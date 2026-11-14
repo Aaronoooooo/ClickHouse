@@ -2,17 +2,17 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include <base/LocalDateTime.h>
+#include <Common/LocalDateTime.h>
 
 
-void fillStackWithGarbage()
+static void fillStackWithGarbage()
 {
     volatile uint64_t a = 0xAABBCCDDEEFF0011ULL;
     volatile uint64_t b = 0x2233445566778899ULL;
     std::cout << a + b << '\n';
 }
 
-void checkComparison()
+static void checkComparison()
 {
     LocalDateTime a("2018-07-18 01:02:03");
     LocalDateTime b("2018-07-18 01:02:03");

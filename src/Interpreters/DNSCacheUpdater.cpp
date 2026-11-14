@@ -1,28 +1,32 @@
-#include "DNSCacheUpdater.h"
+#include <Interpreters/DNSCacheUpdater.h>
 
 #include <Interpreters/Context.h>
 #include <Common/DNSResolver.h>
+#include <Common/logger_useful.h>
+#include <Core/BackgroundSchedulePool.h>
 
 
 namespace DB
 {
 
-DNSCacheUpdater::DNSCacheUpdater(ContextPtr context_, Int32 update_period_seconds_)
+DNSCacheUpdater::DNSCacheUpdater(ContextPtr context_, Int32 update_period_seconds_, UInt32 max_consecutive_failures_)
     : WithContext(context_)
     , update_period_seconds(update_period_seconds_)
+    , max_consecutive_failures(max_consecutive_failures_)
     , pool(getContext()->getSchedulePool())
 {
-    task_handle = pool.createTask("DNSCacheUpdater", [this]{ run(); });
+    task_handle = pool->createTask(StorageID::createEmpty(), "DNSCacheUpdater", [this]{ run(); });
 }
 
 void DNSCacheUpdater::run()
 {
     auto & resolver = DNSResolver::instance();
 
-    /// Reload cluster config if IP of any host has been changed since last update.
-    if (resolver.updateCache())
+    resolver.updateCache(max_consecutive_failures);
+    /// Reload cluster config if IPs of host name has been changed since last update.
+    if (resolver.updateHostNameAndAddresses())
     {
-        LOG_INFO(&Poco::Logger::get("DNSCacheUpdater"), "IPs of some hosts have been changed. Will reload cluster config.");
+        LOG_INFO(getLogger("DNSCacheUpdater"), "IPs of host name {} have been changed. Will reload cluster config.", resolver.getHostName());
         try
         {
             getContext()->reloadClusterConfig();
@@ -38,12 +42,12 @@ void DNSCacheUpdater::run()
       * - automatically throttle when DNS requests take longer time;
       * - add natural randomization on huge clusters - avoid sending all requests at the same moment of time from different servers.
       */
-    task_handle->scheduleAfter(size_t(update_period_seconds) * 1000);
+    task_handle->scheduleAfter(static_cast<size_t>(update_period_seconds) * 1000);
 }
 
 void DNSCacheUpdater::start()
 {
-    LOG_INFO(&Poco::Logger::get("DNSCacheUpdater"), "Update period {} seconds", update_period_seconds);
+    LOG_INFO(getLogger("DNSCacheUpdater"), "Update period {} seconds", update_period_seconds);
     task_handle->activateAndSchedule();
 }
 

@@ -99,8 +99,8 @@ HandshakeResponse::HandshakeResponse() : capability_flags(0x00), max_packet_size
 HandshakeResponse::HandshakeResponse(
     UInt32 capability_flags_, UInt32 max_packet_size_, UInt8 character_set_, const String & username_, const String & database_,
     const String & auth_response_, const String & auth_plugin_name_)
-    : capability_flags(capability_flags_), max_packet_size(max_packet_size_), character_set(character_set_), username(std::move(username_)),
-      database(std::move(database_)), auth_response(std::move(auth_response_)), auth_plugin_name(std::move(auth_plugin_name_))
+    : capability_flags(capability_flags_), max_packet_size(max_packet_size_), character_set(character_set_), username(username_),
+      database(database_), auth_response(auth_response_), auth_plugin_name(auth_plugin_name_)
 {
 }
 
@@ -148,9 +148,9 @@ void HandshakeResponse::readPayloadImpl(ReadBuffer & payload)
     }
     else if (capability_flags & CLIENT_SECURE_CONNECTION)
     {
-        char len;
-        payload.readStrict(len);
-        auth_response.resize(static_cast<unsigned int>(len));
+        UInt8 len = 0;
+        readBinary(len, payload);
+        auth_response.resize(len);
         payload.readStrict(auth_response.data(), len);
     }
     else
@@ -183,8 +183,8 @@ void HandshakeResponse::writePayloadImpl(WriteBuffer & buffer) const
     }
     else if (capability_flags & CLIENT_SECURE_CONNECTION)
     {
-        writeChar(auth_response.size(), buffer);
-        writeString(auth_response.data(), auth_response.size(), buffer);
+        writeChar(static_cast<UInt8>(auth_response.size()), buffer);
+        writeString(auth_response, buffer);
     }
     else
     {

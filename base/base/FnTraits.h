@@ -1,6 +1,12 @@
 #pragma once
 
-#include "Typelist.h"
+// On illumos, <sys/regset.h> defines FS as a macro (x86 segment register).
+// Undef it to allow use of FS as a template parameter below.
+#ifdef FS
+#  undef FS
+#endif
+
+#include "TypeList.h"
 
 namespace detail
 {
@@ -14,7 +20,7 @@ struct FnTraits<R(A...)>
     static constexpr bool value = std::is_invocable_r_v<R, F, A...>;
 
     using Ret = R;
-    using Args = Typelist<A...>;
+    using Args = TypeList<A...>;
 };
 
 template <class R, class ...A>

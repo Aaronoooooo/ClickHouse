@@ -1,28 +1,17 @@
 #pragma once
 
 #include <AggregateFunctions/FactoryHelpers.h>
-
-/// These must be exposed in header for the purpose of dynamic compilation.
-#include <AggregateFunctions/QuantileReservoirSampler.h>
-#include <AggregateFunctions/QuantileReservoirSamplerDeterministic.h>
-#include <AggregateFunctions/QuantileExact.h>
-#include <AggregateFunctions/QuantileExactWeighted.h>
-#include <AggregateFunctions/QuantileTiming.h>
-#include <AggregateFunctions/QuantileTDigest.h>
-#include <AggregateFunctions/QuantileBFloat16Histogram.h>
-
+#include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <AggregateFunctions/QuantilesCommon.h>
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnDecimal.h>
-#include <Columns/ColumnsNumber.h>
+#include <Core/ProtocolDefines.h>
 #include <DataTypes/DataTypeArray.h>
-#include <DataTypes/DataTypeDate.h>
-#include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <Common/assert_cast.h>
+#include <Interpreters/GatherFunctionQuantileVisitor.h>
 
 #include <type_traits>
 
@@ -35,10 +24,25 @@ namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int BAD_ARGUMENTS;
 }
 
 template <typename> class QuantileTiming;
+template <typename> class QuantileGK;
+template <typename> class QuantileDD;
 
+/** Latest serialization version of a quantile data structure, or 0 for the ones that never changed
+  * their state format. A data structure opts in by declaring `static constexpr size_t state_version`,
+  * and then takes the version as the second argument of `serialize` and `deserialize`.
+  */
+template <typename Data>
+constexpr size_t quantileStateVersion()
+{
+    if constexpr (requires { Data::state_version; })
+        return Data::state_version;
+    else
+        return 0;
+}
 
 /** Generic aggregate function for calculation of quantiles.
   * It depends on quantile calculation data structure. Look at Quantile*.h for various implementations.
@@ -51,25 +55,30 @@ template <
     typename Data,
     /// Structure with static member "name", containing the name of the aggregate function.
     typename Name,
-    /// If true, the function accepts the second argument
-    /// (in can be "weight" to calculate quantiles or "determinator" that is used instead of PRNG).
-    /// Second argument is always obtained through 'getUInt' method.
-    bool has_second_arg,
+    /// Type of the second argument. If there is no second argument, this should be void.
+    typename SecondArgumentType,
     /// If non-void, the function will return float of specified type with possibly interpolated results and NaN if there was no values.
     /// Otherwise it will return Value type and default value if there was no values.
     /// As an example, the function cannot return floats, if the SQL type of argument is Date or DateTime.
     typename FloatReturnType,
     /// If true, the function will accept multiple parameters with quantile levels
     ///  and return an Array filled with many values of that quantiles.
-    bool returns_many
->
-class AggregateFunctionQuantile final : public IAggregateFunctionDataHelper<Data,
-    AggregateFunctionQuantile<Value, Data, Name, has_second_arg, FloatReturnType, returns_many>>
+    bool returns_many,
+    /// If the first parameter (before level) is accuracy.
+    bool has_accuracy_parameter>
+class AggregateFunctionQuantile final
+    : public IAggregateFunctionDataHelper<Data, AggregateFunctionQuantile<Value, Data, Name, SecondArgumentType, FloatReturnType, returns_many, has_accuracy_parameter>>
 {
 private:
     using ColVecType = ColumnVectorOrDecimal<Value>;
+    using Base = IAggregateFunctionDataHelper<Data, AggregateFunctionQuantile<Value, Data, Name, SecondArgumentType, FloatReturnType, returns_many, has_accuracy_parameter>>;
 
-    static constexpr bool returns_float = !(std::is_same_v<FloatReturnType, void>);
+    static constexpr bool has_add_many = std::is_same_v<SecondArgumentType, void>
+        && requires(Data & data, const Value * values) { data.addMany(values, size_t{}); };
+
+    static constexpr bool returns_float = !std::is_same_v<FloatReturnType, void>;
+    static constexpr bool is_quantile_ddsketch = std::is_same_v<Data, QuantileDD<Value>>;
+    static constexpr size_t state_version = quantileStateVersion<Data>();
     static_assert(!is_decimal<Value> || !returns_float);
 
     QuantileLevels<Float64> levels;
@@ -77,27 +86,124 @@ private:
     /// Used when there are single level to get.
     Float64 level = 0.5;
 
+    /// Used for the approximate version of the algorithm (Greenwald-Khanna)
+    ssize_t accuracy = 10000;
+
+    /// Used for the quantile sketch
+    Float64 relative_accuracy = 0.01;
+
     DataTypePtr & argument_type;
 
 public:
     AggregateFunctionQuantile(const DataTypes & argument_types_, const Array & params)
-        : IAggregateFunctionDataHelper<Data, AggregateFunctionQuantile<Value, Data, Name, has_second_arg, FloatReturnType, returns_many>>(argument_types_, params)
-        , levels(params, returns_many), level(levels.levels[0]), argument_type(this->argument_types[0])
+        : IAggregateFunctionDataHelper<Data, AggregateFunctionQuantile<Value, Data, Name, SecondArgumentType, FloatReturnType, returns_many, has_accuracy_parameter>>(
+            argument_types_, params, createResultType(argument_types_))
+        , levels(has_accuracy_parameter && !params.empty() ? Array(params.begin() + 1, params.end()) : params, returns_many)
+        , level(levels.levels[0])
+        , argument_type(this->argument_types[0])
     {
         if (!returns_many && levels.size() > 1)
-            throw Exception("Aggregate function " + getName() + " require one parameter or less", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Aggregate function {} requires one level parameter or less", getName());
+
+        if constexpr (std::is_same_v<SecondArgumentType, UInt64>)
+        {
+            assertBinary(Name::name, argument_types_);
+            if (!isUInt(argument_types_[1]))
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "Second argument (weight) for function {} must be unsigned integer, but it has type {}",
+                    Name::name,
+                    argument_types_[1]->getName());
+        }
+        else if constexpr (std::is_same_v<SecondArgumentType, Float64>)
+        {
+            assertBinary(Name::name, argument_types_);
+            if (!isFloat(argument_types_[1]))
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "Second argument for function {} must be float, but it has type {}",
+                    Name::name,
+                    argument_types_[1]->getName());
+        }
+        else
+        {
+            assertUnary(Name::name, argument_types_);
+        }
+
+        if constexpr (is_quantile_ddsketch)
+        {
+            if (params.empty())
+                throw Exception(
+                    ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Aggregate function {} requires at least one param", getName());
+
+            const auto & relative_accuracy_field = params[0];
+            if (relative_accuracy_field.getType() != Field::Types::Float64)
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Aggregate function {} requires relative accuracy parameter with Float64 type", getName());
+
+            relative_accuracy = relative_accuracy_field.safeGet<Float64>();
+
+            if (relative_accuracy <= 0 || relative_accuracy >= 1 || isNaN(relative_accuracy))
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Aggregate function {} requires relative accuracy parameter with value between 0 and 1 but is {}",
+                    getName(),
+                    relative_accuracy);
+            // Throw exception if the relative accuracy is too small.
+            // This is to avoid the case where the user specifies a relative accuracy that is too small
+            // and the sketch is not able to allocate enough memory to satisfy the accuracy requirement.
+            if (relative_accuracy < 1e-6)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Aggregate function {} requires relative accuracy parameter with value greater than 1e-6 but is {}",
+                    getName(),
+                    relative_accuracy);
+        }
+        else if constexpr (has_accuracy_parameter)
+        {
+            if (params.empty())
+                throw Exception(
+                    ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Aggregate function {} requires at least one param", getName());
+
+            const auto & accuracy_field = params[0];
+            if (!isInt64OrUInt64FieldType(accuracy_field.getType()))
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Aggregate function {} requires accuracy parameter with integer type", getName());
+
+            if (accuracy_field.getType() == Field::Types::Int64)
+                accuracy = accuracy_field.safeGet<Int64>();
+            else
+                accuracy = accuracy_field.safeGet<UInt64>();
+
+            if (accuracy <= 0)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Aggregate function {} requires accuracy parameter with positive value but is {}",
+                    getName(),
+                    accuracy);
+        }
     }
 
     String getName() const override { return Name::name; }
 
-    DataTypePtr getReturnType() const override
+    void create(AggregateDataPtr __restrict place) const override /// NOLINT
+    {
+        if constexpr (is_quantile_ddsketch)
+            new (place) Data(relative_accuracy);
+        else if constexpr (has_accuracy_parameter)
+            new (place) Data(accuracy);
+        else
+            new (place) Data;
+    }
+
+    static DataTypePtr createResultType(const DataTypes & argument_types_)
     {
         DataTypePtr res;
 
         if constexpr (returns_float)
             res = std::make_shared<DataTypeNumber<FloatReturnType>>();
         else
-            res = argument_type;
+            res = argument_types_[0];
 
         if constexpr (returns_many)
             return std::make_shared<DataTypeArray>(res);
@@ -105,9 +211,26 @@ public:
             return res;
     }
 
-    bool haveSameStateRepresentation(const IAggregateFunction & rhs) const override
+    bool haveSameStateRepresentationImpl(const IAggregateFunction & rhs) const override
     {
-        return getName() == rhs.getName() && this->haveEqualArgumentTypes(rhs);
+        return GatherFunctionQuantileData::toFusedNameOrSelf(getName()) == GatherFunctionQuantileData::toFusedNameOrSelf(rhs.getName())
+            && this->haveEqualArgumentTypes(rhs);
+    }
+
+    DataTypePtr getNormalizedStateType() const override
+    {
+        /// Return normalized state type: quantiles*(1)(...)
+        Array params{1};
+        if constexpr (is_quantile_ddsketch)
+            params = {relative_accuracy, 1};
+        else if constexpr (has_accuracy_parameter)
+            params = {accuracy, 1};
+        AggregateFunctionProperties properties;
+        return std::make_shared<DataTypeAggregateFunction>(
+            AggregateFunctionFactory::instance().get(
+                GatherFunctionQuantileData::toFusedNameOrSelf(getName()), NullsAction::EMPTY, this->argument_types, params, properties),
+            this->argument_types,
+            params);
     }
 
     bool allocatesMemoryInArena() const override { return false; }
@@ -119,37 +242,134 @@ public:
         if constexpr (std::is_same_v<Data, QuantileTiming<Value>>)
         {
             /// QuantileTiming only supports unsigned integers. Too large values are also meaningless.
+#   pragma clang diagnostic push
+#   pragma clang diagnostic ignored "-Wimplicit-const-int-float-conversion"
             if (isNaN(value) || value > std::numeric_limits<Int64>::max() || value < 0)
                 return;
+#   pragma clang diagnostic pop
         }
 
-        if constexpr (has_second_arg)
-            this->data(place).add(
-                value,
-                columns[1]->getUInt(row_num));
+        if constexpr (std::is_same_v<SecondArgumentType, UInt64>)
+            this->data(place).add(value, columns[1]->getUInt(row_num));
+        else if constexpr (std::is_same_v<SecondArgumentType, Float64>)
+            this->data(place).add(value, columns[1]->getFloat64(row_num));
         else
             this->data(place).add(value);
     }
 
-    void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
+    void addBatchSinglePlace(
+        size_t row_begin,
+        size_t row_end,
+        AggregateDataPtr __restrict place,
+        const IColumn ** columns,
+        Arena * arena,
+        ssize_t if_argument_pos) const override
+    {
+        if constexpr (has_add_many)
+        {
+            const auto * values = assert_cast<const ColVecType &>(*columns[0]).getData().data() + row_begin;
+            if (if_argument_pos >= 0)
+            {
+                const auto * if_flags = assert_cast<const ColumnUInt8 &>(*columns[if_argument_pos]).getData().data() + row_begin;
+                this->data(place).template addManyFiltered<true>(values, row_end - row_begin, if_flags);
+            }
+            else
+                this->data(place).addMany(values, row_end - row_begin);
+        }
+        else
+            Base::addBatchSinglePlace(row_begin, row_end, place, columns, arena, if_argument_pos);
+    }
+
+    void addBatchSinglePlaceNotNull(
+        size_t row_begin,
+        size_t row_end,
+        AggregateDataPtr __restrict place,
+        const IColumn ** columns,
+        const UInt8 * null_map,
+        Arena * arena,
+        ssize_t if_argument_pos) const override
+    {
+        if constexpr (has_add_many)
+        {
+            const auto * values = assert_cast<const ColVecType &>(*columns[0]).getData().data() + row_begin;
+            const size_t count = row_end - row_begin;
+            if (if_argument_pos >= 0)
+            {
+                const auto * if_flags = assert_cast<const ColumnUInt8 &>(*columns[if_argument_pos]).getData().data() + row_begin;
+                auto keep = std::make_unique_for_overwrite<UInt8[]>(count);
+                for (size_t i = 0; i < count; ++i)
+                    keep[i] = !null_map[row_begin + i] & !!if_flags[i];
+                this->data(place).template addManyFiltered<true>(values, count, keep.get());
+            }
+            else
+                this->data(place).template addManyFiltered<false>(values, count, null_map + row_begin);
+        }
+        else
+            Base::addBatchSinglePlaceNotNull(row_begin, row_end, place, columns, null_map, arena, if_argument_pos);
+    }
+
+    void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
     {
         this->data(place).merge(this->data(rhs));
     }
 
-    void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf) const override
+    bool isVersioned() const override { return state_version > 0; }
+
+    /// The default version - the one used when the type carries no explicit version - must stay 0.
+    /// Unversioned `AggregateFunction(quantileDeterministic, ...)` types already exist in persisted
+    /// data written before the version was introduced: in the `columns.txt` of old parts, in old
+    /// `Native` files, and in the type lists and shared-variant values of old `Dynamic` columns.
+    /// None of these media record a default version, so the writer and the reader of an unversioned
+    /// type can only agree on the layout if it never changes: an unversioned type has to keep the
+    /// byte layout that unversioned data always had. The new version applies only where it is
+    /// spelled out explicitly - in the type name (`AggregateFunction(1, ...)`) and in the version
+    /// field of the binary type encoding - or derived from the negotiated revision on the `Native`
+    /// wire. To that end `getStateType` below returns the explicitly versioned type, so every fresh
+    /// state (a `-State` query result, an inferred `CREATE TABLE ... AS SELECT` column, a value
+    /// entering a `Dynamic` column) carries the version with it on every medium, while a fresh
+    /// `CREATE TABLE` with a spelled-out unversioned column type gets the version pinned at DDL time.
+    size_t getDefaultVersion() const override { return 0; }
+
+    /// The state type spells the version out, so that the type name and the payload stay consistent
+    /// on every medium the state can travel through - including the generic formats, which serialize
+    /// query results with the state type as-is (only the `Native` wire re-derives versions from the
+    /// negotiated revision).
+    DataTypePtr getStateType() const override
     {
-        /// const_cast is required because some data structures apply finalizaton (like compactization) before serializing.
-        this->data(const_cast<AggregateDataPtr>(place)).serialize(buf);
+        if constexpr (state_version > 0)
+            return std::make_shared<DataTypeAggregateFunction>(this->shared_from_this(), this->argument_types, this->parameters, state_version);
+        else
+            return IAggregateFunction::getStateType();
     }
 
-    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, Arena *) const override
+    size_t getVersionFromRevision(size_t revision) const override
     {
-        this->data(place).deserialize(buf);
+        if constexpr (state_version >= 1)
+        {
+            if (revision >= DBMS_MIN_REVISION_WITH_QUANTILE_DETERMINISTIC_SKIP_DEGREE)
+                return 1;
+        }
+        return 0;
+    }
+
+    void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> version) const override
+    {
+        if constexpr (state_version > 0)
+            this->data(place).serialize(buf, version.value_or(getDefaultVersion()));
+        else
+            this->data(place).serialize(buf);
+    }
+
+    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> version, Arena *) const override
+    {
+        if constexpr (state_version > 0)
+            this->data(place).deserialize(buf, version.value_or(getDefaultVersion()));
+        else
+            this->data(place).deserialize(buf);
     }
 
     void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena *) const override
     {
-        /// const_cast is required because some data structures apply finalizaton (like sorting) for obtain a result.
         auto & data = this->data(place);
 
         if constexpr (returns_many)
@@ -167,7 +387,7 @@ public:
             {
                 auto & data_to = assert_cast<ColumnVector<FloatReturnType> &>(arr_to.getData()).getData();
                 size_t old_size = data_to.size();
-                data_to.resize(data_to.size() + size);
+                data_to.resize(old_size + size);
 
                 data.getManyFloat(levels.levels.data(), levels.permutation.data(), size, data_to.data() + old_size);
             }
@@ -175,7 +395,7 @@ public:
             {
                 auto & data_to = static_cast<ColVecType &>(arr_to.getData()).getData();
                 size_t old_size = data_to.size();
-                data_to.resize(data_to.size() + size);
+                data_to.resize(old_size + size);
 
                 data.getMany(levels.levels.data(), levels.permutation.data(), size, data_to.data() + old_size);
             }
@@ -187,18 +407,6 @@ public:
             else
                 static_cast<ColVecType &>(to).getData().push_back(data.get(level));
         }
-    }
-
-    static void assertSecondArg(const DataTypes & types)
-    {
-        if constexpr (has_second_arg)
-        {
-            assertBinary(Name::name, types);
-            if (!isUnsignedInteger(types[1]))
-                throw Exception("Second argument (weight) for function " + std::string(Name::name) + " must be unsigned integer, but it has type " + types[1]->getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-        }
-        else
-            assertUnary(Name::name, types);
     }
 };
 
@@ -225,6 +433,12 @@ struct NameQuantilesExactInclusive { static constexpr auto name = "quantilesExac
 struct NameQuantileExactWeighted { static constexpr auto name = "quantileExactWeighted"; };
 struct NameQuantilesExactWeighted { static constexpr auto name = "quantilesExactWeighted"; };
 
+struct NameQuantileExactWeightedInterpolated { static constexpr auto name = "quantileExactWeightedInterpolated"; };
+struct NameQuantilesExactWeightedInterpolated { static constexpr auto name = "quantilesExactWeightedInterpolated"; };
+
+struct NameQuantileInterpolatedWeighted { static constexpr auto name = "quantileInterpolatedWeighted"; };
+struct NameQuantilesInterpolatedWeighted { static constexpr auto name = "quantilesInterpolatedWeighted"; };
+
 struct NameQuantileTiming { static constexpr auto name = "quantileTiming"; };
 struct NameQuantileTimingWeighted { static constexpr auto name = "quantileTimingWeighted"; };
 struct NameQuantilesTiming { static constexpr auto name = "quantilesTiming"; };
@@ -239,5 +453,14 @@ struct NameQuantileBFloat16 { static constexpr auto name = "quantileBFloat16"; }
 struct NameQuantilesBFloat16 { static constexpr auto name = "quantilesBFloat16"; };
 struct NameQuantileBFloat16Weighted { static constexpr auto name = "quantileBFloat16Weighted"; };
 struct NameQuantilesBFloat16Weighted { static constexpr auto name = "quantilesBFloat16Weighted"; };
+
+struct NameQuantileGK { static constexpr auto name = "quantileGK"; };
+struct NameQuantilesGK { static constexpr auto name = "quantilesGK"; };
+
+struct NameQuantileDD { static constexpr auto name = "quantileDD"; };
+struct NameQuantilesDD { static constexpr auto name = "quantilesDD"; };
+
+struct NameQuantilePrometheusHistogram { static constexpr auto name = "quantilePrometheusHistogram"; };
+struct NameQuantilesPrometheusHistogram { static constexpr auto name = "quantilesPrometheusHistogram"; };
 
 }

@@ -4,42 +4,61 @@
 #include <base/types.h>
 #include <base/defines.h>
 
-#include <cassert>
 #include <atomic>
+#include <limits>
 #include <memory>
+#include <system_error>
+#include <cerrno>
 
 
-inline UInt64 clock_gettime_ns(clockid_t clock_type = CLOCK_MONOTONIC)
-{
-    struct timespec ts;
-    clock_gettime(clock_type, &ts);
-    return UInt64(ts.tv_sec * 1000000000LL + ts.tv_nsec);
-}
+/// From clock_getres(2):
+///
+///    Similar to CLOCK_MONOTONIC, but provides access to a raw hardware-based
+///    time that is not subject to NTP adjustments or the incremental
+///    adjustments performed by adjtime(3).
+/// Emscripten defines `CLOCK_MONOTONIC_RAW` but `clock_gettime` returns EINVAL for it, so it
+/// cannot be the default there - see the note on `CLOCK_MONOTONIC_COARSE` in `base/time.h`.
+#if defined(CLOCK_MONOTONIC_RAW) && !defined(OS_WASM)
+static constexpr clockid_t STOPWATCH_DEFAULT_CLOCK = CLOCK_MONOTONIC_RAW;
+#else
+static constexpr clockid_t STOPWATCH_DEFAULT_CLOCK = CLOCK_MONOTONIC;
+#endif
 
-/// Sometimes monotonic clock may not be monotonic (due to bug in kernel?).
-/// It may cause some operations to fail with "Timeout exceeded: elapsed 18446744073.709553 seconds".
+UInt64 clock_gettime_ns(clockid_t clock_type = STOPWATCH_DEFAULT_CLOCK);
+
 /// Takes previously returned value and returns it again if time stepped back for some reason.
-inline UInt64 clock_gettime_ns_adjusted(UInt64 prev_time, clockid_t clock_type = CLOCK_MONOTONIC)
+///
+/// You should use this if OS does not support CLOCK_MONOTONIC_RAW
+inline UInt64 clock_gettime_ns_adjusted(UInt64 prev_time, clockid_t clock_type = STOPWATCH_DEFAULT_CLOCK)
 {
+#ifdef CLOCK_MONOTONIC_RAW
+    if (likely(clock_type == CLOCK_MONOTONIC_RAW))
+        return clock_gettime_ns(clock_type);
+#endif
+
     UInt64 current_time = clock_gettime_ns(clock_type);
     if (likely(prev_time <= current_time))
         return current_time;
 
     /// Something probably went completely wrong if time stepped back for more than 1 second.
-    assert(prev_time - current_time <= 1000000000ULL);
+    chassert(prev_time - current_time <= 1000000000ULL);
     return prev_time;
 }
 
 /** Differs from Poco::Stopwatch only by using 'clock_gettime' instead of 'gettimeofday',
-  *  returns nanoseconds instead of microseconds, and also by other minor differencies.
+  *  returns nanoseconds instead of microseconds, and also by other minor differences.
   */
 class Stopwatch
 {
 public:
-    /** CLOCK_MONOTONIC works relatively efficient (~15 million calls/sec) and doesn't lead to syscall.
+    /** CLOCK_MONOTONIC/CLOCK_MONOTONIC_RAW works relatively efficient (~40-50 million calls/sec) and doesn't lead to syscall.
       * Pass CLOCK_MONOTONIC_COARSE, if you need better performance with acceptable cost of several milliseconds of inaccuracy.
       */
-    explicit Stopwatch(clockid_t clock_type_ = CLOCK_MONOTONIC) : clock_type(clock_type_) { start(); }
+    explicit Stopwatch(clockid_t clock_type_ = STOPWATCH_DEFAULT_CLOCK) : clock_type(clock_type_) { start(); }
+    explicit Stopwatch(clockid_t clock_type_, UInt64 start_nanoseconds, bool is_running_)
+        : start_ns(start_nanoseconds), clock_type(clock_type_), is_running(is_running_)
+    {
+    }
 
     void start()                       { start_ns = nanoseconds(); is_running = true; }
     void stop()                        { stop_ns = nanoseconds(); is_running = false; }
@@ -50,6 +69,9 @@ public:
     UInt64 elapsedMicroseconds() const { return elapsedNanoseconds() / 1000U; }
     UInt64 elapsedMilliseconds() const { return elapsedNanoseconds() / 1000000UL; }
     double elapsedSeconds() const      { return static_cast<double>(elapsedNanoseconds()) / 1000000000ULL; }
+
+    UInt64 getStart() const { return start_ns; }
+    UInt64 getEnd() const { return stop_ns; }
 
 private:
     UInt64 start_ns = 0;
@@ -63,10 +85,12 @@ private:
 using StopwatchUniquePtr = std::unique_ptr<Stopwatch>;
 
 
+/// Allows to obtain the elapsed time concurrently with restarting the stopwatch.
+/// Allows to atomically compare the elapsed time with a threshold and restart the watch if the elapsed time is not less.
 class AtomicStopwatch
 {
 public:
-    explicit AtomicStopwatch(clockid_t clock_type_ = CLOCK_MONOTONIC) : clock_type(clock_type_) { restart(); }
+    explicit AtomicStopwatch(clockid_t clock_type_ = STOPWATCH_DEFAULT_CLOCK) : clock_type(clock_type_) { restart(); }
 
     void restart()                     { start_ns = nanoseconds(0); }
     UInt64 elapsed() const
@@ -83,7 +107,7 @@ public:
       */
     bool compareAndRestart(double seconds)
     {
-        UInt64 threshold = static_cast<UInt64>(seconds * 1000000000.0);
+        UInt64 threshold = secondsToNanoseconds(seconds);
         UInt64 current_start_ns = start_ns;
         UInt64 current_ns = nanoseconds(current_start_ns);
 
@@ -127,7 +151,7 @@ public:
       */
     Lock compareAndRestartDeferred(double seconds)
     {
-        UInt64 threshold = UInt64(seconds * 1000000000.0);
+        UInt64 threshold = secondsToNanoseconds(seconds);
         UInt64 current_start_ns = start_ns;
         UInt64 current_ns = nanoseconds(current_start_ns);
 
@@ -151,5 +175,21 @@ private:
 
     /// Most significant bit is a lock. When it is set, compareAndRestartDeferred method will return false.
     UInt64 nanoseconds(UInt64 prev_time) const { return clock_gettime_ns_adjusted(prev_time, clock_type) & 0x7FFFFFFFFFFFFFFFULL; }
-};
 
+    /// Convert seconds to nanoseconds with saturation. Avoids UB when `seconds` is so large
+    /// that `seconds * 1e9` falls outside the representable range of `UInt64` — which can
+    /// happen when a `UInt64` interval setting tuned to an extreme value is fed in via a
+    /// `static_cast<double>` at the call site. Saturating at half of `UInt64::max` also
+    /// keeps `current_start_ns + threshold` from wrapping inside the compare-and-restart
+    /// loop, so an "essentially infinite" threshold behaves as "never restart".
+    static UInt64 secondsToNanoseconds(double seconds)
+    {
+        if (seconds <= 0.0)
+            return 0;
+        constexpr UInt64 max_ns = std::numeric_limits<UInt64>::max() / 2;
+        const double ns = seconds * 1000000000.0;
+        if (ns >= static_cast<double>(max_ns))
+            return max_ns;
+        return static_cast<UInt64>(ns);
+    }
+};

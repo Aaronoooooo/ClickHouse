@@ -1,13 +1,13 @@
 #pragma once
 
 #include <Storages/ColumnsDescription.h>
-#include <Parsers/IAST.h>
-#include <Parsers/queryToString.h>
+#include <Parsers/IAST_fwd.h>
 #include <Interpreters/Cluster.h>
 
 
 namespace DB
 {
+
 class Context;
 struct StorageID;
 

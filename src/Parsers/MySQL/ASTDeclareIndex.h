@@ -1,6 +1,5 @@
 #pragma once
 
-#include <Core/Field.h>
 #include <Parsers/IAST.h>
 #include <Parsers/IParserBase.h>
 
@@ -30,9 +29,9 @@ public:
     String getID(char /*delimiter*/) const override { return "index declaration"; }
 
 protected:
-    void formatImpl(const FormatSettings & /*settings*/, FormatState & /*state*/, FormatStateStacked /*frame*/) const override
+    void formatImpl(WriteBuffer & /*ostr*/, const FormatSettings & /*settings*/, FormatState & /*state*/, FormatStateStacked /*frame*/) const override
     {
-        throw Exception("Method formatImpl is not supported by MySQLParser::ASTDeclareIndex.", ErrorCodes::NOT_IMPLEMENTED);
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method formatImpl is not supported by MySQLParser::ASTDeclareIndex.");
     }
 };
 

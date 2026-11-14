@@ -1,3 +1,4 @@
+#include <cmath>
 #include <type_traits>
 #include <base/bit_cast.h>
 #include <Functions/FunctionFactory.h>
@@ -14,38 +15,42 @@ namespace
 {
 
 template <typename T>
-inline std::enable_if_t<std::is_integral_v<T> && (sizeof(T) <= sizeof(UInt32)), T>
-roundDownToPowerOfTwo(T x)
+requires std::is_integral_v<T> && (sizeof(T) <= sizeof(UInt32))
+inline T roundDownToPowerOfTwo(T x)
 {
-    return x <= 0 ? 0 : (T(1) << (31 - __builtin_clz(x)));
+    return x <= 0 ? 0 : static_cast<T>(static_cast<T>(1) << (31 - __builtin_clz(x)));
 }
 
 template <typename T>
-inline std::enable_if_t<std::is_integral_v<T> && (sizeof(T) == sizeof(UInt64)), T>
-roundDownToPowerOfTwo(T x)
+requires std::is_integral_v<T> && (sizeof(T) == sizeof(UInt64))
+inline T roundDownToPowerOfTwo(T x)
 {
     return x <= 0 ? 0 : (T(1) << (63 - __builtin_clzll(x)));
 }
 
 template <typename T>
-inline std::enable_if_t<std::is_same_v<T, Float32>, T>
-roundDownToPowerOfTwo(T x)
+requires std::is_same_v<T, Float32>
+inline T roundDownToPowerOfTwo(T x)
 {
+    if (std::isnan(x))
+        return x;
     return bit_cast<T>(bit_cast<UInt32>(x) & ~((1ULL << 23) - 1));
 }
 
 template <typename T>
-inline std::enable_if_t<std::is_same_v<T, Float64>, T>
-roundDownToPowerOfTwo(T x)
+requires std::is_same_v<T, Float64>
+inline T roundDownToPowerOfTwo(T x)
 {
+    if (std::isnan(x))
+        return x;
     return bit_cast<T>(bit_cast<UInt64>(x) & ~((1ULL << 52) - 1));
 }
 
 template <typename T>
-inline std::enable_if_t<is_big_int_v<T>, T>
-roundDownToPowerOfTwo(T)
+requires is_big_int_v<T>
+inline T roundDownToPowerOfTwo(T)
 {
-    throw Exception("roundToExp2() for big integers is not implemented", ErrorCodes::NOT_IMPLEMENTED);
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "roundToExp2() for big integers is not implemented");
 }
 
 /** For integer data types:
@@ -57,16 +62,17 @@ roundDownToPowerOfTwo(T)
   * - negative powers are also used (example: roundToExp2(0.7) = 0.5);
   * - if number is zero, return zero;
   * - if number is less than zero, the result is symmetrical: roundToExp2(x) = -roundToExp2(-x). (example: roundToExp2(-0.3) = -0.25);
+  * - if number is NaN, return it unchanged (zeroing the mantissa would turn it into infinity).
   */
 
 template <typename T>
 struct RoundToExp2Impl
 {
     using ResultType = T;
-    static constexpr const bool allow_fixed_string = false;
-    static const constexpr bool allow_string_integer = false;
+    static constexpr const bool allow_string_or_fixed_string = false;
+    static constexpr auto signature = "(A : NativeNumber) -> A";
 
-    static inline T apply(T x)
+    static T apply(T x)
     {
         return roundDownToPowerOfTwo<T>(x);
     }
@@ -83,9 +89,37 @@ using FunctionRoundToExp2 = FunctionUnaryArithmetic<RoundToExp2Impl, NameRoundTo
 
 template <> struct FunctionUnaryArithmeticMonotonicity<NameRoundToExp2> : PositiveMonotonicity {};
 
-void registerFunctionRoundToExp2(FunctionFactory & factory)
+REGISTER_FUNCTION(RoundToExp2)
 {
-    factory.registerFunction<FunctionRoundToExp2>();
+    FunctionDocumentation::Description description = R"(
+Rounds a number down to the nearest (whole non-negative) power of two.
+If the number is less than one, it returns `0`.
+)";
+    FunctionDocumentation::Syntax syntax = "roundToExp2(num)";
+    FunctionDocumentation::Arguments arguments = {
+        {"num", "A number to round.", {"(U)Int*", "Float*"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns `num` rounded down to the nearest (whole non-negative) power of two, otherwise `0` for `num < 1`.", {"(U)Int*", "Float*"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        "SELECT *, roundToExp2(*) FROM system.numbers WHERE number IN (0, 2, 5, 10, 19, 50)",
+        R"(
+┌─number─┬─roundToExp2(number)─┐
+│      0 │                   0 │
+│      2 │                   2 │
+│      5 │                   4 │
+│     10 │                   8 │
+│     19 │                  16 │
+│     50 │                  32 │
+└────────┴─────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Rounding;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction<FunctionRoundToExp2>(documentation);
 }
 
 }

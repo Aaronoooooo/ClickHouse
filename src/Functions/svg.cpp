@@ -10,14 +10,10 @@
 namespace DB
 {
 
-namespace ErrorCodes
+namespace
 {
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int TOO_MANY_ARGUMENTS_FOR_FUNCTION;
-    extern const int TOO_FEW_ARGUMENTS_FOR_FUNCTION;
-}
 
-class FunctionSvg : public IFunction
+class FunctionSvg final : public IFunction
 {
 public:
     static inline const char * name = "svg";
@@ -46,21 +42,13 @@ public:
 
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    String getSignatureString() const override
     {
-        if (arguments.size() > 2)
-        {
-            throw Exception("Too many arguments", ErrorCodes::TOO_MANY_ARGUMENTS_FOR_FUNCTION);
-        }
-        else if (arguments.empty())
-        {
-            throw Exception("Too few arguments", ErrorCodes::TOO_FEW_ARGUMENTS_FOR_FUNCTION);
-        }
-        else if (arguments.size() == 2 && checkAndGetDataType<DataTypeString>(arguments[1].get()) == nullptr)
-        {
-            throw Exception("Second argument should be String", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-        }
+        return "(Any, [String]) -> String";
+    }
 
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
         return std::make_shared<DataTypeString>();
     }
 
@@ -79,13 +67,13 @@ public:
 
             auto figures = Converter::convert(arguments[0].column->convertToFullColumnIfConst());
 
-            for (size_t i = 0; i < input_rows_count; i++)
+            for (size_t i = 0; i < input_rows_count; ++i)
             {
                 std::stringstream str; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
                 boost::geometry::correct(figures[i]);
-                str << boost::geometry::svg(figures[i], has_style ? style->getDataAt(i).toString() : "");
+                str << boost::geometry::svg(figures[i], has_style ? std::string{style->getDataAt(i)} : "");
                 std::string serialized = str.str();
-                res_column->insertData(serialized.c_str(), serialized.size());
+                res_column->insertData(serialized.data(), serialized.size());
             }
         }
         );
@@ -99,9 +87,25 @@ public:
     }
 };
 
-void registerFunctionSvg(FunctionFactory & factory)
+}
+
+REGISTER_FUNCTION(Svg)
 {
-    factory.registerFunction<FunctionSvg>();
+    FunctionDocumentation::Description description = R"(
+Returns a string representation of a geometry in [SVG](https://en.wikipedia.org/wiki/SVG) format. The output SVG can be used directly in web pages to visualize geospatial data.
+    )";
+    FunctionDocumentation::Syntax syntax = "svg(geometry[, style])";
+    FunctionDocumentation::Arguments arguments = {
+        {"geometry", "Geometry object (Point, MultiPoint, Ring, LineString, MultiLineString, Polygon, MultiPolygon).", {"Point", "MultiPoint", "Ring", "LineString", "MultiLineString", "Polygon", "MultiPolygon"}},
+        {"style", "Optional CSS style string to apply to the SVG element.", {"String"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the SVG representation of the geometry.", {"String"}};
+    FunctionDocumentation::Examples examples = {{"Basic point", "SELECT svg((0.0, 1.0))", R"(<circle cx="0" cy="1" r="5" style=""/>)"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {21, 4};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Geo;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionSvg>(documentation);
     factory.registerAlias("SVG", "svg");
 }
 

@@ -16,7 +16,7 @@ static Block getBlockWithSize(const std::vector<std::string> & columns, size_t r
 
     ColumnsWithTypeAndName cols;
     size_t size_of_row_in_bytes = columns.size() * sizeof(UInt64);
-    for (size_t i = 0; i * sizeof(UInt64) < size_of_row_in_bytes; i++)
+    for (size_t i = 0; i * sizeof(UInt64) < size_of_row_in_bytes; ++i)
     {
         auto column = ColumnUInt64::create(rows, 0);
         for (size_t j = 0; j < rows; ++j)
@@ -82,8 +82,19 @@ TEST(MergingSortedTest, SimpleBlockSizeTest)
 
     EXPECT_EQ(pipe.numOutputPorts(), 3);
 
-    auto transform = std::make_shared<MergingSortedTransform>(pipe.getHeader(), pipe.numOutputPorts(), sort_description,
-            DEFAULT_MERGE_BLOCK_SIZE, 0, nullptr, false, true);
+    auto transform = std::make_shared<MergingSortedTransform>(
+        pipe.getSharedHeader(),
+        pipe.numOutputPorts(),
+        sort_description,
+        /*max_block_size_rows=*/ 8192,
+        /*max_block_size_bytes=*/ 0,
+        /*max_dynamic_subcolumns=*/ std::nullopt,
+        SortingQueueStrategy::Batch,
+        /*limit=*/ 0,
+        /*always_read_till_end=*/ false,
+        /*out_row_sources_buf=*/ nullptr,
+        /*filter_column_name=*/ std::nullopt,
+        /*use_average_block_sizes=*/ true);
 
     pipe.addTransform(std::move(transform));
 
@@ -103,17 +114,18 @@ TEST(MergingSortedTest, SimpleBlockSizeTest)
 
     for (const auto & block : {block1, block2, block3})
         total_rows += block.rows();
+
     /**
       * First block consists of 1 row from block3 with 21 rows + 2 rows from block2 with 10 rows
       * + 5 rows from block 1 with 5 rows granularity
       */
     EXPECT_EQ(block1.rows(), 8);
     /**
-      * Combination of 10 and 21 rows blocks
+      * Second block consists of 8 rows from block2 + 6 rows from block3.
       */
     EXPECT_EQ(block2.rows(), 14);
     /**
-      * Combination of 10 and 21 rows blocks
+      * Third block consists of the remaining 14 rows from block3.
       */
     EXPECT_EQ(block3.rows(), 14);
 
@@ -129,8 +141,19 @@ TEST(MergingSortedTest, MoreInterestingBlockSizes)
 
     EXPECT_EQ(pipe.numOutputPorts(), 3);
 
-    auto transform = std::make_shared<MergingSortedTransform>(pipe.getHeader(), pipe.numOutputPorts(), sort_description,
-            DEFAULT_MERGE_BLOCK_SIZE, 0, nullptr, false, true);
+    auto transform = std::make_shared<MergingSortedTransform>(
+        pipe.getSharedHeader(),
+        pipe.numOutputPorts(),
+        sort_description,
+        /*max_block_size_rows=*/ 8192,
+        /*max_block_size_bytes=*/ 0,
+        /*max_dynamic_subcolumns=*/ std::nullopt,
+        SortingQueueStrategy::Batch,
+        /*limit=*/ 0,
+        /*always_read_till_end=*/ false,
+        /*out_row_sources_buf=*/ nullptr,
+        /*filter_column_name=*/ std::nullopt,
+        /*use_average_block_sizes=*/ true);
 
     pipe.addTransform(std::move(transform));
 

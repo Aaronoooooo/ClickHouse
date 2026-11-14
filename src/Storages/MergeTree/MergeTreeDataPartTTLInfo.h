@@ -1,12 +1,19 @@
 #pragma once
-#include <IO/WriteBufferFromFile.h>
-#include <IO/ReadBufferFromFile.h>
-#include <Storages/TTLDescription.h>
+
+#include <base/types.h>
 
 #include <map>
+#include <optional>
+#include <vector>
+#include <ctime>
 
 namespace DB
 {
+
+class ReadBuffer;
+class WriteBuffer;
+struct TTLDescription;
+using TTLDescriptions = std::vector<TTLDescription>;
 
 /// Minimal and maximal ttl for column or table
 struct MergeTreeDataPartTTLInfo
@@ -15,26 +22,14 @@ struct MergeTreeDataPartTTLInfo
     time_t max = 0;
 
     /// This TTL was computed on completely expired part. It doesn't make sense
-    /// to select such parts for TTL again. But make sense to recalcuate TTL
+    /// to select such parts for TTL again. But make sense to recalculate TTL
     /// again for merge with multiple parts.
-    bool finished = false;
+    std::optional<bool> ttl_finished;
+    bool finished() const { return ttl_finished.value_or(false); }
+    bool initialized() const { return min != 0 || max != 0; }
 
-    void update(time_t time)
-    {
-        if (time && (!min || time < min))
-            min = time;
-
-        max = std::max(time, max);
-    }
-
-    void update(const MergeTreeDataPartTTLInfo & other_info)
-    {
-        if (other_info.min && (!min || other_info.min < min))
-            min = other_info.min;
-
-        max = std::max(other_info.max, max);
-        finished &= other_info.finished;
-    }
+    void update(time_t time);
+    void update(const MergeTreeDataPartTTLInfo & other_info);
 };
 
 /// Order is important as it would be serialized and hashed for checksums
@@ -69,23 +64,40 @@ struct MergeTreeDataPartTTLInfos
     /// Has any TTLs which are not calculated on completely expired parts.
     bool hasAnyNonFinishedTTLs() const;
 
-    void updatePartMinMaxTTL(time_t time_min, time_t time_max)
-    {
-        if (time_min && (!part_min_ttl || time_min < part_min_ttl))
-            part_min_ttl = time_min;
+    /// Has any row TTL (table, `WHERE` or `GROUP BY`) which is not calculated on a completely expired part.
+    bool hasAnyNonFinishedRowTTLs() const;
 
-        if (time_max && (!part_max_ttl || time_max > part_max_ttl))
-            part_max_ttl = time_max;
+    /// Has any column TTL which is not calculated on a completely expired part. A column TTL can only
+    /// be honoured by rewriting the part, never by dropping it, so it is tracked separately.
+    bool hasAnyNonFinishedColumnTTLs() const;
+
+    /// The earliest time at which a column TTL becomes due. Zero if there is no unfinished column TTL.
+    time_t getMinimalNonFinishedColumnTTL() const;
+
+    void updatePartMinMaxTTL(const MergeTreeDataPartTTLInfo & ttl_info)
+    {
+        if (ttl_info.finished())
+            return;
+
+        if (ttl_info.min && (!part_min_ttl || ttl_info.min < part_min_ttl))
+            part_min_ttl = ttl_info.min;
+
+        if (ttl_info.max && (!part_max_ttl || ttl_info.max > part_max_ttl))
+            part_max_ttl = ttl_info.max;
     }
 
     bool empty() const
     {
         /// part_min_ttl in minimum of rows, rows_where and group_by TTLs
-        return !part_min_ttl && moves_ttl.empty() && recompression_ttl.empty();
+        return !part_min_ttl && moves_ttl.empty() && recompression_ttl.empty() && columns_ttl.empty() && rows_where_ttl.empty() && group_by_ttl.empty();
     }
 };
 
 /// Selects the most appropriate TTLDescription using TTL info and current time.
 std::optional<TTLDescription> selectTTLDescriptionForTTLInfos(const TTLDescriptions & descriptions, const TTLInfoMap & ttl_info_map, time_t current_time, bool use_max);
+
+/// True if a `RECOMPRESS` TTL entry from `recompression_ttl_entries` is due at `current_time` and its codec is not `Default` (=is explicit).
+bool isExplicitRecompression(
+    const TTLDescriptions & recompression_ttl_entries, const TTLInfoMap & recompression_ttl_info, time_t current_time);
 
 }

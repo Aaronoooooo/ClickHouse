@@ -1,18 +1,11 @@
 #pragma once
 
-#include <Parsers/IAST_fwd.h>
-#include <Core/Block.h>
-#include <Core/NamesAndTypes.h>
-#include <Interpreters/Aliases.h>
-#include <Interpreters/SelectQueryOptions.h>
-#include <Interpreters/DatabaseAndTableWithAlias.h>
-#include <Storages/IStorage_fwd.h>
-#include <Interpreters/TreeCNFConverter.h>
-
+#include <memory>
 
 namespace DB
 {
 
+class CNFQuery;
 struct StorageInMemoryMetadata;
 using StorageMetadataPtr = std::shared_ptr<const StorageInMemoryMetadata>;
 
@@ -23,8 +16,7 @@ using StorageMetadataPtr = std::shared_ptr<const StorageInMemoryMetadata>;
 class AddIndexConstraintsOptimizer final
 {
 public:
-    AddIndexConstraintsOptimizer(
-        const StorageMetadataPtr & metadata_snapshot);
+    explicit AddIndexConstraintsOptimizer(const StorageMetadataPtr & metadata_snapshot);
 
     void perform(CNFQuery & cnf_query);
 

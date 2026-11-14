@@ -1,4 +1,5 @@
 #include <IO/WriteBufferFromFileDescriptorDiscardOnFailure.h>
+#include <Common/ProfileEvents.h>
 
 namespace ProfileEvents
 {
@@ -17,7 +18,10 @@ void WriteBufferFromFileDescriptorDiscardOnFailure::nextImpl()
 
         if ((-1 == res || 0 == res) && errno != EINTR)
         {
-            ProfileEvents::increment(ProfileEvents::CannotWriteToWriteBufferDiscard);
+            /// Never send this profile event to trace log because it may cause another
+            /// write into the same fd and likely will trigger the same error
+            /// and will lead to infinite recursion.
+            ProfileEvents::incrementSignalSafe(ProfileEvents::CannotWriteToWriteBufferDiscard);
             break;  /// Discard
         }
 

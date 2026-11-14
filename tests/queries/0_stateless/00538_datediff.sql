@@ -43,12 +43,12 @@ SELECT DATEDIFF('year', today(), today() - INTERVAL 10 YEAR);
 
 SELECT 'Dependance of timezones';
 
-SELECT dateDiff('month', toDate('2014-10-26'), toDate('2014-10-27'), 'Europe/Moscow');
-SELECT dateDiff('week', toDate('2014-10-26'), toDate('2014-10-27'), 'Europe/Moscow');
-SELECT dateDiff('day', toDate('2014-10-26'), toDate('2014-10-27'), 'Europe/Moscow');
-SELECT dateDiff('hour', toDate('2014-10-26'), toDate('2014-10-27'), 'Europe/Moscow');
-SELECT dateDiff('minute', toDate('2014-10-26'), toDate('2014-10-27'), 'Europe/Moscow');
-SELECT dateDiff('second', toDate('2014-10-26'), toDate('2014-10-27'), 'Europe/Moscow');
+SELECT dateDiff('month', toDate('2014-10-26'), toDate('2014-10-27'), 'Asia/Istanbul');
+SELECT dateDiff('week', toDate('2014-10-26'), toDate('2014-10-27'), 'Asia/Istanbul');
+SELECT dateDiff('day', toDate('2014-10-26'), toDate('2014-10-27'), 'Asia/Istanbul');
+SELECT dateDiff('hour', toDate('2014-10-26'), toDate('2014-10-27'), 'Asia/Istanbul');
+SELECT dateDiff('minute', toDate('2014-10-26'), toDate('2014-10-27'), 'Asia/Istanbul');
+SELECT dateDiff('second', toDate('2014-10-26'), toDate('2014-10-27'), 'Asia/Istanbul');
 
 SELECT dateDiff('month', toDate('2014-10-26'), toDate('2014-10-27'), 'UTC');
 SELECT dateDiff('week', toDate('2014-10-26'), toDate('2014-10-27'), 'UTC');
@@ -57,12 +57,12 @@ SELECT dateDiff('hour', toDate('2014-10-26'), toDate('2014-10-27'), 'UTC');
 SELECT dateDiff('minute', toDate('2014-10-26'), toDate('2014-10-27'), 'UTC');
 SELECT dateDiff('second', toDate('2014-10-26'), toDate('2014-10-27'), 'UTC');
 
-SELECT dateDiff('month', toDateTime('2014-10-26 00:00:00', 'Europe/Moscow'), toDateTime('2014-10-27 00:00:00', 'Europe/Moscow'));
-SELECT dateDiff('week', toDateTime('2014-10-26 00:00:00', 'Europe/Moscow'), toDateTime('2014-10-27 00:00:00', 'Europe/Moscow'));
-SELECT dateDiff('day', toDateTime('2014-10-26 00:00:00', 'Europe/Moscow'), toDateTime('2014-10-27 00:00:00', 'Europe/Moscow'));
-SELECT dateDiff('hour', toDateTime('2014-10-26 00:00:00', 'Europe/Moscow'), toDateTime('2014-10-27 00:00:00', 'Europe/Moscow'));
-SELECT dateDiff('minute', toDateTime('2014-10-26 00:00:00', 'Europe/Moscow'), toDateTime('2014-10-27 00:00:00', 'Europe/Moscow'));
-SELECT dateDiff('second', toDateTime('2014-10-26 00:00:00', 'Europe/Moscow'), toDateTime('2014-10-27 00:00:00', 'Europe/Moscow'));
+SELECT dateDiff('month', toDateTime('2014-10-26 00:00:00', 'Asia/Istanbul'), toDateTime('2014-10-27 00:00:00', 'Asia/Istanbul'));
+SELECT dateDiff('week', toDateTime('2014-10-26 00:00:00', 'Asia/Istanbul'), toDateTime('2014-10-27 00:00:00', 'Asia/Istanbul'));
+SELECT dateDiff('day', toDateTime('2014-10-26 00:00:00', 'Asia/Istanbul'), toDateTime('2014-10-27 00:00:00', 'Asia/Istanbul'));
+SELECT dateDiff('hour', toDateTime('2014-10-26 00:00:00', 'Asia/Istanbul'), toDateTime('2014-10-27 00:00:00', 'Asia/Istanbul'));
+SELECT dateDiff('minute', toDateTime('2014-10-26 00:00:00', 'Asia/Istanbul'), toDateTime('2014-10-27 00:00:00', 'Asia/Istanbul'));
+SELECT dateDiff('second', toDateTime('2014-10-26 00:00:00', 'Asia/Istanbul'), toDateTime('2014-10-27 00:00:00', 'Asia/Istanbul'));
 
 SELECT dateDiff('month', toDateTime('2014-10-26 00:00:00', 'UTC'), toDateTime('2014-10-27 00:00:00', 'UTC'));
 SELECT dateDiff('week', toDateTime('2014-10-26 00:00:00', 'UTC'), toDateTime('2014-10-27 00:00:00', 'UTC'));
@@ -74,3 +74,14 @@ SELECT dateDiff('second', toDateTime('2014-10-26 00:00:00', 'UTC'), toDateTime('
 SELECT 'Additional test';
 
 SELECT number = dateDiff('month', now() - INTERVAL number MONTH, now()) FROM system.numbers LIMIT 10;
+
+-- Regression: UBSan signed integer overflow in DateDiffImpl::calculate with extreme DateTime64 values (fuzzer input).
+-- Constant path:
+SELECT dateDiff('second', reinterpret(toInt64(9223372036854775807), 'DateTime64(0)'), reinterpret(toInt64(-1356997800), 'DateTime64(0)'));
+-- Vector path:
+SELECT dateDiff('second', materialize(reinterpret(toInt64(9223372036854775807), 'DateTime64(0)')), materialize(reinterpret(toInt64(-1356997800), 'DateTime64(0)')));
+-- The 'hour' and 'minute' units route through DateLUTImpl::toStableRelativeHourNum / toRelativeMinuteNum, a different overflow site.
+SELECT dateDiff('hour', reinterpret(toInt64(9223372036854775807), 'DateTime64(0)'), reinterpret(toInt64(-1356997800), 'DateTime64(0)'));
+SELECT dateDiff('hour', materialize(reinterpret(toInt64(9223372036854775807), 'DateTime64(0)')), materialize(reinterpret(toInt64(-1356997800), 'DateTime64(0)')));
+SELECT dateDiff('minute', reinterpret(toInt64(9223372036854775807), 'DateTime64(0)'), reinterpret(toInt64(-1356997800), 'DateTime64(0)'));
+SELECT dateDiff('minute', materialize(reinterpret(toInt64(9223372036854775807), 'DateTime64(0)')), materialize(reinterpret(toInt64(-1356997800), 'DateTime64(0)')));

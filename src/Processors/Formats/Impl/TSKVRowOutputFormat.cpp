@@ -1,19 +1,18 @@
+#include <DataTypes/Serializations/ISerialization.h>
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferFromString.h>
 #include <Processors/Formats/Impl/TSKVRowOutputFormat.h>
+#include <Processors/Port.h>
 #include <Formats/FormatFactory.h>
-
+#include <Formats/EscapingRuleUtils.h>
+#include <Formats/registerWithNamesAndTypes.h>
 
 namespace DB
 {
 
-TSKVRowOutputFormat::TSKVRowOutputFormat(WriteBuffer & out_, const Block & header, const RowOutputFormatParams & params_, const FormatSettings & format_settings_)
-    : TabSeparatedRowOutputFormat(out_, header, false, false, false, params_, format_settings_)
+TSKVRowOutputFormat::TSKVRowOutputFormat(WriteBuffer & out_, SharedHeader header, const FormatSettings & format_settings_)
+    : TabSeparatedRowOutputFormat(out_, header, false, false, false, format_settings_), fields(header->getNamesAndTypes())
 {
-    const auto & sample = getPort(PortKind::Main).getHeader();
-    NamesAndTypesList columns(sample.getNamesAndTypesList());
-    fields.assign(columns.begin(), columns.end());
-
     for (auto & field : fields)
     {
         WriteBufferFromOwnString wb;
@@ -39,17 +38,32 @@ void TSKVRowOutputFormat::writeRowEndDelimiter()
 }
 
 
+void registerOutputFormatTSKV(FormatFactory & factory);
 void registerOutputFormatTSKV(FormatFactory & factory)
 {
     factory.registerOutputFormat("TSKV", [](
         WriteBuffer & buf,
         const Block & sample,
-        const RowOutputFormatParams & params,
-        const FormatSettings & settings)
+        const FormatSettings & settings,
+        FormatFilterInfoPtr /*format_filter_info*/)
     {
-        return std::make_shared<TSKVRowOutputFormat>(buf, sample, params, settings);
+        return std::make_shared<TSKVRowOutputFormat>(buf, std::make_shared<const Block>(sample), settings);
     });
     factory.markOutputFormatSupportsParallelFormatting("TSKV");
+    factory.setContentType("TSKV", "text/tab-separated-values; charset=UTF-8");
+
+    /// `TSKV` always writes the column names into the header (`writeAnyEscapedString<'='>`, which
+    /// escapes control characters but does not validate UTF-8), so a column name that is not valid
+    /// UTF-8 (a quoted identifier with arbitrary bytes) makes the output non-textual. The values are
+    /// written through the `Escaped` serializations, which write the `TSV` `NULL` representation and
+    /// the `Bool` representations verbatim (see `settingsLiteralsMayProduceRawBytes`). All of this is
+    /// knowable from the header and the settings, so the text framings reject or base64-encode the
+    /// output accordingly.
+    factory.registerOutputFormatMayProduceRawBytesChecker("TSKV", [](const FormatSettings & settings, const Block & header)
+    {
+        return headerNamesMayProduceRawBytes(header, /*with_names=*/true, /*with_types=*/false)
+            || settingsLiteralsMayProduceRawBytes(settings, FormatSettings::EscapingRule::Escaped);
+    });
 }
 
 }

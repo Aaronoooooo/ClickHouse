@@ -4,6 +4,7 @@
 #include <bitset>
 #include <cstring>
 #include <vector>
+#include <unordered_map>
 
 
 namespace DB
@@ -15,17 +16,22 @@ using Strings = std::vector<String>;
 class AccessFlags
 {
 public:
-    AccessFlags(AccessType type);
+    AccessFlags(AccessType type); /// NOLINT
 
     /// The same as AccessFlags(AccessType::NONE).
     AccessFlags() = default;
 
     /// Constructs from a string like "SELECT".
-    AccessFlags(const std::string_view & keyword);
+    AccessFlags(std::string_view keyword); /// NOLINT
+
+    /// The same, but for callers that are only asking whether the keyword names an access type -
+    /// the parser checking which alternative it is looking at, for instance. Returns false rather
+    /// than throwing when it does not.
+    static bool tryFromKeyword(std::string_view keyword, AccessFlags & result);
 
     /// Constructs from a list of strings like "SELECT, UPDATE, INSERT".
-    AccessFlags(const std::vector<std::string_view> & keywords);
-    AccessFlags(const Strings & keywords);
+    AccessFlags(const std::vector<std::string_view> & keywords); /// NOLINT
+    AccessFlags(const Strings & keywords); /// NOLINT
 
     AccessFlags(const AccessFlags & src) = default;
     AccessFlags(AccessFlags && src) = default;
@@ -48,8 +54,22 @@ public:
     AccessFlags operator ~() const { AccessFlags res; res.flags = ~flags; return res; }
 
     bool isEmpty() const { return flags.none(); }
+    bool isAll() const { return flags.all(); }
     explicit operator bool() const { return !isEmpty(); }
     bool contains(const AccessFlags & other) const { return (flags & other.flags) == other.flags; }
+    bool isGlobalWithParameter() const;
+    bool validateParameter(String & parameter, std::function<void(const char *)> add_to_expected) const;
+    enum ParameterType
+    {
+        NONE,
+        SOURCE,
+        TABLE_ENGINE,
+        NAMED_COLLECTION,
+        USER_NAME,
+        DEFINER,
+    };
+    ParameterType getParameterType() const;
+    std::unordered_map<ParameterType, AccessFlags> splitIntoParameterTypes() const;
 
     friend bool operator ==(const AccessFlags & left, const AccessFlags & right) { return left.flags == right.flags; }
     friend bool operator !=(const AccessFlags & left, const AccessFlags & right) { return !(left == right); }
@@ -76,6 +96,8 @@ public:
     /// Returns all the global flags.
     static AccessFlags allGlobalFlags();
 
+    static AccessFlags allGlobalWithParameterFlags();
+
     /// Returns all the flags related to a database.
     static AccessFlags allDatabaseFlags();
 
@@ -88,9 +110,27 @@ public:
     /// Returns all the flags related to a dictionary.
     static AccessFlags allDictionaryFlags();
 
+    /// Returns all the flags related to a named collection.
+    static AccessFlags allNamedCollectionFlags();
+
+    /// Returns all the flags related to a user.
+    static AccessFlags allUserNameFlags();
+
+    /// Returns all the flags related to a definer.
+    static AccessFlags allDefinerFlags();
+
+    /// Returns all the flags related to a table engine.
+    static AccessFlags allTableEngineFlags();
+
+    /// Returns all the flags related to a source.
+    static AccessFlags allSourceFlags();
+
     /// Returns all the flags which could be granted on the global level.
     /// The same as allFlags().
     static AccessFlags allFlagsGrantableOnGlobalLevel();
+
+    /// Returns all the flags which could be granted on the global with parameter level.
+    static AccessFlags allFlagsGrantableOnGlobalWithParameterLevel();
 
     /// Returns all the flags which could be granted on the database level.
     /// Returns allDatabaseFlags() | allTableFlags() | allDictionaryFlags() | allColumnFlags().
@@ -104,12 +144,12 @@ public:
     /// The same as allColumnFlags().
     static AccessFlags allFlagsGrantableOnColumnLevel();
 
-    static constexpr size_t SIZE = 128;
+    static constexpr size_t SIZE = 256;
 private:
     using Flags = std::bitset<SIZE>;
     Flags flags;
 
-    AccessFlags(const Flags & flags_) : flags(flags_) {}
+    AccessFlags(const Flags & flags_) : flags(flags_) {} /// NOLINT
 };
 
 AccessFlags operator |(AccessType left, AccessType right);

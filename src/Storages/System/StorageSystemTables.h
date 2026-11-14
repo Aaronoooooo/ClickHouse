@@ -1,7 +1,8 @@
 #pragma once
 
-#include <base/shared_ptr_helper.h>
-#include <Storages/IStorage.h>
+#include <Databases/IDatabase.h>
+#include <Storages/StorageWithCommonVirtualColumns.h>
+#include <Interpreters/ActionsDAG.h>
 
 
 namespace DB
@@ -9,28 +10,46 @@ namespace DB
 
 class Context;
 
+namespace detail
+{
+
+ColumnPtr getFilteredDatabases(const ActionsDAG::Node * predicate, ContextPtr context);
+
+/// The table names of `filtered_databases_column` that can pass `predicate`. `tables_filter` is
+/// what the query asks of the table name column (`name` here, `table` for the detached tables),
+/// and lets each database enumerate less than everything it holds.
+ColumnPtr getFilteredTables(
+    const ActionsDAG::Node * predicate,
+    const ColumnPtr & filtered_databases_column,
+    ContextPtr context,
+    bool is_detached,
+    const TablesFilter & tables_filter);
+
+}
+
 
 /** Implements the system table `tables`, which allows you to get information about all tables.
   */
-class StorageSystemTables final : public shared_ptr_helper<StorageSystemTables>, public IStorage
+class StorageSystemTables final : public StorageWithCommonVirtualColumns
 {
-    friend struct shared_ptr_helper<StorageSystemTables>;
 public:
+    explicit StorageSystemTables(const StorageID & table_id_);
+
     std::string getName() const override { return "SystemTables"; }
 
-    Pipe read(
+    static VirtualColumnsDescription createVirtuals();
+
+    void readImpl(
+        QueryPlan & query_plan,
         const Names & column_names,
-        const StorageMetadataPtr & /*metadata_*/,
-        SelectQueryInfo & query_info,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & /*query_info*/,
         ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
-        unsigned num_streams) override;
+        size_t num_streams) override;
 
     bool isSystemStorage() const override { return true; }
-
-protected:
-    StorageSystemTables(const StorageID & table_id_);
 };
 
 }

@@ -1,22 +1,34 @@
-import pytest
-from helpers.cluster import ClickHouseCluster
+import os
 import random
 import string
-import os
+import threading
 import time
 from multiprocessing.dummy import Pool
 
+import pytest
+
+import helpers.keeper_utils as keeper_utils
+from helpers.test_tools import get_retry_number
+from helpers.cluster import ClickHouseCluster
+from kazoo.client import KazooState
+
 cluster = ClickHouseCluster(__file__)
-node = cluster.add_instance('node', main_configs=['configs/enable_keeper.xml'], with_zookeeper=True, use_keeper=False)
-from kazoo.client import KazooClient, KazooState, KeeperState
+node = cluster.add_instance(
+    "node",
+    main_configs=["configs/enable_keeper.xml"],
+    with_zookeeper=True,
+    use_keeper=False,
+)
+
 
 def get_genuine_zk():
     print("Zoo1", cluster.get_instance_ip("zoo1"))
-    return cluster.get_kazoo_client('zoo1')
+    return cluster.get_kazoo_client("zoo1")
+
 
 def get_fake_zk():
-    print("node", cluster.get_instance_ip("node"))
-    _fake_zk_instance =  KazooClient(hosts=cluster.get_instance_ip("node") + ":9181", timeout=30.0)
+    _fake_zk_instance = keeper_utils.get_fake_zk(cluster, "node", start=False)
+
     def reset_last_zxid_listener(state):
         print("Fake zk callback called for state", state)
         nonlocal _fake_zk_instance
@@ -27,13 +39,16 @@ def get_fake_zk():
     _fake_zk_instance.start()
     return _fake_zk_instance
 
+
 def random_string(length):
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
 
 def create_random_path(prefix="", depth=1):
     if depth == 0:
         return prefix
     return create_random_path(os.path.join(prefix, random_string(3)), depth - 1)
+
 
 def stop_zk(zk):
     try:
@@ -55,80 +70,100 @@ def started_cluster():
         cluster.shutdown()
 
 
-def test_simple_commands(started_cluster):
+def test_simple_commands(started_cluster, request):
+    retry = get_retry_number(request)
+
     try:
         genuine_zk = get_genuine_zk()
         fake_zk = get_fake_zk()
 
         for zk in [genuine_zk, fake_zk]:
-            zk.create("/test_simple_commands", b"")
-            zk.create("/test_simple_commands/somenode1", b"hello")
-            zk.set("/test_simple_commands/somenode1", b"world")
+            zk.create(f"/test_simple_commands_{retry}", b"")
+            zk.create(f"/test_simple_commands_{retry}/somenode1", b"hello")
+            zk.set(f"/test_simple_commands_{retry}/somenode1", b"world")
 
         for zk in [genuine_zk, fake_zk]:
-            assert zk.exists("/test_simple_commands")
-            assert zk.exists("/test_simple_commands/somenode1")
-            print(zk.get("/test_simple_commands/somenode1"))
-            assert zk.get("/test_simple_commands/somenode1")[0] == b"world"
+            assert zk.exists(f"/test_simple_commands_{retry}")
+            assert zk.exists(f"/test_simple_commands_{retry}/somenode1")
+            print(zk.get(f"/test_simple_commands_{retry}/somenode1"))
+            assert zk.get(f"/test_simple_commands_{retry}/somenode1")[0] == b"world"
     finally:
         for zk in [genuine_zk, fake_zk]:
             stop_zk(zk)
 
 
-def test_sequential_nodes(started_cluster):
+def test_sequential_nodes(started_cluster, request):
+    retry = get_retry_number(request)
+
     try:
         genuine_zk = get_genuine_zk()
         fake_zk = get_fake_zk()
-        genuine_zk.create("/test_sequential_nodes")
-        fake_zk.create("/test_sequential_nodes")
+        genuine_zk.create(f"/test_sequential_nodes_{retry}")
+        fake_zk.create(f"/test_sequential_nodes_{retry}")
         for i in range(1, 11):
-            genuine_zk.create("/test_sequential_nodes/" + ("a" * i) + "-", sequence=True)
-            genuine_zk.create("/test_sequential_nodes/" + ("b" * i))
-            fake_zk.create("/test_sequential_nodes/" + ("a" * i) + "-", sequence=True)
-            fake_zk.create("/test_sequential_nodes/" + ("b" * i))
+            genuine_zk.create(
+                f"/test_sequential_nodes_{retry}/" + ("a" * i) + "-", sequence=True
+            )
+            genuine_zk.create(f"/test_sequential_nodes_{retry}/" + ("b" * i))
+            fake_zk.create(
+                f"/test_sequential_nodes_{retry}/" + ("a" * i) + "-", sequence=True
+            )
+            fake_zk.create(f"/test_sequential_nodes_{retry}/" + ("b" * i))
 
-        genuine_childs = list(sorted(genuine_zk.get_children("/test_sequential_nodes")))
-        fake_childs = list(sorted(fake_zk.get_children("/test_sequential_nodes")))
+        genuine_childs = list(
+            sorted(genuine_zk.get_children(f"/test_sequential_nodes_{retry}"))
+        )
+        fake_childs = list(
+            sorted(fake_zk.get_children(f"/test_sequential_nodes_{retry}"))
+        )
         assert genuine_childs == fake_childs
 
-        genuine_zk.create("/test_sequential_nodes_1")
-        fake_zk.create("/test_sequential_nodes_1")
+        genuine_zk.create(f"/test_sequential_nodes_{retry}_1")
+        fake_zk.create(f"/test_sequential_nodes_{retry}_1")
 
-        genuine_zk.create("/test_sequential_nodes_1/a", sequence=True)
-        fake_zk.create("/test_sequential_nodes_1/a", sequence=True)
+        genuine_zk.create(f"/test_sequential_nodes_{retry}_1/a", sequence=True)
+        fake_zk.create(f"/test_sequential_nodes_{retry}_1/a", sequence=True)
 
-        genuine_zk.create("/test_sequential_nodes_1/a0000000002")
-        fake_zk.create("/test_sequential_nodes_1/a0000000002")
+        genuine_zk.create(f"/test_sequential_nodes_{retry}_1/a0000000002")
+        fake_zk.create(f"/test_sequential_nodes_{retry}_1/a0000000002")
 
         genuine_throw = False
         fake_throw = False
         try:
-            genuine_zk.create("/test_sequential_nodes_1/a", sequence=True)
-        except Exception as ex:
+            genuine_zk.create(f"/test_sequential_nodes_{retry}_1/a", sequence=True)
+        except Exception:
             genuine_throw = True
 
         try:
-            fake_zk.create("/test_sequential_nodes_1/a", sequence=True)
-        except Exception as ex:
+            fake_zk.create(f"/test_sequential_nodes_{retry}_1/a", sequence=True)
+        except Exception:
             fake_throw = True
 
         assert genuine_throw == True
         assert fake_throw == True
 
-        genuine_childs_1 = list(sorted(genuine_zk.get_children("/test_sequential_nodes_1")))
-        fake_childs_1 = list(sorted(fake_zk.get_children("/test_sequential_nodes_1")))
+        genuine_childs_1 = list(
+            sorted(genuine_zk.get_children(f"/test_sequential_nodes_{retry}_1"))
+        )
+        fake_childs_1 = list(
+            sorted(fake_zk.get_children(f"/test_sequential_nodes_{retry}_1"))
+        )
         assert genuine_childs_1 == fake_childs_1
 
-        genuine_zk.create("/test_sequential_nodes_2")
-        fake_zk.create("/test_sequential_nodes_2")
+        genuine_zk.create(f"/test_sequential_nodes_{retry}_2")
+        fake_zk.create(f"/test_sequential_nodes_{retry}_2")
 
-        genuine_zk.create("/test_sequential_nodes_2/node")
-        fake_zk.create("/test_sequential_nodes_2/node")
-        genuine_zk.create("/test_sequential_nodes_2/node", sequence=True)
-        fake_zk.create("/test_sequential_nodes_2/node", sequence=True)
+        genuine_zk.create(f"/test_sequential_nodes_{retry}_2/node")
+        fake_zk.create(f"/test_sequential_nodes_{retry}_2/node")
+        genuine_zk.create(f"/test_sequential_nodes_{retry}_2/node", sequence=True)
+        fake_zk.create(f"/test_sequential_nodes_{retry}_2/node", sequence=True)
 
-        genuine_childs_2 = list(sorted(genuine_zk.get_children("/test_sequential_nodes_2")))
-        fake_childs_2 = list(sorted(fake_zk.get_children("/test_sequential_nodes_2")))
+        genuine_childs_2 = list(
+            sorted(genuine_zk.get_children(f"/test_sequential_nodes_{retry}_2"))
+        )
+        fake_childs_2 = list(
+            sorted(fake_zk.get_children(f"/test_sequential_nodes_{retry}_2"))
+        )
         assert genuine_childs_2 == fake_childs_2
     finally:
         for zk in [genuine_zk, fake_zk]:
@@ -139,46 +174,68 @@ def assert_eq_stats(stat1, stat2):
     assert stat1.version == stat2.version
     assert stat1.cversion == stat2.cversion
     assert stat1.aversion == stat2.aversion
-    assert stat1.aversion == stat2.aversion
+    assert stat1.ephemeralOwner == stat2.ephemeralOwner
     assert stat1.dataLength == stat2.dataLength
     assert stat1.numChildren == stat2.numChildren
 
-def test_stats(started_cluster):
+
+def test_stats(started_cluster, request):
+    retry = get_retry_number(request)
+
     try:
         genuine_zk = get_genuine_zk()
         fake_zk = get_fake_zk()
-        genuine_zk.create("/test_stats_nodes")
-        fake_zk.create("/test_stats_nodes")
-        genuine_stats = genuine_zk.exists("/test_stats_nodes")
-        fake_stats = fake_zk.exists("/test_stats_nodes")
+        genuine_zk.create(f"/test_stats_nodes_{retry}")
+        fake_zk.create(f"/test_stats_nodes_{retry}")
+        genuine_stats = genuine_zk.exists(f"/test_stats_nodes_{retry}")
+        fake_stats = fake_zk.exists(f"/test_stats_nodes_{retry}")
         assert_eq_stats(genuine_stats, fake_stats)
         for i in range(1, 11):
-            genuine_zk.create("/test_stats_nodes/" + ("a" * i) + "-", sequence=True)
-            genuine_zk.create("/test_stats_nodes/" + ("b" * i))
-            fake_zk.create("/test_stats_nodes/" + ("a" * i) + "-", sequence=True)
-            fake_zk.create("/test_stats_nodes/" + ("b" * i))
+            genuine_zk.create(
+                f"/test_stats_nodes_{retry}/" + ("a" * i) + "-", sequence=True
+            )
+            genuine_zk.create(f"/test_stats_nodes_{retry}/" + ("b" * i))
+            fake_zk.create(
+                f"/test_stats_nodes_{retry}/" + ("a" * i) + "-", sequence=True
+            )
+            fake_zk.create(f"/test_stats_nodes_{retry}/" + ("b" * i))
 
-        genuine_stats = genuine_zk.exists("/test_stats_nodes")
-        fake_stats = fake_zk.exists("/test_stats_nodes")
+        genuine_stats = genuine_zk.exists(f"/test_stats_nodes_{retry}")
+        fake_stats = fake_zk.exists(f"/test_stats_nodes_{retry}")
         assert_eq_stats(genuine_stats, fake_stats)
         for i in range(1, 11):
-            print("/test_stats_nodes/" + ("a" * i) + "-" + "{:010d}".format((i - 1) * 2))
-            genuine_zk.delete("/test_stats_nodes/" + ("a" * i) + "-" + "{:010d}".format((i - 1) * 2))
-            genuine_zk.delete("/test_stats_nodes/" + ("b" * i))
-            fake_zk.delete("/test_stats_nodes/" + ("a" * i) + "-" + "{:010d}".format((i - 1) * 2))
-            fake_zk.delete("/test_stats_nodes/" + ("b" * i))
+            print(
+                f"/test_stats_nodes_{retry}/"
+                + ("a" * i)
+                + "-"
+                + "{:010d}".format((i - 1) * 2)
+            )
+            genuine_zk.delete(
+                f"/test_stats_nodes_{retry}/"
+                + ("a" * i)
+                + "-"
+                + "{:010d}".format((i - 1) * 2)
+            )
+            genuine_zk.delete(f"/test_stats_nodes_{retry}/" + ("b" * i))
+            fake_zk.delete(
+                f"/test_stats_nodes_{retry}/"
+                + ("a" * i)
+                + "-"
+                + "{:010d}".format((i - 1) * 2)
+            )
+            fake_zk.delete(f"/test_stats_nodes_{retry}/" + ("b" * i))
 
-        genuine_stats = genuine_zk.exists("/test_stats_nodes")
-        fake_stats = fake_zk.exists("/test_stats_nodes")
+        genuine_stats = genuine_zk.exists(f"/test_stats_nodes_{retry}")
+        fake_stats = fake_zk.exists(f"/test_stats_nodes_{retry}")
         print(genuine_stats)
         print(fake_stats)
         assert_eq_stats(genuine_stats, fake_stats)
         for i in range(100):
-            genuine_zk.set("/test_stats_nodes", ("q" * i).encode())
-            fake_zk.set("/test_stats_nodes", ("q" * i).encode())
+            genuine_zk.set(f"/test_stats_nodes_{retry}", ("q" * i).encode())
+            fake_zk.set(f"/test_stats_nodes_{retry}", ("q" * i).encode())
 
-        genuine_stats = genuine_zk.exists("/test_stats_nodes")
-        fake_stats = fake_zk.exists("/test_stats_nodes")
+        genuine_stats = genuine_zk.exists(f"/test_stats_nodes_{retry}")
+        fake_stats = fake_zk.exists(f"/test_stats_nodes_{retry}")
         print(genuine_stats)
         print(fake_stats)
         assert_eq_stats(genuine_stats, fake_stats)
@@ -186,64 +243,79 @@ def test_stats(started_cluster):
         for zk in [genuine_zk, fake_zk]:
             stop_zk(zk)
 
-def test_watchers(started_cluster):
+
+def test_watchers(started_cluster, request):
+    retry = get_retry_number(request)
+
     try:
         genuine_zk = get_genuine_zk()
         fake_zk = get_fake_zk()
-        genuine_zk.create("/test_data_watches")
-        fake_zk.create("/test_data_watches")
+        genuine_zk.create(f"/test_data_watches_{retry}")
+        fake_zk.create(f"/test_data_watches_{retry}")
         genuine_data_watch_data = None
 
         def genuine_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Genuine data watch called")
             nonlocal genuine_data_watch_data
             genuine_data_watch_data = event
 
         fake_data_watch_data = None
+
         def fake_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Fake data watch called")
             nonlocal fake_data_watch_data
             fake_data_watch_data = event
 
-        genuine_zk.get("/test_data_watches", watch=genuine_callback)
-        fake_zk.get("/test_data_watches", watch=fake_callback)
+        genuine_zk.get(f"/test_data_watches_{retry}", watch=genuine_callback)
+        fake_zk.get(f"/test_data_watches_{retry}", watch=fake_callback)
 
         print("Calling set genuine")
-        genuine_zk.set("/test_data_watches", b"a")
+        genuine_zk.set(f"/test_data_watches_{retry}", b"a")
         print("Calling set fake")
-        fake_zk.set("/test_data_watches", b"a")
+        fake_zk.set(f"/test_data_watches_{retry}", b"a")
         time.sleep(3)
 
         print("Genuine data", genuine_data_watch_data)
         print("Fake data", fake_data_watch_data)
         assert genuine_data_watch_data == fake_data_watch_data
 
-
-        genuine_zk.create("/test_data_watches/child", b"a")
-        fake_zk.create("/test_data_watches/child", b"a")
+        genuine_zk.create(f"/test_data_watches_{retry}/child", b"a")
+        fake_zk.create(f"/test_data_watches_{retry}/child", b"a")
 
         genuine_children = None
+
         def genuine_child_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Genuine child watch called")
             nonlocal genuine_children
             genuine_children = event
 
         fake_children = None
+
         def fake_child_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Fake child watch called")
             nonlocal fake_children
             fake_children = event
 
-        genuine_zk.get_children("/test_data_watches", watch=genuine_child_callback)
-        fake_zk.get_children("/test_data_watches", watch=fake_child_callback)
+        genuine_zk.get_children(
+            f"/test_data_watches_{retry}", watch=genuine_child_callback
+        )
+        fake_zk.get_children(f"/test_data_watches_{retry}", watch=fake_child_callback)
 
         print("Calling non related genuine child")
-        genuine_zk.set("/test_data_watches/child", b"q")
-        genuine_zk.set("/test_data_watches", b"q")
+        genuine_zk.set(f"/test_data_watches_{retry}/child", b"q")
+        genuine_zk.set(f"/test_data_watches_{retry}", b"q")
 
         print("Calling non related fake child")
-        fake_zk.set("/test_data_watches/child", b"q")
-        fake_zk.set("/test_data_watches", b"q")
+        fake_zk.set(f"/test_data_watches_{retry}/child", b"q")
+        fake_zk.set(f"/test_data_watches_{retry}", b"q")
 
         time.sleep(3)
 
@@ -251,9 +323,9 @@ def test_watchers(started_cluster):
         assert fake_children == None
 
         print("Calling genuine child")
-        genuine_zk.create("/test_data_watches/child_new", b"b")
+        genuine_zk.create(f"/test_data_watches_{retry}/child_new", b"b")
         print("Calling fake child")
-        fake_zk.create("/test_data_watches/child_new", b"b")
+        fake_zk.create(f"/test_data_watches_{retry}/child_new", b"b")
 
         time.sleep(3)
 
@@ -262,38 +334,58 @@ def test_watchers(started_cluster):
         assert genuine_children == fake_children
 
         genuine_children_delete = None
+
         def genuine_child_delete_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Genuine child watch called")
             nonlocal genuine_children_delete
             genuine_children_delete = event
 
         fake_children_delete = None
+
         def fake_child_delete_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Fake child watch called")
             nonlocal fake_children_delete
             fake_children_delete = event
 
         genuine_child_delete = None
+
         def genuine_own_delete_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Genuine child watch called")
             nonlocal genuine_child_delete
             genuine_child_delete = event
 
         fake_child_delete = None
+
         def fake_own_delete_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Fake child watch called")
             nonlocal fake_child_delete
             fake_child_delete = event
 
-        genuine_zk.get_children("/test_data_watches", watch=genuine_child_delete_callback)
-        fake_zk.get_children("/test_data_watches", watch=fake_child_delete_callback)
-        genuine_zk.get_children("/test_data_watches/child", watch=genuine_own_delete_callback)
-        fake_zk.get_children("/test_data_watches/child", watch=fake_own_delete_callback)
+        genuine_zk.get_children(
+            f"/test_data_watches_{retry}", watch=genuine_child_delete_callback
+        )
+        fake_zk.get_children(
+            f"/test_data_watches_{retry}", watch=fake_child_delete_callback
+        )
+        genuine_zk.get_children(
+            f"/test_data_watches_{retry}/child", watch=genuine_own_delete_callback
+        )
+        fake_zk.get_children(
+            f"/test_data_watches_{retry}/child", watch=fake_own_delete_callback
+        )
 
         print("Calling genuine child delete")
-        genuine_zk.delete("/test_data_watches/child")
+        genuine_zk.delete(f"/test_data_watches_{retry}/child")
         print("Calling fake child delete")
-        fake_zk.delete("/test_data_watches/child")
+        fake_zk.delete(f"/test_data_watches_{retry}/child")
 
         time.sleep(3)
 
@@ -309,49 +401,63 @@ def test_watchers(started_cluster):
         for zk in [genuine_zk, fake_zk]:
             stop_zk(zk)
 
-def test_multitransactions(started_cluster):
+
+def test_multitransactions(started_cluster, request):
+    retry = get_retry_number(request)
+
     try:
         genuine_zk = get_genuine_zk()
         fake_zk = get_fake_zk()
         for zk in [genuine_zk, fake_zk]:
-            zk.create('/test_multitransactions')
+            zk.create(f"/test_multitransactions_{retry}")
             t = zk.transaction()
-            t.create('/test_multitransactions/freddy')
-            t.create('/test_multitransactions/fred', ephemeral=True)
-            t.create('/test_multitransactions/smith', sequence=True)
+            t.create(f"/test_multitransactions_{retry}/freddy")
+            t.create(f"/test_multitransactions_{retry}/fred", ephemeral=True)
+            t.create(f"/test_multitransactions_{retry}/smith", sequence=True)
             results = t.commit()
             assert len(results) == 3
-            assert results[0] == '/test_multitransactions/freddy'
-            assert results[2].startswith('/test_multitransactions/smith0') is True
+            assert results[0] == f"/test_multitransactions_{retry}/freddy"
+            assert (
+                results[2].startswith(f"/test_multitransactions_{retry}/smith0") is True
+            )
 
-        from kazoo.exceptions import RolledBackError, NoNodeError
+        from kazoo.exceptions import NoNodeError, RolledBackError
+
         for i, zk in enumerate([genuine_zk, fake_zk]):
             print("Processing ZK", i)
             t = zk.transaction()
-            t.create('/test_multitransactions/q')
-            t.delete('/test_multitransactions/a')
-            t.create('/test_multitransactions/x')
+            t.create(f"/test_multitransactions_{retry}/q")
+            t.delete(f"/test_multitransactions_{retry}/a")
+            t.create(f"/test_multitransactions_{retry}/x")
             results = t.commit()
             print("Results", results)
             assert results[0].__class__ == RolledBackError
             assert results[1].__class__ == NoNodeError
-            assert zk.exists('/test_multitransactions/q') is None
-            assert zk.exists('/test_multitransactions/a') is None
-            assert zk.exists('/test_multitransactions/x') is None
+            assert zk.exists(f"/test_multitransactions_{retry}/q") is None
+            assert zk.exists(f"/test_multitransactions_{retry}/a") is None
+            assert zk.exists(f"/test_multitransactions_{retry}/x") is None
     finally:
         for zk in [genuine_zk, fake_zk]:
             stop_zk(zk)
+
 
 def exists(zk, path):
     result = zk.exists(path)
     return result is not None
 
+
 def get(zk, path):
     result = zk.get(path)
     return result[0]
 
+
 def get_children(zk, path):
-    return [elem for elem in list(sorted(zk.get_children(path))) if elem not in ('clickhouse', 'zookeeper')]
+    return [
+        elem
+        for elem in list(sorted(zk.get_children(path)))
+        if elem not in ("clickhouse", "zookeeper")
+    ]
+
 
 READ_REQUESTS = [
     ("exists", exists),
@@ -377,9 +483,8 @@ WRITE_REQUESTS = [
 def delete(zk, path):
     zk.delete(path)
 
-DELETE_REQUESTS = [
-    ("delete", delete)
-]
+
+DELETE_REQUESTS = [("delete", delete)]
 
 
 class Request(object):
@@ -390,8 +495,9 @@ class Request(object):
         self.is_return = is_return
 
     def __str__(self):
-        arg_str = ', '.join([str(k) + "=" + str(v) for k, v in self.arguments.items()])
+        arg_str = ", ".join([str(k) + "=" + str(v) for k, v in self.arguments.items()])
         return "ZKRequest name {} with arguments {}".format(self.name, arg_str)
+
 
 def generate_requests(prefix="/", iters=1):
     requests = []
@@ -404,18 +510,29 @@ def generate_requests(prefix="/", iters=1):
                 path = create_random_path(path, 1)
                 existing_paths.append(path)
                 value = random_string(1000)
-                request = Request("create", {"path" : path, "value": value[0:10]}, lambda zk, path=path, value=value: create(zk, path, value), False)
+                request = Request(
+                    "create",
+                    {"path": path, "value": value[0:10]},
+                    lambda zk, path=path, value=value: create(zk, path, value),
+                    False,
+                )
                 requests.append(request)
 
         for _ in range(100):
             path = random.choice(existing_paths)
             value = random_string(100)
-            request = Request("set", {"path": path, "value": value[0:10]}, lambda zk, path=path, value=value: set_data(zk, path, value), False)
+            request = Request(
+                "set",
+                {"path": path, "value": value[0:10]},
+                lambda zk, path=path, value=value: set_data(zk, path, value),
+                False,
+            )
             requests.append(request)
 
         for _ in range(100):
             path = random.choice(existing_paths)
             callback = random.choice(READ_REQUESTS)
+
             def read_func1(zk, path=path, callback=callback):
                 return callback[1](zk, path)
 
@@ -424,26 +541,32 @@ def generate_requests(prefix="/", iters=1):
 
         for _ in range(30):
             path = random.choice(existing_paths)
-            request = Request("delete", {"path": path}, lambda zk, path=path: delete(zk, path), False)
+            request = Request(
+                "delete", {"path": path}, lambda zk, path=path: delete(zk, path), False
+            )
 
         for _ in range(100):
             path = random.choice(existing_paths)
             callback = random.choice(READ_REQUESTS)
+
             def read_func2(zk, path=path, callback=callback):
                 return callback[1](zk, path)
+
             request = Request(callback[0], {"path": path}, read_func2, True)
             requests.append(request)
     return requests
 
 
-def test_random_requests(started_cluster):
+def test_random_requests(started_cluster, request):
+    retry = get_retry_number(request)
+
     try:
-        requests = generate_requests("/test_random_requests", 10)
+        requests = generate_requests(f"/test_random_requests_{retry}", 10)
         print("Generated", len(requests), "requests")
         genuine_zk = get_genuine_zk()
         fake_zk = get_fake_zk()
-        genuine_zk.create("/test_random_requests")
-        fake_zk.create("/test_random_requests")
+        genuine_zk.create(f"/test_random_requests_{retry}")
+        fake_zk.create(f"/test_random_requests_{retry}")
         for i, request in enumerate(requests):
             genuine_throw = False
             fake_throw = False
@@ -463,16 +586,32 @@ def test_random_requests(started_cluster):
                 print("Fake exception", str(ex))
                 fake_throw = True
 
-            assert fake_throw == genuine_throw, "Fake throw genuine not or vise versa request {}"
+            assert (
+                fake_throw == genuine_throw
+            ), "Fake throw genuine not or vise versa request {}"
             assert fake_result == genuine_result, "Zookeeper results differ"
-        root_children_genuine = [elem for elem in list(sorted(genuine_zk.get_children("/test_random_requests"))) if elem not in ('clickhouse', 'zookeeper')]
-        root_children_fake = [elem for elem in list(sorted(fake_zk.get_children("/test_random_requests"))) if elem not in ('clickhouse', 'zookeeper')]
+        root_children_genuine = [
+            elem
+            for elem in list(
+                sorted(genuine_zk.get_children(f"/test_random_requests_{retry}"))
+            )
+            if elem not in ("clickhouse", "zookeeper")
+        ]
+        root_children_fake = [
+            elem
+            for elem in list(
+                sorted(fake_zk.get_children(f"/test_random_requests_{retry}"))
+            )
+            if elem not in ("clickhouse", "zookeeper")
+        ]
         assert root_children_fake == root_children_genuine
     finally:
         for zk in [genuine_zk, fake_zk]:
             stop_zk(zk)
 
-def test_end_of_session(started_cluster):
+
+def test_end_of_session(started_cluster, request):
+    retry = get_retry_number(request)
 
     fake_zk1 = None
     fake_zk2 = None
@@ -480,37 +619,55 @@ def test_end_of_session(started_cluster):
     genuine_zk2 = None
 
     try:
-        fake_zk1 = KazooClient(hosts=cluster.get_instance_ip("node") + ":9181")
-        fake_zk1.start()
-        fake_zk2 = KazooClient(hosts=cluster.get_instance_ip("node") + ":9181")
-        fake_zk2.start()
-        genuine_zk1 = cluster.get_kazoo_client('zoo1')
+        fake_zk1 = keeper_utils.get_fake_zk(cluster, "node")
+        fake_zk2 = keeper_utils.get_fake_zk(cluster, "node")
+        genuine_zk1 = cluster.get_kazoo_client("zoo1")
         genuine_zk1.start()
-        genuine_zk2 = cluster.get_kazoo_client('zoo1')
+        genuine_zk2 = cluster.get_kazoo_client("zoo1")
         genuine_zk2.start()
 
-        fake_zk1.create("/test_end_of_session")
-        genuine_zk1.create("/test_end_of_session")
+        fake_zk1.create(f"/test_end_of_session_{retry}")
+        genuine_zk1.create(f"/test_end_of_session_{retry}")
         fake_ephemeral_event = None
+
         def fake_ephemeral_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Fake watch triggered")
             nonlocal fake_ephemeral_event
             fake_ephemeral_event = event
 
         genuine_ephemeral_event = None
+
         def genuine_ephemeral_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             print("Genuine watch triggered")
             nonlocal genuine_ephemeral_event
             genuine_ephemeral_event = event
 
-        assert fake_zk2.exists("/test_end_of_session") is not None
-        assert genuine_zk2.exists("/test_end_of_session") is not None
+        assert fake_zk2.exists(f"/test_end_of_session_{retry}") is not None
+        assert genuine_zk2.exists(f"/test_end_of_session_{retry}") is not None
 
-        fake_zk1.create("/test_end_of_session/ephemeral_node", ephemeral=True)
-        genuine_zk1.create("/test_end_of_session/ephemeral_node", ephemeral=True)
+        fake_zk1.create(f"/test_end_of_session_{retry}/ephemeral_node", ephemeral=True)
+        genuine_zk1.create(
+            f"/test_end_of_session_{retry}/ephemeral_node", ephemeral=True
+        )
 
-        assert fake_zk2.exists("/test_end_of_session/ephemeral_node", watch=fake_ephemeral_callback) is not None
-        assert genuine_zk2.exists("/test_end_of_session/ephemeral_node", watch=genuine_ephemeral_callback) is not None
+        assert (
+            fake_zk2.exists(
+                f"/test_end_of_session_{retry}/ephemeral_node",
+                watch=fake_ephemeral_callback,
+            )
+            is not None
+        )
+        assert (
+            genuine_zk2.exists(
+                f"/test_end_of_session_{retry}/ephemeral_node",
+                watch=genuine_ephemeral_callback,
+            )
+            is not None
+        )
 
         print("Stopping genuine zk")
         genuine_zk1.stop()
@@ -522,8 +679,10 @@ def test_end_of_session(started_cluster):
         print("Closing fake zk")
         fake_zk1.close()
 
-        assert fake_zk2.exists("/test_end_of_session/ephemeral_node") is None
-        assert genuine_zk2.exists("/test_end_of_session/ephemeral_node") is None
+        assert fake_zk2.exists(f"/test_end_of_session_{retry}/ephemeral_node") is None
+        assert (
+            genuine_zk2.exists(f"/test_end_of_session_{retry}/ephemeral_node") is None
+        )
 
         assert fake_ephemeral_event == genuine_ephemeral_event
 
@@ -531,61 +690,94 @@ def test_end_of_session(started_cluster):
         for zk in [fake_zk1, fake_zk2, genuine_zk1, genuine_zk2]:
             stop_zk(zk)
 
-def test_end_of_watches_session(started_cluster):
+
+def test_end_of_watches_session(started_cluster, request):
+    retry = get_retry_number(request)
+
     fake_zk1 = None
     fake_zk2 = None
     try:
-        fake_zk1 = KazooClient(hosts=cluster.get_instance_ip("node") + ":9181")
-        fake_zk1.start()
+        fake_zk1 = keeper_utils.get_fake_zk(cluster, "node")
+        fake_zk2 = keeper_utils.get_fake_zk(cluster, "node")
 
-        fake_zk2 = KazooClient(hosts=cluster.get_instance_ip("node") + ":9181")
-        fake_zk2.start()
-
-        fake_zk1.create("/test_end_of_watches_session")
+        fake_zk1.create(f"/test_end_of_watches_session_{retry}")
 
         dummy_set = 0
+
         def dummy_callback(event):
+            if not keeper_utils.is_znode_watch_event(event):
+                return
             nonlocal dummy_set
             dummy_set += 1
             print(event)
 
         for child_node in range(100):
-            fake_zk1.create("/test_end_of_watches_session/" + str(child_node))
-            fake_zk1.get_children("/test_end_of_watches_session/" + str(child_node), watch=dummy_callback)
+            fake_zk1.create(f"/test_end_of_watches_session_{retry}/" + str(child_node))
+            fake_zk1.get_children(
+                f"/test_end_of_watches_session_{retry}/" + str(child_node),
+                watch=dummy_callback,
+            )
 
-        fake_zk2.get_children("/test_end_of_watches_session/" + str(0), watch=dummy_callback)
-        fake_zk2.get_children("/test_end_of_watches_session/" + str(1), watch=dummy_callback)
+        fake_zk2.get_children(
+            f"/test_end_of_watches_session_{retry}/" + str(0), watch=dummy_callback
+        )
+        fake_zk2.get_children(
+            f"/test_end_of_watches_session_{retry}/" + str(1), watch=dummy_callback
+        )
 
         fake_zk1.stop()
         fake_zk1.close()
 
         for child_node in range(100):
-            fake_zk2.create("/test_end_of_watches_session/" + str(child_node) + "/" + str(child_node), b"somebytes")
+            fake_zk2.create(
+                f"/test_end_of_watches_session_{retry}/"
+                + str(child_node)
+                + "/"
+                + str(child_node),
+                b"somebytes",
+            )
 
         assert dummy_set == 2
     finally:
         for zk in [fake_zk1, fake_zk2]:
             stop_zk(zk)
 
-def test_concurrent_watches(started_cluster):
+
+def test_concurrent_watches(started_cluster, request):
+    retry = get_retry_number(request)
+
     try:
         fake_zk = get_fake_zk()
         fake_zk.restart()
-        global_path = "/test_concurrent_watches_0"
+        global_path = f"/test_concurrent_watches_{retry}_0"
         fake_zk.create(global_path)
 
         dumb_watch_triggered_counter = 0
         all_paths_triggered = []
 
         existing_path = []
+        # A watch is one-shot per (path, session), so a mutation only notifies a registration
+        # live at that moment. Claim a token before mutating: mutating without one lets a stale
+        # removal drop the token of a later registration, which then never gets a mutation.
+        existing_path_lock = threading.Lock()
         all_paths_created = []
         watches_created = 0
+
+        def claim_path():
+            with existing_path_lock:
+                if not existing_path:
+                    return None
+                return existing_path.pop(random.randrange(len(existing_path)))
+
         def create_path_and_watch(i):
             nonlocal watches_created
             nonlocal all_paths_created
             fake_zk.ensure_path(global_path + "/" + str(i))
+
             # new function each time
             def dumb_watch(event):
+                if not keeper_utils.is_znode_watch_event(event):
+                    return
                 nonlocal dumb_watch_triggered_counter
                 dumb_watch_triggered_counter += 1
                 nonlocal all_paths_triggered
@@ -594,33 +786,28 @@ def test_concurrent_watches(started_cluster):
             fake_zk.get(global_path + "/" + str(i), watch=dumb_watch)
             all_paths_created.append(global_path + "/" + str(i))
             watches_created += 1
-            existing_path.append(i)
+            with existing_path_lock:
+                existing_path.append(i)
 
         trigger_called = 0
+
         def trigger_watch(i):
             nonlocal trigger_called
             trigger_called += 1
             fake_zk.set(global_path + "/" + str(i), b"somevalue")
-            try:
-                existing_path.remove(i)
-            except:
-                pass
 
         def call(total):
             for i in range(total):
                 create_path_and_watch(random.randint(0, 1000))
                 time.sleep(random.random() % 0.5)
-                try:
-                    rand_num = random.choice(existing_path)
+                rand_num = claim_path()
+                if rand_num is not None:
                     trigger_watch(rand_num)
-                except:
-                    pass
-            while existing_path:
-                try:
-                    rand_num = random.choice(existing_path)
-                    trigger_watch(rand_num)
-                except:
-                    pass
+            while True:
+                rand_num = claim_path()
+                if rand_num is None:
+                    break
+                trigger_watch(rand_num)
 
         p = Pool(10)
         arguments = [100] * 10
@@ -638,7 +825,7 @@ def test_concurrent_watches(started_cluster):
             time.sleep(0.1)
 
         assert watches_created == watches_must_be_created
-        assert trigger_called >= watches_trigger_must_be_called
+        assert trigger_called == watches_trigger_must_be_called
         assert len(existing_path) == 0
         if dumb_watch_triggered_counter != watches_must_be_triggered:
             print("All created paths", all_paths_created)

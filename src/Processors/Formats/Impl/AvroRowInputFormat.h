@@ -1,50 +1,90 @@
 #pragma once
 
-#include "config_formats.h"
-#include "config_core.h"
+#include "config.h"
 
 #if USE_AVRO
 
-#include <unordered_map>
-#include <map>
-#include <vector>
-
-#include <Core/Block.h>
-#include <Formats/FormatSettings.h>
+#include <Common/VectorWithMemoryTracking.h>
+#include <Common/UnorderedMapWithMemoryTracking.h>
+#include <Common/UnorderedSetWithMemoryTracking.h>
+#include <Common/MapWithMemoryTracking.h>
 #include <Formats/FormatSchemaInfo.h>
+#include <Formats/FormatSettings.h>
 #include <Processors/Formats/IRowInputFormat.h>
-
-#include <avro/DataFile.hh>
-#include <avro/Decoder.hh>
-#include <avro/Schema.hh>
-#include <avro/ValidSchema.hh>
-
+#include <Processors/Formats/ISchemaReader.h>
+#include <DataFile.hh>
+#include <Decoder.hh>
+#include <Schema.hh>
+#include <ValidSchema.hh>
 
 namespace DB
 {
+
+class Block;
+
+/// Maximum nesting depth for Avro schemas. Passed to the Avro library to
+/// prevent stack overflow on deeply nested schemas (e.g. crafted inputs with
+/// thousands of nested arrays/records). Real-world schemas rarely exceed 10-20
+/// levels, so 256 is more than enough.
+static constexpr size_t MAX_AVRO_SCHEMA_DEPTH = 256;
+
+class ConfluentSchemaRegistry;
+class AvroInputStreamReadBufferAdapter : public avro::InputStream
+{
+public:
+    explicit AvroInputStreamReadBufferAdapter(ReadBuffer & in_) : in(in_) {}
+
+    bool next(const uint8_t ** data, size_t * len) override;
+
+    void backup(size_t len) override;
+
+    void skip(size_t len) override;
+
+    size_t byteCount() const override;
+
+private:
+    ReadBuffer & in;
+};
+
 class AvroDeserializer
 {
 public:
-    AvroDeserializer(const Block & header, avro::ValidSchema schema, bool allow_missing_fields);
+    /// `absent_columns` are known to be missing from the file and get defaults even if `allow_missing_fields` is false.
+    AvroDeserializer(const Block & header, avro::ValidSchema schema, bool allow_missing_fields, bool null_as_default_, const FormatSettings & settings_, const NameSet & absent_columns = {});
+    AvroDeserializer(DataTypePtr data_type, const std::string & column_name, avro::ValidSchema schema, bool allow_missing_fields, bool null_as_default_, const FormatSettings & settings_);
+
+    /// Not movable: stored closures capture `this` and references into `symbolic_skip_fn_map`.
+    AvroDeserializer(const AvroDeserializer &) = delete;
+    AvroDeserializer & operator=(const AvroDeserializer &) = delete;
+    AvroDeserializer(AvroDeserializer &&) = delete;
+    AvroDeserializer & operator=(AvroDeserializer &&) = delete;
+
     void deserializeRow(MutableColumns & columns, avro::Decoder & decoder, RowReadExtension & ext) const;
 
+    using DeserializeFn = std::function<bool(IColumn & column, avro::Decoder & decoder)>;
+    using DeserializeNestedFn = std::function<bool(IColumn & column, avro::Decoder & decoder)>;
+
 private:
-    using DeserializeFn = std::function<void(IColumn & column, avro::Decoder & decoder)>;
     using SkipFn = std::function<void(avro::Decoder & decoder)>;
-    static DeserializeFn createDeserializeFn(avro::NodePtr root_node, DataTypePtr target_type);
-    SkipFn createSkipFn(avro::NodePtr root_node);
+    DeserializeFn createDeserializeFn(const avro::NodePtr & root_node, const DataTypePtr & target_type);
+    DeserializeFn tryCreateVariantDeserializeFn(const avro::NodePtr & node, const DataTypePtr & target_type);
+    SkipFn createSkipFn(const avro::NodePtr & root_node);
+    static size_t readUnionIndex(avro::Decoder & decoder, size_t num_branches);
 
     struct Action
     {
-        enum Type {Noop, Deserialize, Skip, Record, Union};
+        enum Type {Noop, Deserialize, Skip, Record, Union, Nested};
         Type type;
         /// Deserialize
-        int target_column_idx;
+        int target_column_idx{};
         DeserializeFn deserialize_fn;
         /// Skip
         SkipFn skip_fn;
         /// Record | Union
-        std::vector<Action> actions;
+        VectorWithMemoryTracking<Action> actions;
+        /// For flattened Nested column
+        VectorWithMemoryTracking<size_t> nested_column_indexes;
+        VectorWithMemoryTracking<DeserializeFn> nested_deserializers;
 
 
         Action() : type(Noop) {}
@@ -54,13 +94,20 @@ private:
             , target_column_idx(target_column_idx_)
             , deserialize_fn(deserialize_fn_) {}
 
-        Action(SkipFn skip_fn_)
+        explicit Action(SkipFn skip_fn_)
             : type(Skip)
+            , target_column_idx(0)
             , skip_fn(skip_fn_) {}
 
-        static Action recordAction(std::vector<Action> field_actions) { return Action(Type::Record, field_actions); }
+        Action(const VectorWithMemoryTracking<size_t> & nested_column_indexes_, const VectorWithMemoryTracking<DeserializeFn> & nested_deserializers_)
+            : type(Nested)
+            , target_column_idx(0)
+            , nested_column_indexes(nested_column_indexes_)
+            , nested_deserializers(nested_deserializers_) {}
 
-        static Action unionAction(std::vector<Action> branch_actions) { return Action(Type::Union, branch_actions); }
+        static Action recordAction(const VectorWithMemoryTracking<Action> & field_actions) { return Action(Type::Record, field_actions); }
+
+        static Action unionAction(const VectorWithMemoryTracking<Action> & branch_actions) { return Action(Type::Union, branch_actions); }
 
 
         void execute(MutableColumns & columns, avro::Decoder & decoder, RowReadExtension & ext) const
@@ -70,8 +117,7 @@ private:
                 case Noop:
                     break;
                 case Deserialize:
-                    deserialize_fn(*columns[target_column_idx], decoder);
-                    ext.read_columns[target_column_idx] = true;
+                    ext.read_columns[target_column_idx] = deserialize_fn(*columns[target_column_idx], decoder);
                     break;
                 case Skip:
                     skip_fn(decoder);
@@ -80,43 +126,66 @@ private:
                     for (const auto & action : actions)
                         action.execute(columns, decoder, ext);
                     break;
+                case Nested:
+                    deserializeNested(columns, decoder, ext);
+                    break;
                 case Union:
-                    actions[decoder.decodeUnionIndex()].execute(columns, decoder, ext);
+                    actions[readUnionIndex(decoder, actions.size())].execute(columns, decoder, ext);
                     break;
             }
         }
     private:
-        Action(Type type_, std::vector<Action> actions_)
+        Action(Type type_, VectorWithMemoryTracking<Action> actions_)
             : type(type_)
+            , target_column_idx(0)
             , actions(actions_) {}
+
+        void deserializeNested(MutableColumns & columns, avro::Decoder & decoder, RowReadExtension & ext) const;
     };
 
     /// Populate actions by recursively traversing root schema
     AvroDeserializer::Action createAction(const Block & header, const avro::NodePtr & node, const std::string & current_path = "");
 
     /// Bitmap of columns found in Avro schema
-    std::vector<bool> column_found;
+    VectorWithMemoryTracking<bool> column_found;
     /// Deserialize/Skip actions for a row
     Action row_action;
     /// Map from name of named Avro type (record, enum, fixed) to SkipFn.
     /// This is to avoid infinite recursion when  Avro schema contains self-references. e.g. LinkedList
-    std::map<avro::Name, SkipFn> symbolic_skip_fn_map;
+    MapWithMemoryTracking<avro::Name, SkipFn> symbolic_skip_fn_map;
+
+    /// Guard against infinite recursion in createDeserializeFn and createAction
+    /// when Avro schema contains cyclic symbolic references (e.g. TypeA -> TypeB -> TypeA).
+    UnorderedSetWithMemoryTracking<std::string> symbolic_deserialize_guard;
+
+    /// The column `createDeserializeFn` is building for, for error messages.
+    String current_column_name;
+
+    bool null_as_default = false;
+
+    const FormatSettings & settings;
 };
 
-class AvroRowInputFormat : public IRowInputFormat
+class AvroRowInputFormat final : public IRowInputFormat
 {
 public:
-    AvroRowInputFormat(const Block & header_, ReadBuffer & in_, Params params_, const FormatSettings & format_settings_);
+    AvroRowInputFormat(SharedHeader header_, ReadBuffer & in_, Params params_, const FormatSettings & format_settings_);
 
     String getName() const override { return "AvroRowInputFormat"; }
+
+    void setColumnMapper(const ColumnMapperPtr & column_mapper_) override { column_mapper = column_mapper_; }
 
 private:
     bool readRow(MutableColumns & columns, RowReadExtension & ext) override;
     void readPrefix() override;
 
+    bool supportsCountRows() const override;
+    size_t countRows(size_t max_block_size) override;
+
     std::unique_ptr<avro::DataFileReaderBase> file_reader_ptr;
     std::unique_ptr<AvroDeserializer> deserializer_ptr;
-    bool allow_missing_fields;
+    FormatSettings format_settings;
+    ColumnMapperPtr column_mapper;
 };
 
 /// Confluent framing + Avro binary datum encoding. Mainly used for Kafka.
@@ -125,28 +194,46 @@ private:
 /// 2. SchemaRegistry: schema cache (schema_id -> schema)
 /// 3. AvroConfluentRowInputFormat: deserializer cache (schema_id -> AvroDeserializer)
 /// This is needed because KafkaStorage creates a new instance of InputFormat per a batch of messages
-class AvroConfluentRowInputFormat : public IRowInputFormat
+class AvroConfluentRowInputFormat final : public IRowInputFormat
 {
 public:
-    AvroConfluentRowInputFormat(const Block & header_, ReadBuffer & in_, Params params_, const FormatSettings & format_settings_);
+    AvroConfluentRowInputFormat(SharedHeader header_, ReadBuffer & in_, Params params_, const FormatSettings & format_settings_);
     String getName() const override { return "AvroConfluentRowInputFormat"; }
 
-    class SchemaRegistry;
-
 private:
-    virtual bool readRow(MutableColumns & columns, RowReadExtension & ext) override;
+    bool readRow(MutableColumns & columns, RowReadExtension & ext) override;
+    void readPrefix() override;
 
     bool allowSyncAfterError() const override { return true; }
     void syncAfterError() override;
 
-    std::shared_ptr<SchemaRegistry> schema_registry;
+    std::shared_ptr<ConfluentSchemaRegistry> schema_registry;
     using SchemaId = uint32_t;
-    std::unordered_map<SchemaId, AvroDeserializer> deserializer_cache;
+    UnorderedMapWithMemoryTracking<SchemaId, AvroDeserializer> deserializer_cache;
     const AvroDeserializer & getOrCreateDeserializer(SchemaId schema_id);
 
     avro::InputStreamPtr input_stream;
     avro::DecoderPtr decoder;
     FormatSettings format_settings;
+};
+
+class AvroSchemaReader final : public ISchemaReader
+{
+public:
+    AvroSchemaReader(ReadBuffer & in_, bool confluent_, const FormatSettings & format_settings_);
+
+    NamesAndTypesList readSchema() override;
+
+    /// If `allow_nullable_tuple_type` is false, a union [null, record] is converted to a plain
+    /// Tuple instead of Nullable(Tuple). Schema inference passes
+    /// schema_inference_allow_nullable_tuple_type here, because otherwise it would return a type
+    /// that CREATE TABLE rejects.
+    static DataTypePtr avroNodeToDataType(avro::NodePtr node, bool allow_nullable_tuple_type = true);
+private:
+    static DataTypePtr avroNodeToDataTypeImpl(const avro::NodePtr & node, UnorderedSetWithMemoryTracking<std::string> & seen_names, bool allow_nullable_tuple_type);
+
+    bool confluent;
+    const FormatSettings format_settings;
 };
 
 }

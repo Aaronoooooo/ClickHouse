@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <Common/HashTable/HashTable.h>
 
 namespace DB
@@ -19,10 +20,10 @@ struct FixedHashTableCell
     using mapped_type = VoidMapped;
     bool full;
 
-    FixedHashTableCell() {} //-V730
+    FixedHashTableCell() {} /// NOLINT
     FixedHashTableCell(const Key &, const State &) : full(true) {}
 
-    const VoidKey getKey() const { return {}; }
+    const VoidKey getKey() const { return {}; } /// NOLINT
     VoidMapped getMapped() const { return {}; }
 
     bool isZero(const State &) const { return !full; }
@@ -39,10 +40,11 @@ struct FixedHashTableCell
     {
         Key key;
 
-        const VoidKey getKey() const { return {}; }
+        const VoidKey getKey() const { return {}; } /// NOLINT
         VoidMapped getMapped() const { return {}; }
         const value_type & getValue() const { return key; }
-        void update(Key && key_, FixedHashTableCell *) { key = key_; }
+        /// The cell pointer is unused (the key is the cell index); const so that const iteration works.
+        void update(Key && key_, const FixedHashTableCell *) { key = key_; }
     };
 };
 
@@ -52,14 +54,14 @@ struct FixedHashTableCell
 template <typename Cell>
 struct FixedHashTableStoredSize
 {
-    size_t m_size = 0;
+    std::atomic<size_t> m_size = 0;
 
-    size_t getSize(const Cell *, const typename Cell::State &, size_t) const { return m_size; }
-    bool isEmpty(const Cell *, const typename Cell::State &, size_t) const { return m_size == 0; }
+    size_t getSize(const Cell *, const typename Cell::State &, size_t) const { return m_size.load(); }
+    bool isEmpty(const Cell *, const typename Cell::State &, size_t) const { return m_size.load() == 0; }
 
-    void increaseSize() { ++m_size; }
-    void clearSize() { m_size = 0; }
-    void setSize(size_t to) { m_size = to; }
+    void increaseSize() { m_size.fetch_add(1); }
+    void clearSize() { m_size.store(0); }
+    void setSize(size_t to) { m_size.store(to); }
 };
 
 template <typename Cell>
@@ -67,6 +69,9 @@ struct FixedHashTableCalculatedSize
 {
     size_t getSize(const Cell * buf, const typename Cell::State & state, size_t num_cells) const
     {
+        if (!buf)
+            return 0;
+
         size_t res = 0;
         for (const Cell * end = buf + num_cells; buf != end; ++buf)
             if (!buf->isZero(state))
@@ -76,6 +81,9 @@ struct FixedHashTableCalculatedSize
 
     bool isEmpty(const Cell * buf, const typename Cell::State & state, size_t num_cells) const
     {
+        if (!buf)
+            return true;
+
         for (const Cell * end = buf + num_cells; buf != end; ++buf)
             if (!buf->isZero(state))
                 return false;
@@ -101,13 +109,20 @@ struct FixedHashTableCalculatedSize
   *
   * TODO: Deprecate the cell API so that end users don't rely on the structure
   *  of cell. Instead iterator should be used for operations such as cell
-  *  transfer, key updates (f.g. StringRef) and serde. This will allow
+  *  transfer, key updates (f.g. std::string_view) and serde. This will allow
   *  TwoLevelHashSet(Map) to contain different type of sets(maps).
   */
-template <typename Key, typename Cell, typename Size, typename Allocator>
+template <typename Key, typename Cell, typename Size, typename Allocator, size_t size_bits = sizeof(Key) * 8>
 class FixedHashTable : private boost::noncopyable, protected Allocator, protected Cell::State, protected Size
 {
-    static constexpr size_t NUM_CELLS = 1ULL << (sizeof(Key) * 8);
+    static constexpr size_t NUM_CELLS = 1ULL << size_bits;
+
+    /// We maintain min and max values inserted into the hash table to then limit the amount of cells to traverse to the [min; max] range.
+    /// False after a path other than `emplace` or `restoreMinMaxOptimization` wrote cells, so the bounds may be stale.
+    bool can_trust_min_max_values = true;
+    bool disable_min_max_optimization = false;
+    size_t min = NUM_CELLS - 1;
+    size_t max = 0;
 
 protected:
     friend class const_iterator;
@@ -119,6 +134,11 @@ protected:
     Cell * buf; /// A piece of memory for all elements.
 
     void alloc() { buf = reinterpret_cast<Cell *>(Allocator::alloc(NUM_CELLS * sizeof(Cell))); }
+
+    std::pair<UInt32, UInt32> getMinMaxIndex() const
+    {
+        return {min, max};
+    }
 
     void free()
     {
@@ -138,7 +158,7 @@ protected:
 
 
     template <typename Derived, bool is_const>
-    class iterator_base
+    class iterator_base /// NOLINT
     {
         using Container = std::conditional_t<is_const, const Self, Self>;
         using cell_type = std::conditional_t<is_const, const Cell, Cell>;
@@ -149,10 +169,10 @@ protected:
         friend class FixedHashTable;
 
     public:
-        iterator_base() {}
+        iterator_base() {} /// NOLINT
         iterator_base(Container * container_, cell_type * ptr_) : container(container_), ptr(ptr_)
         {
-            cell.update(ptr - container->buf, ptr);
+            cell.update(static_cast<Key>(ptr - container->buf), ptr);
         }
 
         bool operator==(const iterator_base & rhs) const { return ptr == rhs.ptr; }
@@ -163,7 +183,9 @@ protected:
             ++ptr;
 
             /// Skip empty cells in the main buffer.
-            auto buf_end = container->buf + container->NUM_CELLS;
+            const auto * buf_end = container->buf + container->NUM_CELLS;
+            if (container->canUseMinMaxOptimization())
+                buf_end = container->buf + container->max + 1;
             while (ptr < buf_end && ptr->isZero(*container))
                 ++ptr;
 
@@ -172,14 +194,14 @@ protected:
 
         auto & operator*()
         {
-            if (cell.key != ptr - container->buf)
-                cell.update(ptr - container->buf, ptr);
+            if (cell.key != static_cast<Key>(ptr - container->buf))
+                cell.update(static_cast<Key>(ptr - container->buf), ptr);
             return cell;
         }
         auto * operator-> ()
         {
-            if (cell.key != ptr - container->buf)
-                cell.update(ptr - container->buf, ptr);
+            if (cell.key != static_cast<Key>(ptr - container->buf))
+                cell.update(static_cast<Key>(ptr - container->buf), ptr);
             return &cell;
         }
 
@@ -204,7 +226,7 @@ public:
 
     FixedHashTable() { alloc(); }
 
-    FixedHashTable(FixedHashTable && rhs) : buf(nullptr) { *this = std::move(rhs); }
+    FixedHashTable(FixedHashTable && rhs) noexcept : buf(nullptr) { *this = std::move(rhs); } /// NOLINT
 
     ~FixedHashTable()
     {
@@ -212,7 +234,7 @@ public:
         free();
     }
 
-    FixedHashTable & operator=(FixedHashTable && rhs)
+    FixedHashTable & operator=(FixedHashTable && rhs) noexcept
     {
         destroyElements();
         free();
@@ -229,7 +251,7 @@ public:
     class Reader final : private Cell::State
     {
     public:
-        Reader(DB::ReadBuffer & in_) : in(in_) {}
+        explicit Reader(DB::ReadBuffer & in_) : in(in_) {}
 
         Reader(const Reader &) = delete;
         Reader & operator=(const Reader &) = delete;
@@ -255,10 +277,10 @@ public:
             return true;
         }
 
-        inline const value_type & get() const
+        const value_type & get() const
         {
             if (!is_initialized || is_eof)
-                throw DB::Exception("No available data", DB::ErrorCodes::NO_AVAILABLE_DATA);
+                throw DB::Exception(DB::ErrorCodes::NO_AVAILABLE_DATA, "No available data");
 
             return cell.getValue();
         }
@@ -273,13 +295,13 @@ public:
     };
 
 
-    class iterator : public iterator_base<iterator, false>
+    class iterator : public iterator_base<iterator, false> /// NOLINT
     {
     public:
         using iterator_base<iterator, false>::iterator_base;
     };
 
-    class const_iterator : public iterator_base<const_iterator, true>
+    class const_iterator : public iterator_base<const_iterator, true> /// NOLINT
     {
     public:
         using iterator_base<const_iterator, true>::iterator_base;
@@ -291,12 +313,7 @@ public:
         if (!buf)
             return end();
 
-        const Cell * ptr = buf;
-        auto buf_end = buf + NUM_CELLS;
-        while (ptr < buf_end && ptr->isZero(*this))
-            ++ptr;
-
-        return const_iterator(this, ptr);
+        return const_iterator(this, firstPopulatedCell());
     }
 
     const_iterator cbegin() const { return begin(); }
@@ -306,18 +323,13 @@ public:
         if (!buf)
             return end();
 
-        Cell * ptr = buf;
-        auto buf_end = buf + NUM_CELLS;
-        while (ptr < buf_end && ptr->isZero(*this))
-            ++ptr;
-
-        return iterator(this, ptr);
+        return iterator(this, const_cast<Cell *>(firstPopulatedCell()));
     }
 
     const_iterator end() const
     {
         /// Avoid UBSan warning about adding zero to nullptr. It is valid in C++20 (and earlier) but not valid in C.
-        return const_iterator(this, buf ? buf + NUM_CELLS : buf);
+        return const_iterator(this, buf ? lastPopulatedCell() : buf);
     }
 
     const_iterator cend() const
@@ -327,11 +339,10 @@ public:
 
     iterator end()
     {
-        return iterator(this, buf ? buf + NUM_CELLS : buf);
+        return iterator(this, buf ? lastPopulatedCell() : buf);
     }
 
 
-public:
     /// The last parameter is unused but exists for compatibility with HashTable interface.
     void ALWAYS_INLINE emplace(const Key & x, LookupResult & it, bool & inserted, size_t /* hash */ = 0)
     {
@@ -345,6 +356,13 @@ public:
 
         new (&buf[x]) Cell(x, *this);
         inserted = true;
+
+        if (!disable_min_max_optimization)
+        {
+            if (x < min) min = x;
+            if (x > max) max = x;
+        }
+
         this->increaseSize();
     }
 
@@ -353,7 +371,7 @@ public:
         std::pair<LookupResult, bool> res;
         emplace(Cell::getKey(x), res.first, res.second);
         if (res.second)
-            insertSetMapped(res.first->getMapped(), x);
+            res.first->setMapped(x);
 
         return res;
     }
@@ -371,6 +389,54 @@ public:
 
     bool ALWAYS_INLINE has(const Key & x) const { return !buf[x].isZero(*this); }
     bool ALWAYS_INLINE has(const Key &, size_t hash_value) const { return !buf[hash_value].isZero(*this); }
+
+    /// `max < min` means the table is empty. `can_trust_min_max_values` is false when the bounds were not maintained.
+    /// `disable_min_max_optimization` keeps the bounds off until `restoreMinMaxOptimization`.
+    bool ALWAYS_INLINE canUseMinMaxOptimization() const
+    {
+        return (max >= min) && can_trust_min_max_values && !disable_min_max_optimization;
+    }
+
+    /// min/max optimization has to be disabled when FixedHashTable is used concurrently in certain scenarios.
+    /// For example, when aggregator merges single level aggregation state in parallel.
+    void ALWAYS_INLINE disableMinMaxOptimization() { disable_min_max_optimization = true; }
+
+    /// Derive the bounds from the cells and enable the optimization again, once no concurrent writer
+    /// is left. An empty table keeps `max < min`, which is how iteration finds nothing.
+    void restoreMinMaxOptimization()
+    {
+        min = NUM_CELLS - 1;
+        max = 0;
+        if (buf)
+        {
+            for (size_t i = 0; i < NUM_CELLS; ++i)
+            {
+                if (!buf[i].isZero(*this))
+                {
+                    min = std::min(i, min);
+                    max = std::max(i, max);
+                }
+            }
+        }
+        disable_min_max_optimization = false;
+        can_trust_min_max_values = true;
+    }
+
+    const Cell * ALWAYS_INLINE firstPopulatedCell() const
+    {
+        const Cell * ptr = buf;
+        if (!canUseMinMaxOptimization())
+        {
+            while (ptr < buf + NUM_CELLS && ptr->isZero(*this))
+                ++ptr;
+        }
+        else
+            ptr = buf + min;
+
+        return ptr;
+    }
+
+    Cell * ALWAYS_INLINE lastPopulatedCell() const { return canUseMinMaxOptimization() ? buf + max + 1 : buf + NUM_CELLS; }
 
     void write(DB::WriteBuffer & wb) const
     {
@@ -414,7 +480,7 @@ public:
     {
         Cell::State::read(rb);
         destroyElements();
-        size_t m_size;
+        size_t m_size = 0;
         DB::readVarUInt(m_size, rb);
         this->setSize(m_size);
         free();
@@ -428,13 +494,14 @@ public:
             x.read(rb);
             new (&buf[place_value]) Cell(x, *this);
         }
+        can_trust_min_max_values = false;
     }
 
     void readText(DB::ReadBuffer & rb)
     {
         Cell::State::readText(rb);
         destroyElements();
-        size_t m_size;
+        size_t m_size = 0;
         DB::readText(m_size, rb);
         this->setSize(m_size);
         free();
@@ -450,6 +517,7 @@ public:
             x.readText(rb);
             new (&buf[place_value]) Cell(x, *this);
         }
+        can_trust_min_max_values = false;
     }
 
     size_t size() const { return this->getSize(buf, *this, NUM_CELLS); }
@@ -488,7 +556,11 @@ public:
     }
 
     const Cell * data() const { return buf; }
-    Cell * data() { return buf; }
+    Cell * data()
+    {
+        can_trust_min_max_values = false;
+        return buf;
+    }
 
 #ifdef DBMS_HASH_MAP_COUNT_COLLISIONS
     size_t getCollisions() const { return 0; }

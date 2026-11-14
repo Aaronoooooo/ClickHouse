@@ -1,176 +1,131 @@
 #pragma once
-#include "config_functions.h"
+#include "config.h"
 
-#if USE_BASE64
-#    include <Columns/ColumnConst.h>
-#    include <Common/MemorySanitizer.h>
+#if USE_SIMDUTF
+#    include <Columns/ColumnFixedString.h>
 #    include <Columns/ColumnString.h>
 #    include <DataTypes/DataTypeString.h>
-#    include <Functions/FunctionFactory.h>
-#    include <Functions/FunctionHelpers.h>
-#    include <Functions/GatherUtils/Algorithms.h>
-#    include <IO/WriteHelpers.h>
-#    include <turbob64.h>
+#    include <Functions/FunctionBaseXXConversion.h>
+#    include <Interpreters/Context_fwd.h>
+#    include <simdutf.h>
 
+#    include <cstddef>
+#    include <functional>
+#    include <string>
+#    include <string_view>
 
 namespace DB
 {
-using namespace GatherUtils;
 
-namespace ErrorCodes
+enum class Base64Variant : uint8_t
 {
-    extern const int ILLEGAL_COLUMN;
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int INCORRECT_DATA;
-}
+    Normal,
+    URL
+};
 
-struct Base64Encode
+template<Base64Variant variant>
+struct Base64EncodeTraits
 {
-    static constexpr auto name = "base64Encode";
-    static size_t getBufferSize(size_t string_length, size_t string_count)
+    /// Base64 conversion is linear, so there is no size limit.
+    static constexpr size_t max_input_size = 0;
+
+    template<typename Col>
+    static size_t getBufferSize(Col const& src_column)
     {
+        auto const string_length = src_column.byteSize();
+        auto const string_count = src_column.size();
         return ((string_length - string_count) / 3 + string_count) * 4 + string_count;
     }
+
+    /// Base64 conversion is linear in the input length, so the cancellation callback is unused.
+    static size_t perform(std::string_view src, UInt8 * dst, const std::function<void()> & = {})
+    {
+        /// simdutf emits the base64url alphabet ('-' and '_') without padding for the URL variant directly.
+        constexpr auto options = (variant == Base64Variant::URL) ? simdutf::base64_url : simdutf::base64_default;
+        return simdutf::binary_to_base64(src.data(), src.size(), reinterpret_cast<char *>(dst), options);
+    }
 };
 
-struct Base64Decode
+template<Base64Variant variant>
+struct Base64DecodeTraits
 {
-    static constexpr auto name = "base64Decode";
+    static constexpr bool has_size_optimization = false;
+    /// Base64 conversion is linear, so there is no size limit.
+    static constexpr size_t max_input_size = 0;
 
-    static size_t getBufferSize(size_t string_length, size_t string_count)
+    template<typename Col>
+    static size_t getBufferSize(Col const& src_column)
     {
+        auto const string_length = src_column.byteSize();
+        auto const string_count = src_column.size();
         return ((string_length - string_count) / 4 + string_count) * 3 + string_count;
     }
-};
 
-struct TryBase64Decode
-{
-    static constexpr auto name = "tryBase64Decode";
-
-    static size_t getBufferSize(size_t string_length, size_t string_count)
+    /// The whitespace characters simdutf ignores in base64 input (RFC 2045 transparency, minus vertical tab).
+    static bool isIgnoredWhitespace(char c)
     {
-        return Base64Decode::getBufferSize(string_length, string_count);
-    }
-};
-
-template <typename Func>
-class FunctionBase64Conversion : public IFunction
-{
-public:
-    static constexpr auto name = Func::name;
-
-    static FunctionPtr create(ContextPtr)
-    {
-        return std::make_shared<FunctionBase64Conversion>();
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
     }
 
-    String getName() const override
+    /// Base64 conversion is linear in the input length, so the cancellation callback is unused.
+    static std::optional<size_t> perform(std::string_view src, UInt8 * dst, const std::function<void()> & = {})
     {
-        return Func::name;
-    }
-
-    size_t getNumberOfArguments() const override
-    {
-        return 1;
-    }
-
-    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
-
-    bool useDefaultImplementationForConstants() const override
-    {
-        return true;
-    }
-
-    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
-    {
-        if (!WhichDataType(arguments[0].type).isString())
-            throw Exception(
-                "Illegal type " + arguments[0].type->getName() + " of 1 argument of function " + getName() + ". Must be String.",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-        return std::make_shared<DataTypeString>();
-    }
-
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
-    {
-        const ColumnPtr column_string = arguments[0].column;
-        const ColumnString * input = checkAndGetColumn<ColumnString>(column_string.get());
-
-        if (!input)
-            throw Exception(
-                "Illegal column " + arguments[0].column->getName() + " of first argument of function " + getName(),
-                ErrorCodes::ILLEGAL_COLUMN);
-
-        auto dst_column = ColumnString::create();
-        auto & dst_data = dst_column->getChars();
-        auto & dst_offsets = dst_column->getOffsets();
-
-        size_t reserve = Func::getBufferSize(input->getChars().size(), input->size());
-        dst_data.resize(reserve);
-        dst_offsets.resize(input_rows_count);
-
-        const ColumnString::Offsets & src_offsets = input->getOffsets();
-
-        const auto * source = input->getChars().data();
-        auto * dst = dst_data.data();
-        auto * dst_pos = dst;
-
-        size_t src_offset_prev = 0;
-
-        for (size_t row = 0; row < input_rows_count; ++row)
+        /// The URL variant decodes the standard/base64url hybrid alphabet: the previous implementation only
+        /// translated '-' and '_' before decoding and left '+' and '/' untouched, so it accepted both alphabets
+        /// (e.g. base64URLDecode('+w==')). It is also defined to omit padding, so partial final chunks are valid.
+        /// The standard variant requires a complete, padded final chunk and rejects truncated input such as the
+        /// 3-character "foo".
+        constexpr auto options = (variant == Base64Variant::URL) ? simdutf::base64_default_or_url : simdutf::base64_default;
+        constexpr auto last_chunk = (variant == Base64Variant::URL) ? simdutf::loose : simdutf::strict;
+        simdutf::result res
+            = simdutf::base64_to_binary(src.data(), src.size(), reinterpret_cast<char *>(dst), options, last_chunk);
+        if (res.error != simdutf::SUCCESS) [[unlikely]]
         {
-            size_t srclen = src_offsets[row] - src_offset_prev - 1;
-            size_t outlen = 0;
-
-            if constexpr (std::is_same_v<Func, Base64Encode>)
+            if constexpr (variant == Base64Variant::Normal)
             {
-                outlen = _tb64e(reinterpret_cast<const uint8_t *>(source), srclen, reinterpret_cast<uint8_t *>(dst_pos));
-            }
-            else if constexpr (std::is_same_v<Func, Base64Decode>)
-            {
-                if (srclen > 0)
-                {
-                    outlen = _tb64d(reinterpret_cast<const uint8_t *>(source), srclen, reinterpret_cast<uint8_t *>(dst_pos));
-                    if (!outlen)
-                        throw Exception("Failed to " + getName() + " input '" + String(reinterpret_cast<const char *>(source), srclen) + "'", ErrorCodes::INCORRECT_DATA);
-                }
+                /// The previous implementation (aklomp-base64) silently dropped non-zero leftover bits
+                /// in a complete, properly padded final chunk, e.g. base64Decode('Zh==') = 'f'.
+                /// simdutf::strict reports them as BASE64_EXTRA_BITS; retry in loose mode, which drops
+                /// them. This cannot accept anything else that strict rejects: BASE64_EXTRA_BITS is
+                /// only reported after the final chunk passed the completeness and padding checks.
+                if (res.error == simdutf::BASE64_EXTRA_BITS)
+                    res = simdutf::base64_to_binary(src.data(), src.size(), reinterpret_cast<char *>(dst), options, simdutf::loose);
             }
             else
             {
-                if (srclen > 0)
+                /// The previous implementation padded the input with '=' to a multiple of four characters
+                /// before decoding, so an underpadded final chunk was accepted, e.g. base64URLDecode('Zg=')
+                /// was decoded as 'Zg=='. simdutf rejects it: in loose mode padding, if present, must
+                /// complete the final chunk. Retry with the missing '=' appended. Only the "two significant
+                /// characters plus one '='" form can be underpadded: one leftover character is invalid
+                /// regardless of padding, and three leftover characters plus one '=' form a complete chunk.
+                size_t significant = 0;
+                size_t padding = 0;
+                for (char c : src)
                 {
-                    // during decoding character array can be partially polluted
-                    // if fail, revert back and clean
-                    auto * savepoint = dst_pos;
-                    outlen = _tb64d(reinterpret_cast<const uint8_t *>(source), srclen, reinterpret_cast<uint8_t *>(dst_pos));
-                    if (!outlen)
-                    {
-                        outlen = 0;
-                        dst_pos = savepoint; //-V1048
-                        // clean the symbol
-                        dst_pos[0] = 0;
-                    }
+                    if (c == '=')
+                        ++padding;
+                    else if (!isIgnoredWhitespace(c))
+                        ++significant;
+                }
+                if (significant % 4 == 2 && padding == 1)
+                {
+                    std::string padded_src;
+                    padded_src.reserve(src.size() + 1);
+                    padded_src = src;
+                    padded_src += '=';
+                    res = simdutf::base64_to_binary(padded_src.data(), padded_src.size(), reinterpret_cast<char *>(dst), options, last_chunk);
                 }
             }
 
-            /// Base64 library is using AVX-512 with some shuffle operations.
-            /// Memory sanitizer don't understand if there was uninitialized memory in SIMD register but it was not used in the result of shuffle.
-            __msan_unpoison(dst_pos, outlen);
-
-            source += srclen + 1;
-            dst_pos += outlen;
-            *dst_pos = '\0';
-            dst_pos += 1;
-
-            dst_offsets[row] = dst_pos - dst;
-            src_offset_prev = src_offsets[row];
+            if (res.error != simdutf::SUCCESS)
+                return std::nullopt;
         }
 
-        dst_data.resize(dst_pos - dst);
-
-        return dst_column;
+        return res.count;
     }
 };
+
 }
 
 #endif

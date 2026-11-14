@@ -6,7 +6,7 @@
 #include <Functions/FunctionHelpers.h>
 #include <Functions/IFunction.h>
 
-#include <base/logger_useful.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
@@ -17,7 +17,7 @@ namespace ErrorCodes
 
 namespace
 {
-    class FunctionLogTrace : public IFunction
+    class FunctionLogTrace final : public IFunction
     {
     public:
         static constexpr auto name = "logTrace";
@@ -29,26 +29,22 @@ namespace
 
         bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
-        DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+        String getSignatureString() const override
         {
-            if (!isString(arguments[0]))
-                throw Exception(
-                    "Illegal type " + arguments[0]->getName() + " of argument of function " + getName(),
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-            return std::make_shared<DataTypeUInt8>();
+            return "(const String) -> UInt8";
         }
 
         ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
         {
             String message;
             if (const ColumnConst * col = checkAndGetColumnConst<ColumnString>(arguments[0].column.get()))
-                message = col->getDataAt(0).data;
+                message = col->getDataAt(0);
             else
-                throw Exception(
-                    "First argument for function " + getName() + " must be Constant string", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "First argument for function {} must be Constant string",
+                    getName());
 
-            static auto * log = &Poco::Logger::get("FunctionLogTrace");
-            LOG_TRACE(log, message);
+            static auto log = getLogger("FunctionLogTrace");
+            LOG_TRACE(log, fmt::runtime(message));
 
             return DataTypeUInt8().createColumnConst(input_rows_count, 0);
         }
@@ -56,9 +52,39 @@ namespace
 
 }
 
-void registerFunctionLogTrace(FunctionFactory & factory)
+REGISTER_FUNCTION(LogTrace)
 {
-    factory.registerFunction<FunctionLogTrace>();
+    FunctionDocumentation::Description description = R"(
+Emits a trace log message to the server log.
+
+The function accepts a constant argument only, so the call is evaluated during query analysis and replaced
+by its result. The message is therefore emitted once while the query is analyzed, and not once per processed
+[Block](/resources/develop-contribute/introduction/architecture#block): the number of rows and the setting `max_block_size` have no effect
+on how many messages appear in the log.
+    )";
+    FunctionDocumentation::Syntax syntax = "logTrace(message)";
+    FunctionDocumentation::Arguments arguments = {
+        {"message", "Message that is emitted to the server log.", {"const String"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns `0` always.", {"UInt8"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Basic example",
+        R"(
+SELECT logTrace('logTrace message');
+        )",
+        R"(
+┌─logTrace('logTrace message')─┐
+│                            0 │
+└──────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 12};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Introspection;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionLogTrace>(documentation);
 }
 
 }

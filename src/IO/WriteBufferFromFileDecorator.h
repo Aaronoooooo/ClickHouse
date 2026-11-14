@@ -17,13 +17,21 @@ public:
 
     std::string getFileName() const override;
 
+    void preFinalize() override;
+
+    const WriteBuffer & getImpl() const { return *impl; }
+
 protected:
     void finalizeImpl() override;
+
+    void cancelImpl() noexcept override;
 
     std::unique_ptr<WriteBuffer> impl;
 
 private:
     void nextImpl() override;
+
+    bool is_prefinalized = false;
 };
 
 }

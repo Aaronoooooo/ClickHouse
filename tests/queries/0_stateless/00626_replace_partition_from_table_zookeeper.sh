@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-parallel
+# Tags: zookeeper, no-object-storage, long, no-msan
 
 # Because REPLACE PARTITION does not forces immediate removal of replaced data parts from local filesystem
 # (it tries to do it as quick as possible, but it still performed in separate thread asynchronously)
@@ -11,33 +11,17 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CURDIR"/../shell_config.sh
 
-function query_with_retry
-{
-    local query="$1" && shift
-
-    local retry=0
-    until [ $retry -ge 5 ]
-    do
-        local result
-        result="$($CLICKHOUSE_CLIENT "$@" --query="$query" 2>&1)"
-        if [ "$?" == 0 ]; then
-            echo -n "$result"
-            return
-        else
-            retry=$((retry + 1))
-            sleep 3
-        fi
-    done
-    echo "Query '$query' failed with '$result'"
-}
-
 $CLICKHOUSE_CLIENT --query="DROP TABLE IF EXISTS src;"
 $CLICKHOUSE_CLIENT --query="DROP TABLE IF EXISTS dst_r1;"
 $CLICKHOUSE_CLIENT --query="DROP TABLE IF EXISTS dst_r2;"
 
 $CLICKHOUSE_CLIENT --query="CREATE TABLE src (p UInt64, k String, d UInt64) ENGINE = MergeTree PARTITION BY p ORDER BY k;"
-$CLICKHOUSE_CLIENT --query="CREATE TABLE dst_r1 (p UInt64, k String, d UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/dst_1', '1') PARTITION BY p ORDER BY k SETTINGS old_parts_lifetime=1, cleanup_delay_period=1, cleanup_delay_period_random_add=0;"
-$CLICKHOUSE_CLIENT --query="CREATE TABLE dst_r2 (p UInt64, k String, d UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/dst_1', '2') PARTITION BY p ORDER BY k SETTINGS old_parts_lifetime=1, cleanup_delay_period=1, cleanup_delay_period_random_add=0;"
+$CLICKHOUSE_CLIENT --query="CREATE TABLE dst_r1 (p UInt64, k String, d UInt64)
+ENGINE = ReplicatedMergeTree('/clickhouse/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/dst_1', '1') PARTITION BY p ORDER BY k
+SETTINGS old_parts_lifetime=1, cleanup_delay_period=1, cleanup_delay_period_random_add=0, cleanup_thread_preferred_points_per_iteration=0;"
+$CLICKHOUSE_CLIENT --query="CREATE TABLE dst_r2 (p UInt64, k String, d UInt64)
+ENGINE = ReplicatedMergeTree('/clickhouse/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/dst_1', '2') PARTITION BY p ORDER BY k
+SETTINGS old_parts_lifetime=1, cleanup_delay_period=1, cleanup_delay_period_random_add=0, cleanup_thread_preferred_points_per_iteration=0;"
 
 $CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (0, '0', 1);"
 $CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (1, '0', 1);"
@@ -67,7 +51,10 @@ $CLICKHOUSE_CLIENT --query="SELECT count(), sum(d) FROM dst_r2;"
 
 $CLICKHOUSE_CLIENT --query="SELECT 'REPLACE empty';"
 query_with_retry "ALTER TABLE src DROP PARTITION 1;"
-query_with_retry "ALTER TABLE dst_r1 REPLACE PARTITION 1 FROM src;"
+# The setting opt-in preserves the legacy `REPLACE PARTITION` from empty source behavior
+# (silently drop the destination partition). Issue #23727 made this a per-query opt-in to
+# prevent accidental data loss; this test continues to exercise the intentional-clear case.
+query_with_retry "ALTER TABLE dst_r1 REPLACE PARTITION 1 FROM src SETTINGS allow_replace_partition_from_empty_source = 1;"
 
 $CLICKHOUSE_CLIENT --query="SYSTEM SYNC REPLICA dst_r2;"
 $CLICKHOUSE_CLIENT --query="SELECT count(), sum(d) FROM dst_r1;"
@@ -98,6 +85,8 @@ $CLICKHOUSE_CLIENT --query="DROP TABLE src;"
 $CLICKHOUSE_CLIENT --query="CREATE TABLE src (p UInt64, k String, d UInt64) ENGINE = MergeTree PARTITION BY p ORDER BY k;"
 $CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (1, '0', 1);"
 $CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (1, '1', 1);"
+$CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (3, '1', 2);"
+$CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (4, '1', 2);"
 
 $CLICKHOUSE_CLIENT --query="INSERT INTO dst_r2 VALUES (1, '1', 2);"
 query_with_retry "ALTER TABLE dst_r2 ATTACH PARTITION 1 FROM src;"
@@ -106,13 +95,20 @@ $CLICKHOUSE_CLIENT --query="SYSTEM SYNC REPLICA dst_r1;"
 $CLICKHOUSE_CLIENT --query="SELECT count(), sum(d) FROM dst_r1;"
 $CLICKHOUSE_CLIENT --query="SELECT count(), sum(d) FROM dst_r2;"
 
+query_with_retry "ALTER TABLE dst_r2 ATTACH PARTITION ALL FROM src;"
+$CLICKHOUSE_CLIENT --query="SYSTEM SYNC REPLICA dst_r2;"
+$CLICKHOUSE_CLIENT --query="SELECT count(), sum(d) FROM dst_r2;"
+query_with_retry "ALTER TABLE dst_r2 DROP PARTITION 3;"
+$CLICKHOUSE_CLIENT --query="SYSTEM SYNC REPLICA dst_r2;"
+query_with_retry "ALTER TABLE dst_r2 DROP PARTITION 4;"
+$CLICKHOUSE_CLIENT --query="SYSTEM SYNC REPLICA dst_r2;"
 
 $CLICKHOUSE_CLIENT --query="SELECT 'REPLACE with fetch';"
 $CLICKHOUSE_CLIENT --query="DROP TABLE src;"
 $CLICKHOUSE_CLIENT --query="CREATE TABLE src (p UInt64, k String, d UInt64) ENGINE = MergeTree PARTITION BY p ORDER BY k;"
 $CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (1, '0', 1);"
 $CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (1, '1', 1);"
-$CLICKHOUSE_CLIENT --query="INSERT INTO dst_r1 VALUES (1, '1', 2); -- trash part to be deleted"
+$CLICKHOUSE_CLIENT --query="INSERT INTO dst_r1 VALUES (1, '1', 2);" # trash part to be deleted
 
 # Stop replication at the second replica and remove source table to use fetch instead of copying
 $CLICKHOUSE_CLIENT --query="SYSTEM STOP REPLICATION QUEUES dst_r2;"
@@ -132,7 +128,7 @@ query_with_retry "ALTER TABLE dst_r1 DROP PARTITION 1;"
 $CLICKHOUSE_CLIENT --query="CREATE TABLE src (p UInt64, k String, d UInt64) ENGINE = MergeTree PARTITION BY p ORDER BY k;"
 $CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (1, '0', 1);"
 $CLICKHOUSE_CLIENT --query="INSERT INTO src VALUES (1, '1', 1);"
-$CLICKHOUSE_CLIENT --query="INSERT INTO dst_r1 VALUES (1, '1', 2); -- trash part to be deleted"
+$CLICKHOUSE_CLIENT --query="INSERT INTO dst_r1 VALUES (1, '1', 2);" # trash part to be deleted
 
 $CLICKHOUSE_CLIENT --query="SYSTEM STOP MERGES dst_r2;"
 $CLICKHOUSE_CLIENT --query="SYSTEM STOP REPLICATION QUEUES dst_r2;"

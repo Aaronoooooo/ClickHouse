@@ -1,38 +1,16 @@
-#include "RedisDictionarySource.h"
-#include "DictionarySourceFactory.h"
-#include "DictionaryStructure.h"
-#include "registerDictionaries.h"
+#include <Dictionaries/RedisDictionarySource.h>
+#include <Dictionaries/DictionarySourceFactory.h>
+#include <Dictionaries/DictionaryStructure.h>
 
-namespace DB
-{
-
-void registerDictionarySourceRedis(DictionarySourceFactory & factory)
-{
-    auto create_table_source = [=](const DictionaryStructure & dict_struct,
-                                   const Poco::Util::AbstractConfiguration & config,
-                                   const String & config_prefix,
-                                   Block & sample_block,
-                                   ContextPtr /* global_context */,
-                                   const std::string & /* default_database */,
-                                   bool /* created_from_ddl */) -> DictionarySourcePtr {
-        return std::make_unique<RedisDictionarySource>(dict_struct, config, config_prefix + ".redis", sample_block);
-    };
-    factory.registerSource("redis", create_table_source);
-}
-
-}
-
-
-#include <Poco/Redis/Array.h>
-#include <Poco/Redis/Client.h>
-#include <Poco/Redis/Command.h>
-#include <Poco/Redis/Type.h>
+#include <Columns/IColumn.h>
+#include <Interpreters/Context.h>
+#include <QueryPipeline/QueryPipeline.h>
 #include <Poco/Util/AbstractConfiguration.h>
+#include <Common/RemoteHostFilter.h>
 
 #include <IO/WriteHelpers.h>
 
-#include "RedisSource.h"
-
+#include <Dictionaries/RedisSource.h>
 
 namespace DB
 {
@@ -40,36 +18,103 @@ namespace DB
     {
         extern const int UNSUPPORTED_METHOD;
         extern const int INVALID_CONFIG_PARAMETER;
-        extern const int INTERNAL_REDIS_ERROR;
         extern const int LOGICAL_ERROR;
     }
 
+    void registerDictionarySourceRedis(DictionarySourceFactory & factory);
+    void registerDictionarySourceRedis(DictionarySourceFactory & factory)
+    {
+        auto create_table_source = [=](const String & /*name*/,
+                                    const DictionaryStructure & dict_struct,
+                                    const Poco::Util::AbstractConfiguration & config,
+                                    const String & config_prefix,
+                                    Block & sample_block,
+                                    ContextPtr global_context,
+                                    const std::string & /* default_database */,
+                                    bool /* created_from_ddl */) -> DictionarySourcePtr {
+            auto redis_config_prefix = config_prefix + ".redis";
 
-    static const size_t max_block_size = 8192;
+            auto host = config.getString(redis_config_prefix + ".host");
+            auto port = config.getUInt(redis_config_prefix + ".port");
+            global_context->getRemoteHostFilter().checkHostAndPort(host, toString(port));
+
+            RedisConfiguration configuration =
+            {
+                .host = host,
+                .port = static_cast<UInt16>(port),
+                .db_index = config.getUInt(redis_config_prefix + ".db_index", DEFAULT_REDIS_DB_INDEX),
+                .password = config.getString(redis_config_prefix + ".password", DEFAULT_REDIS_PASSWORD),
+                .storage_type = parseStorageType(config.getString(redis_config_prefix + ".storage_type", "")),
+                .pool_size = config.getUInt(redis_config_prefix + ".pool_size", DEFAULT_REDIS_POOL_SIZE),
+            };
+
+            return std::make_unique<RedisDictionarySource>(dict_struct, configuration, std::make_shared<const Block>(std::move(sample_block)));
+        };
+
+        factory.registerSource("redis", create_table_source, SecretArgumentsSpec{.secret_keys = {"password"}}, Documentation{
+            .description = R"DOCS_MD(
+# Redis dictionary source
+
+Example of settings:
+
+<Tabs>
+<Tab title="DDL">
+
+```sql
+SOURCE(REDIS(
+    host 'localhost'
+    port 6379
+    storage_type 'simple'
+    db_index 0
+))
+```
+
+</Tab>
+<Tab title="Configuration file">
+
+```xml
+<source>
+    <redis>
+        <host>localhost</host>
+        <port>6379</port>
+        <storage_type>simple</storage_type>
+        <db_index>0</db_index>
+    </redis>
+</source>
+```
+
+</Tab>
+</Tabs>
+<br/>
+
+Setting fields:
+
+| Setting | Description |
+|---------|-------------|
+| `host` | The Redis host. |
+| `port` | The port on the Redis server. |
+| `storage_type` | The structure of the internal Redis storage used to work with keys. `simple` uses a flat key-value map and supports simple-key layouts as well as single-column complex-key layouts (such as `complex_key_cache` and `complex_key_direct`). `hash_map` uses a Redis hash and is required for composite complex keys; it expects exactly two key columns. Key columns must be of native integer (`Int8` to `Int64`, `UInt8` to `UInt64`) or `String` type; wide integers such as `Int256` are not supported. Ranged layouts are unsupported. Default value is `simple`. Optional. |
+| `db_index` | The specific numeric index of Redis logical database. Default value is `0`. Optional. |
+)DOCS_MD",
+            .syntax = "SOURCE(REDIS(host 'host' port 6379 storage_type 'simple' db_index 0))",
+            .related = {}});
+    }
 
     RedisDictionarySource::RedisDictionarySource(
-            const DictionaryStructure & dict_struct_,
-            const String & host_,
-            UInt16 port_,
-            UInt8 db_index_,
-            const String & password_,
-            RedisStorageType storage_type_,
-            const Block & sample_block_)
-            : dict_struct{dict_struct_}
-            , host{host_}
-            , port{port_}
-            , db_index{db_index_}
-            , password{password_}
-            , storage_type{storage_type_}
-            , sample_block{sample_block_}
-            , client{std::make_shared<Poco::Redis::Client>(host, port)}
+        const DictionaryStructure & dict_struct_,
+        const RedisConfiguration & configuration_,
+        SharedHeader sample_block_)
+        : dict_struct{dict_struct_}
+        , configuration(configuration_)
+        , pool(std::make_shared<RedisPool>(configuration.pool_size))
+        , sample_block{sample_block_}
     {
         if (dict_struct.attributes.size() != 1)
             throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
                 "Invalid number of non key columns for Redis source: {}, expected 1",
-                DB::toString(dict_struct.attributes.size()));
+                dict_struct.attributes.size());
 
-        if (storage_type == RedisStorageType::HASH_MAP)
+        if (configuration.storage_type == RedisStorageType::HASH_MAP)
         {
             if (!dict_struct.key)
                 throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
@@ -81,144 +126,79 @@ namespace DB
             // suppose key[0] is primary key, key[1] is secondary key
 
             for (const auto & key : *dict_struct.key)
-                if (!isInteger(key.type) && !isString(key.type))
+                if (!isNativeInteger(key.type) && !isString(key.type))
                     throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
-                        "Redis source supports only integer or string key, but key '{}' of type {} given",
+                        "Redis source supports only native integer or string key, but key '{}' of type {} given",
                         key.name,
                         key.type->getName());
         }
-
-        if (!password.empty())
+        else if (dict_struct.key)
         {
-            RedisCommand command("AUTH");
-            command << password;
-            String reply = client->execute<String>(command);
-            if (reply != "OK")
-                throw Exception(ErrorCodes::INTERNAL_REDIS_ERROR,
-                    "Authentication failed with reason {}",
-                    reply);
-        }
+            /// Complex-key layouts (e.g. 'complex_key_cache', 'complex_key_direct') load keys via loadKeys.
+            /// 'simple' storage is a flat Redis key-value map, so it can only encode a single key column.
+            /// Composite keys have no canonical mapping to a single Redis key - use 'hash_map' storage for them.
+            if (dict_struct.key->size() != 1)
+                throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                    "Redis source with storage type 'simple' supports only a single key column, but {} were given; "
+                    "use storage type 'hash_map' for composite keys",
+                    dict_struct.key->size());
 
-        if (db_index != 0)
-        {
-            RedisCommand command("SELECT");
-            command << std::to_string(db_index);
-            String reply = client->execute<String>(command);
-            if (reply != "OK")
-                throw Exception(ErrorCodes::INTERNAL_REDIS_ERROR,
-                    "Selecting database with index {} failed with reason {}",
-                    DB::toString(db_index),
-                    reply);
+            const auto & key = dict_struct.key->front();
+            if (!isNativeInteger(key.type) && !isString(key.type))
+                throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                    "Redis source supports only native integer or string key, but key '{}' of type {} given",
+                    key.name,
+                    key.type->getName());
         }
     }
-
-
-    RedisDictionarySource::RedisDictionarySource(
-            const DictionaryStructure & dict_struct_,
-            const Poco::Util::AbstractConfiguration & config_,
-            const String & config_prefix_,
-            Block & sample_block_)
-            : RedisDictionarySource(
-            dict_struct_,
-            config_.getString(config_prefix_ + ".host"),
-            config_.getUInt(config_prefix_ + ".port"),
-            config_.getUInt(config_prefix_ + ".db_index", 0),
-            config_.getString(config_prefix_ + ".password",""),
-            parseStorageType(config_.getString(config_prefix_ + ".storage_type", "")),
-            sample_block_)
-    {
-    }
-
 
     RedisDictionarySource::RedisDictionarySource(const RedisDictionarySource & other)
-            : RedisDictionarySource{other.dict_struct,
-                                    other.host,
-                                    other.port,
-                                    other.db_index,
-                                    other.password,
-                                    other.storage_type,
-                                    other.sample_block}
+        : RedisDictionarySource(other.dict_struct, other.configuration, other.sample_block)
     {
     }
-
 
     RedisDictionarySource::~RedisDictionarySource() = default;
 
-    static String storageTypeToKeyType(RedisStorageType type)
+    BlockIO RedisDictionarySource::loadAll()
     {
-        switch (type)
-        {
-            case RedisStorageType::SIMPLE:
-                return "string";
-            case RedisStorageType::HASH_MAP:
-                return "hash";
-            default:
-                return "none";
-        }
-
-        __builtin_unreachable();
-    }
-
-    Pipe RedisDictionarySource::loadAll()
-    {
-        if (!client->isConnected())
-            client->connect(host, port);
+        BlockIO io;
+        auto connection = getRedisConnection(pool, configuration);
 
         RedisCommand command_for_keys("KEYS");
         command_for_keys << "*";
 
         /// Get only keys for specified storage type.
-        auto all_keys = client->execute<RedisArray>(command_for_keys);
+        auto all_keys = connection->client->execute<RedisArray>(command_for_keys);
         if (all_keys.isNull())
-            return Pipe(std::make_shared<RedisSource>(client, RedisArray{}, storage_type, sample_block, max_block_size));
-
-        RedisArray keys;
-        auto key_type = storageTypeToKeyType(storage_type);
-        for (const auto & key : all_keys)
-            if (key_type == client->execute<String>(RedisCommand("TYPE").addRedisType(key)))
-                keys.addRedisType(std::move(key));
-
-        if (storage_type == RedisStorageType::HASH_MAP)
         {
-            RedisArray hkeys;
-            for (const auto & key : keys)
-            {
-                RedisCommand command_for_secondary_keys("HKEYS");
-                command_for_secondary_keys.addRedisType(key);
-
-                auto secondary_keys = client->execute<RedisArray>(command_for_secondary_keys);
-
-                RedisArray primary_with_secondary;
-                primary_with_secondary.addRedisType(key);
-                for (const auto & secondary_key : secondary_keys)
-                {
-                    primary_with_secondary.addRedisType(secondary_key);
-                    /// Do not store more than max_block_size values for one request.
-                    if (primary_with_secondary.size() == max_block_size + 1)
-                    {
-                        hkeys.add(primary_with_secondary);
-                        primary_with_secondary.clear();
-                        primary_with_secondary.addRedisType(key);
-                    }
-                }
-
-                if (primary_with_secondary.size() > 1)
-                    hkeys.add(std::move(primary_with_secondary));
-            }
-
-            keys = std::move(hkeys);
+            io.pipeline = QueryPipeline(std::make_shared<RedisSource>(
+                std::move(connection), RedisArray{},
+                configuration.storage_type, sample_block, REDIS_MAX_BLOCK_SIZE));
+            return io;
         }
 
-        return Pipe(std::make_shared<RedisSource>(client, std::move(keys), storage_type, sample_block, max_block_size));
+        RedisArray keys;
+        auto key_type = storageTypeToKeyType(configuration.storage_type);
+        for (auto && key : all_keys)
+            if (key_type == connection->client->execute<String>(RedisCommand("TYPE").addRedisType(key)))
+                keys.addRedisType(key);
+
+        if (configuration.storage_type == RedisStorageType::HASH_MAP)
+        {
+            keys = *getRedisHashMapKeys(connection, keys);
+        }
+
+        io.pipeline = QueryPipeline(std::make_shared<RedisSource>(
+            std::move(connection), std::move(keys),
+            configuration.storage_type, sample_block, REDIS_MAX_BLOCK_SIZE));
+        return io;
     }
 
-
-    Pipe RedisDictionarySource::loadIds(const std::vector<UInt64> & ids)
+    BlockIO RedisDictionarySource::loadIds(const VectorWithMemoryTracking<UInt64> & ids)
     {
-        if (!client->isConnected())
-            client->connect(host, port);
+        auto connection = getRedisConnection(pool, configuration);
 
-        if (storage_type == RedisStorageType::HASH_MAP)
+        if (configuration.storage_type == RedisStorageType::HASH_MAP)
             throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Cannot use loadIds with 'hash_map' storage type");
 
         if (!dict_struct.id)
@@ -229,51 +209,64 @@ namespace DB
         for (UInt64 id : ids)
             keys << DB::toString(id);
 
-        return Pipe(std::make_shared<RedisSource>(client, std::move(keys), storage_type, sample_block, max_block_size));
+        BlockIO io;
+        io.pipeline = QueryPipeline(std::make_shared<RedisSource>(
+            std::move(connection), std::move(keys),
+            configuration.storage_type, sample_block, REDIS_MAX_BLOCK_SIZE));
+        return io;
     }
 
-    Pipe RedisDictionarySource::loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows)
+    BlockIO RedisDictionarySource::loadKeys(const Columns & key_columns, const VectorWithMemoryTracking<size_t> & requested_rows)
     {
-        if (!client->isConnected())
-            client->connect(host, port);
+        auto connection = getRedisConnection(pool, configuration);
 
         if (key_columns.size() != dict_struct.key->size())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "The size of key_columns does not equal to the size of dictionary key");
 
+        const auto serialize_key = [&](RedisArray & out, size_t column, size_t row)
+        {
+            const auto & type = dict_struct.key->at(column).type;
+            if (isNativeInt(type))
+                out << DB::toString(key_columns[column]->getInt(row));
+            else if (isNativeUInt(type))
+                out << DB::toString(key_columns[column]->getUInt(row));
+            else if (isString(type))
+                out << (*key_columns[column])[row].safeGet<String>();
+            else
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected type of key in Redis dictionary");
+        };
+
+        if (configuration.storage_type == RedisStorageType::SIMPLE && key_columns.size() != 1)
+            throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Expected exactly one key column for 'simple' storage type");
+
         RedisArray keys;
         for (auto row : requested_rows)
         {
-            RedisArray key;
-            for (size_t i = 0; i < key_columns.size(); ++i)
+            if (configuration.storage_type == RedisStorageType::SIMPLE)
             {
-                const auto & type = dict_struct.key->at(i).type;
-                if (isInteger(type))
-                    key << DB::toString(key_columns[i]->get64(row));
-                else if (isString(type))
-                    key << get<String>((*key_columns[i])[row]);
-                else
-                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected type of key in Redis dictionary");
+                /// 'simple' storage is read with MGET, which expects a flat list of keys (one per row).
+                serialize_key(keys, 0, row);
             }
-
-            keys.add(key);
+            else
+            {
+                /// 'hash_map' storage is read with HMGET, which expects a nested array per row.
+                RedisArray key;
+                for (size_t i = 0; i < key_columns.size(); ++i)
+                    serialize_key(key, i, row);
+                keys.add(key);
+            }
         }
 
-        return Pipe(std::make_shared<RedisSource>(client, std::move(keys), storage_type, sample_block, max_block_size));
+        BlockIO io;
+        io.pipeline = QueryPipeline(std::make_shared<RedisSource>(
+            std::move(connection), std::move(keys),
+            configuration.storage_type, sample_block, REDIS_MAX_BLOCK_SIZE));
+        return io;
     }
-
 
     String RedisDictionarySource::toString() const
     {
-        return "Redis: " + host + ':' + DB::toString(port);
+        return "Redis: " + configuration.host + ':' + DB::toString(configuration.port);
     }
 
-    RedisStorageType RedisDictionarySource::parseStorageType(const String & storage_type_str)
-    {
-        if (storage_type_str == "hash_map")
-            return RedisStorageType::HASH_MAP;
-        else if (!storage_type_str.empty() && storage_type_str != "simple")
-            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Unknown storage type {} for Redis dictionary", storage_type_str);
-
-        return RedisStorageType::SIMPLE;
-    }
 }

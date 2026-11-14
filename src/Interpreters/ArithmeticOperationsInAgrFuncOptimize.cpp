@@ -1,8 +1,12 @@
 #include <unordered_set>
 
 #include <Common/typeid_cast.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <Interpreters/IdentifierSemantic.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Interpreters/ArithmeticOperationsInAgrFuncOptimize.h>
@@ -19,6 +23,35 @@ namespace ErrorCodes
 
 namespace
 {
+
+/** Arithmetic with a `Decimal` operand does not distribute over these aggregate functions. It computes in
+  * the native width of the decimal, into which the other operand is truncated, with an overflow check on
+  * every row, and `divide` drops the fractional digits beyond the scale of the decimal on every row. The
+  * hoisted operation runs once, on the aggregate, often in a wider type: for `a Decimal32(0)`, `sum(a / 2)`
+  * over `{1, 1}` is `0`, but `sum(a) / 2` is `1`.
+  *
+  * The types of expressions are not known at this stage, so the operation is hoisted only when its other
+  * operand is a column of the source tables whose type is known not to be `Decimal`.
+  */
+DataTypePtr getNonDecimalColumnType(const ASTPtr & ast, const TablesWithColumns & tables)
+{
+    const auto * identifier = ast->as<ASTIdentifier>();
+    if (!identifier)
+        return {};
+
+    auto pos = IdentifierSemantic::getMembership(*identifier);
+    if (!pos)
+        pos = IdentifierSemantic::chooseTableColumnMatch(*identifier, tables, true);
+    if (!pos || *pos >= tables.size())
+        return {};
+
+    auto column = tables[*pos].columns.tryGetByName(identifier->shortName());
+    if (!column || !column->type)
+        return {};
+
+    auto type = removeNullable(removeLowCardinality(column->type));
+    return isDecimal(type) ? nullptr : type;
+}
 
 const ASTFunction * getInternalFunction(const ASTFunction & func)
 {
@@ -38,7 +71,9 @@ ASTPtr exchangeExtractFirstArgument(const String & func_name, const ASTFunction 
     new_args.push_back(child_func.arguments->children[0]);
     new_args.push_back(new_child);
 
-    return makeASTFunction(child_func.name, new_args);
+    auto res = makeASTFunction(child_func.name, new_args);
+    res->setIsOperator(child_func.isOperator());
+    return res;
 }
 
 ASTPtr exchangeExtractSecondArgument(const String & func_name, const ASTFunction & child_func)
@@ -52,59 +87,43 @@ ASTPtr exchangeExtractSecondArgument(const String & func_name, const ASTFunction
     new_args.push_back(new_child);
     new_args.push_back(child_func.arguments->children[1]);
 
-    return makeASTFunction(child_func.name, new_args);
+    auto res = makeASTFunction(child_func.name, new_args);
+    res->setIsOperator(child_func.isOperator());
+    return res;
 }
 
 Field zeroField(const Field & value)
 {
     switch (value.getType())
     {
-        case Field::Types::UInt64: return UInt64(0);
-        case Field::Types::Int64: return Int64(0);
-        case Field::Types::Float64: return Float64(0);
-        case Field::Types::UInt128: return UInt128(0);
-        case Field::Types::Int128: return Int128(0);
-        case Field::Types::UInt256: return UInt256(0);
-        case Field::Types::Int256: return Int256(0);
+        case Field::Types::UInt64: return static_cast<UInt64>(0);
+        case Field::Types::Int64: return static_cast<Int64>(0);
+        case Field::Types::Float64: return static_cast<Float64>(0);
+        case Field::Types::UInt128: return static_cast<UInt128>(0);
+        case Field::Types::Int128: return static_cast<Int128>(0);
+        case Field::Types::UInt256: return static_cast<UInt256>(0);
+        case Field::Types::Int256: return static_cast<Int256>(0);
         default:
             break;
     }
 
-    throw Exception("Unexpected literal type in function", ErrorCodes::BAD_TYPE_OF_FIELD);
+    throw Exception(ErrorCodes::BAD_TYPE_OF_FIELD, "Unexpected literal type in function");
 }
 
-const String & changeNameIfNeeded(const String & func_name, const String & child_name, const ASTLiteral & literal)
-{
-    static const std::unordered_map<String, std::unordered_set<String>> matches = {
-        { "min", { "multiply", "divide" } },
-        { "max", { "multiply", "divide" } }
-    };
-
-    static const std::unordered_map<String, String> swap_to = {
-        { "min", "max" },
-        { "max", "min" }
-    };
-
-    if (literal.value < zeroField(literal.value) && matches.count(func_name) && matches.find(func_name)->second.count(child_name))
-        return swap_to.find(func_name)->second;
-
-    return func_name;
-}
-
-ASTPtr tryExchangeFunctions(const ASTFunction & func)
+ASTPtr tryExchangeFunctions(const ASTFunction & func, const TablesWithColumns & tables)
 {
     static const std::unordered_map<String, std::unordered_set<String>> supported
-        = {{"sum", {"multiply", "divide"}},
-           {"min", {"multiply", "divide", "plus", "minus"}},
-           {"max", {"multiply", "divide", "plus", "minus"}},
-           {"avg", {"multiply", "divide", "plus", "minus"}}};
+        = {{"sum", {"multiply", "divide", "divideExact"}},
+           {"min", {"multiply", "divide", "divideExact", "plus", "minus"}},
+           {"max", {"multiply", "divide", "divideExact", "plus", "minus"}},
+           {"avg", {"multiply", "divide", "divideExact", "plus", "minus"}}};
 
     /// Aggregate functions[sum|min|max|avg] is case-insensitive, so we use lower cases name
     auto lower_name = Poco::toLower(func.name);
 
     const ASTFunction * child_func = getInternalFunction(func);
-    if (!child_func || !child_func->arguments || child_func->arguments->children.size() != 2 || !supported.count(lower_name)
-        || !supported.find(lower_name)->second.count(child_func->name))
+    if (!child_func || !child_func->arguments || child_func->arguments->children.size() != 2 || !supported.contains(lower_name)
+        || !supported.find(lower_name)->second.contains(child_func->name))
         return {};
 
     auto original_alias = func.tryGetAlias();
@@ -114,19 +133,55 @@ ASTPtr tryExchangeFunctions(const ASTFunction & func)
 
     ASTPtr optimized_ast;
 
+    /** Need reverse max <-> min for:
+      *
+      * max(-1*value) -> -1*min(value)
+      * max(value/-2) -> min(value)/-2
+      * max(1-value) -> 1-min(value)
+      */
+    auto get_reverse_aggregate_function_name = [](const std::string & aggregate_function_name) -> std::string
+    {
+        if (aggregate_function_name == "min")
+            return "max";
+        if (aggregate_function_name == "max")
+            return "min";
+        return aggregate_function_name;
+    };
+
     if (first_literal && !second_literal)
     {
         /// It's possible to rewrite 'sum(1/n)' with 'sum(1) * div(1/n)' but we lose accuracy. Ignored.
-        if (child_func->name == "divide")
+        if (child_func->name == "divide" || child_func->name == "divideExact")
             return {};
 
-        const String & new_name = changeNameIfNeeded(lower_name, child_func->name, *first_literal);
-        optimized_ast = exchangeExtractFirstArgument(new_name, *child_func);
+        if (!getNonDecimalColumnType(child_func_args[1], tables))
+            return {};
+
+        bool need_reverse
+            = (child_func->name == "multiply" && first_literal->value < zeroField(first_literal->value)) || child_func->name == "minus";
+        if (need_reverse)
+            lower_name = get_reverse_aggregate_function_name(lower_name);
+
+        optimized_ast = exchangeExtractFirstArgument(lower_name, *child_func);
     }
     else if (second_literal) /// second or both are consts
     {
-        const String & new_name = changeNameIfNeeded(lower_name, child_func->name, *second_literal);
-        optimized_ast = exchangeExtractSecondArgument(new_name, *child_func);
+        auto column_type = getNonDecimalColumnType(child_func_args[0], tables);
+        if (!column_type)
+            return {};
+
+        /// Preserve per-row truncation and overflow checks only for integer division.
+        if (child_func->name == "divideExact" && isInteger(column_type)
+            && second_literal->value.getType() != Field::Types::Float64)
+            return {};
+
+        bool need_reverse
+            = (child_func->name == "multiply" || child_func->name == "divide" || child_func->name == "divideExact")
+            && second_literal->value < zeroField(second_literal->value);
+        if (need_reverse)
+            lower_name = get_reverse_aggregate_function_name(lower_name);
+
+        optimized_ast = exchangeExtractSecondArgument(lower_name, *child_func);
     }
 
     if (optimized_ast)
@@ -142,7 +197,7 @@ ASTPtr tryExchangeFunctions(const ASTFunction & func)
 
 void ArithmeticOperationsInAgrFuncMatcher::visit(const ASTFunction & func, ASTPtr & ast, Data & data)
 {
-    if (auto exchanged_funcs = tryExchangeFunctions(func))
+    if (auto exchanged_funcs = tryExchangeFunctions(func, data.tables))
     {
         ast = exchanged_funcs;
 
@@ -157,7 +212,12 @@ void ArithmeticOperationsInAgrFuncMatcher::visit(const ASTFunction & func, ASTPt
 void ArithmeticOperationsInAgrFuncMatcher::visit(ASTPtr & ast, Data & data)
 {
     if (const auto * function_node = ast->as<ASTFunction>())
+    {
+        if (function_node->isWindowFunction())
+            return;
+
         visit(*function_node, ast, data);
+    }
 }
 
 bool ArithmeticOperationsInAgrFuncMatcher::needChildVisit(const ASTPtr & node, const ASTPtr &)

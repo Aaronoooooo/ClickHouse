@@ -10,9 +10,7 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
-    extern const int SIZES_OF_ARRAYS_DOESNT_MATCH;
+    extern const int SIZES_OF_ARRAYS_DONT_MATCH;
 }
 
 /** Function validateNestedArraySizes is used to check the consistency of Nested DataType subcolumns's offsets when Update
@@ -20,7 +18,7 @@ namespace ErrorCodes
  *     The first argument is the condition of WHERE in UPDATE operation, only when this is true, we need to check
  *     The rest arguments are the subcolumns of Nested DataType.
  */
-class FunctionValidateNestedArraySizes : public IFunction
+class FunctionValidateNestedArraySizes final : public IFunction
 {
 public:
     static constexpr auto name = "validateNestedArraySizes";
@@ -31,31 +29,14 @@ public:
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
     size_t getNumberOfArguments() const override { return 0; }
     bool useDefaultImplementationForConstants() const override { return true; }
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override;
+
+    String getSignatureString() const override
+    {
+        return "(UInt8, Array, Array, ...) -> UInt8";
+    }
+
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override;
 };
-
-DataTypePtr FunctionValidateNestedArraySizes::getReturnTypeImpl(const DataTypes & arguments) const
-{
-    size_t num_args = arguments.size();
-
-    if (num_args < 3)
-        throw Exception(
-            "Function " + getName() + " needs more than two arguments; passed " + toString(arguments.size()) + ".",
-            ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
-
-    if (!WhichDataType(arguments[0]).isUInt8())
-        throw Exception("Illegal type " + arguments[0]->getName() + " of first argument of function " + getName() + " Must be UInt.",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-    for (size_t i = 1; i < num_args; ++i)
-        if (!WhichDataType(arguments[i]).isArray())
-            throw Exception(
-                "Illegal type " + arguments[i]->getName() + " of " + toString(i) + " argument of function " + getName() + " Must be Array.",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-    return std::make_shared<DataTypeUInt8>();
-}
 
 ColumnPtr FunctionValidateNestedArraySizes::executeImpl(
     const ColumnsWithTypeAndName & arguments, const DataTypePtr & /*result_type*/, size_t input_rows_count) const
@@ -108,7 +89,7 @@ ColumnPtr FunctionValidateNestedArraySizes::executeImpl(
             else if (first_length != length)
             {
                 throw Exception(
-                    ErrorCodes::SIZES_OF_ARRAYS_DOESNT_MATCH,
+                    ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH,
                     "Elements '{}' and '{}' of Nested data structure (Array columns) "
                     "have different array sizes ({} and {} respectively) on row {}",
                     arguments[1].name, arguments[args_idx].name, first_length, length, i);
@@ -116,12 +97,12 @@ ColumnPtr FunctionValidateNestedArraySizes::executeImpl(
         }
     }
 
-    return ColumnUInt8::create(input_rows_count, 1);
+    return ColumnUInt8::create(input_rows_count, static_cast<UInt8>(1));
 }
 
-void registerFunctionValidateNestedArraySizes(FunctionFactory & factory)
+REGISTER_FUNCTION(ValidateNestedArraySizes)
 {
-    factory.registerFunction<FunctionValidateNestedArraySizes>();
+    factory.registerFunction<FunctionValidateNestedArraySizes>(FunctionDocumentation::INTERNAL_FUNCTION_DOCS);
 }
 
 }

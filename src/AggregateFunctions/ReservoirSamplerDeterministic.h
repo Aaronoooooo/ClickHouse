@@ -5,10 +5,9 @@
 #include <climits>
 #include <AggregateFunctions/ReservoirSampler.h>
 #include <base/types.h>
+#include <base/sort.h>
 #include <Common/HashTable/Hash.h>
 #include <IO/ReadBuffer.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
 #include <Common/PODArray.h>
 #include <Common/NaNUtils.h>
 #include <Poco/Exception.h>
@@ -21,6 +20,8 @@ struct Settings;
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int TOO_LARGE_ARRAY_SIZE;
+    extern const int BAD_ARGUMENTS;
 }
 }
 
@@ -30,25 +31,14 @@ namespace ErrorCodes
 /// That is, it makes sense to first add, then get quantiles without adding.
 
 
-namespace DB
-{
-struct Settings;
-
-namespace ErrorCodes
-{
-    extern const int MEMORY_LIMIT_EXCEEDED;
-}
-}
-
-
 namespace detail
 {
     const size_t DEFAULT_MAX_SAMPLE_SIZE = 8192;
-    const auto MAX_SKIP_DEGREE = sizeof(UInt32) * 8;
+    const auto MAX_SKIP_DEGREE = sizeof(UInt32) * 8 - 1;
 }
 
 /// What if there is not a single value - throw an exception, or return 0 or NaN in the case of double?
-enum class ReservoirSamplerDeterministicOnEmpty
+enum class ReservoirSamplerDeterministicOnEmpty : uint8_t
 {
     THROW,
     RETURN_NAN_OR_ZERO,
@@ -66,7 +56,7 @@ private:
     }
 
 public:
-    ReservoirSamplerDeterministic(const size_t max_sample_size_ = detail::DEFAULT_MAX_SAMPLE_SIZE)
+    explicit ReservoirSamplerDeterministic(const size_t max_sample_size_ = detail::DEFAULT_MAX_SAMPLE_SIZE)
         : max_sample_size{max_sample_size_}
     {
     }
@@ -83,7 +73,7 @@ public:
         if (isNaN(v))
             return;
 
-        UInt32 hash = intHash64(determinator);
+        UInt32 hash = static_cast<UInt32>(intHash64(determinator));
         insertImpl(v, hash);
         sorted = false;
         ++total_values;
@@ -94,6 +84,11 @@ public:
         return total_values;
     }
 
+    bool empty() const
+    {
+        return samples.empty();
+    }
+
     T quantileNearest(double level)
     {
         if (samples.empty())
@@ -102,7 +97,7 @@ public:
         sortIfNeeded();
 
         double index = level * (samples.size() - 1);
-        size_t int_index = static_cast<size_t>(index + 0.5);
+        size_t int_index = static_cast<size_t>(index + 0.5); /// NOLINT
         int_index = std::max(0LU, std::min(samples.size() - 1, int_index));
         return samples[int_index].first;
     }
@@ -118,7 +113,7 @@ public:
 
         sortIfNeeded();
 
-        const double index = std::max(0., std::min(samples.size() - 1., level * (samples.size() - 1)));
+        const double index = std::max(0., std::min(static_cast<double>(samples.size() - 1), level * static_cast<double>(samples.size() - 1)));
 
         /// To get a value from a fractional index, we linearly interpolate between adjacent values.
         size_t left_index = static_cast<size_t>(index);
@@ -126,8 +121,8 @@ public:
         if (right_index == samples.size())
             return static_cast<double>(samples[left_index].first);
 
-        const double left_coef = right_index - index;
-        const double right_coef = index - left_index;
+        const double left_coef = static_cast<double>(right_index) - index;
+        const double right_coef = index - static_cast<double>(left_index);
 
         return static_cast<double>(samples[left_index].first) * left_coef + static_cast<double>(samples[right_index].first) * right_coef;
     }
@@ -147,33 +142,54 @@ public:
         total_values += b.total_values;
     }
 
-    void read(DB::ReadBuffer & buf)
+    void read(DB::ReadBuffer & buf, size_t version = 0)
     {
         size_t size = 0;
-        DB::readIntBinary<size_t>(size, buf);
-        DB::readIntBinary<size_t>(total_values, buf);
+        readBinaryLittleEndian(size, buf);
+        readBinaryLittleEndian(total_values, buf);
 
         /// Compatibility with old versions.
-        if (size > total_values)
-            size = total_values;
+        size = std::min(size, total_values);
+
+        static constexpr size_t MAX_RESERVOIR_SIZE = 1_GiB;
+        if (unlikely(size > MAX_RESERVOIR_SIZE))
+            throw DB::Exception(DB::ErrorCodes::TOO_LARGE_ARRAY_SIZE,
+                                "Too large array size (maximum: {})", MAX_RESERVOIR_SIZE);
 
         samples.resize(size);
         for (size_t i = 0; i < size; ++i)
-            DB::readPODBinary(samples[i], buf);
+            readBinaryLittleEndian(samples[i], buf);
+
+        /// Since version 1 the skip degree is a part of the state. Reading it back is what makes the
+        /// result of a merge independent of how the data was partitioned between the merged states:
+        /// without it, an already thinned out sample is indistinguishable from a complete one, and
+        /// `merge` under-samples the states that were thinned out the most. See `setSkipDegree`.
+        /// A state written by version 0 is only correct to merge with when nothing was skipped, and
+        /// `skip_degree` stays 0 - the pre-existing behaviour.
+        UInt8 new_skip_degree = 0;
+        if (version >= 1)
+        {
+            readBinaryLittleEndian(new_skip_degree, buf);
+
+            if (unlikely(new_skip_degree > detail::MAX_SKIP_DEGREE))
+                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                    "Skip degree in `quantileDeterministic` state is {}, which exceeds the maximum value of {}",
+                    static_cast<size_t>(new_skip_degree), detail::MAX_SKIP_DEGREE);
+        }
+
+        /// The samples that have just been read are already thinned out to `new_skip_degree`, so assign
+        /// the fields directly instead of going through `setSkipDegree`, which would walk them again.
+        skip_degree = new_skip_degree;
+        skip_mask = skip_degree == detail::MAX_SKIP_DEGREE ? static_cast<UInt32>(-1) : (1 << skip_degree) - 1;
 
         sorted = false;
     }
 
-#if !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wclass-memaccess"
-#endif
-
-    void write(DB::WriteBuffer & buf) const
+    void write(DB::WriteBuffer & buf, size_t version = 0) const
     {
-        size_t size = samples.size();
-        DB::writeIntBinary<size_t>(size, buf);
-        DB::writeIntBinary<size_t>(total_values, buf);
+        const size_t size = samples.size();
+        writeBinaryLittleEndian(size, buf);
+        writeBinaryLittleEndian(total_values, buf);
 
         for (size_t i = 0; i < size; ++i)
         {
@@ -183,18 +199,23 @@ public:
             /// Here we ensure that padding is zero without changing the protocol.
             /// TODO: After implementation of "versioning aggregate function state",
             /// change the serialization format.
-
             Element elem;
-            memset(&elem, 0, sizeof(elem));
-            elem = samples[i];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-warning-option"  /// Remove after clang20
+#pragma clang diagnostic ignored "-Wnontrivial-memcall"
+            memset(&elem, 0, sizeof(elem)); /// NOLINT(bugprone-undefined-memory-manipulation)
+#pragma clang diagnostic pop
+            elem.first = samples[i].first;
+            elem.second = samples[i].second;
 
-            DB::writePODBinary(elem, buf);
+            DB::transformEndianness<std::endian::little>(elem);
+            DB::writeString(reinterpret_cast<const char*>(&elem), sizeof(elem), buf);
         }
-    }
 
-#if !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
+        /// Appended after the samples so that the prefix stays byte-identical to version 0.
+        if (version >= 1)
+            writeBinaryLittleEndian(skip_degree, buf);
+    }
 
 private:
     /// We allocate some memory on the stack to avoid allocations when there are many objects with a small number of elements.
@@ -238,7 +259,9 @@ private:
         if (skip_degree_ == skip_degree)
             return;
         if (skip_degree_ > detail::MAX_SKIP_DEGREE)
-            throw DB::Exception{"skip_degree exceeds maximum value", DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED};
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "Skip degree in `quantileDeterministic` exceeds the maximum value of {}, which indicates an incorrect usage",
+                detail::MAX_SKIP_DEGREE);
         skip_degree = skip_degree_;
         if (skip_degree == detail::MAX_SKIP_DEGREE)
             skip_mask = static_cast<UInt32>(-1);
@@ -258,7 +281,9 @@ private:
     {
         if (sorted)
             return;
-        std::sort(samples.begin(), samples.end(), [](const auto & lhs, const auto & rhs) { return lhs.first < rhs.first; });
+
+        /// In order to provide deterministic result we must sort by value and hash
+        ::sort(samples.begin(), samples.end(), [](const auto & lhs, const auto & rhs) { return lhs < rhs; });
         sorted = true;
     }
 
@@ -267,7 +292,15 @@ private:
     {
         if (OnEmpty == ReservoirSamplerDeterministicOnEmpty::THROW)
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Quantile of empty ReservoirSamplerDeterministic");
-        else
-            return NanLikeValueConstructor<ResultType, std::is_floating_point_v<ResultType>>::getValue();
+        return NanLikeValueConstructor<ResultType, is_floating_point<ResultType>>::getValue();
     }
 };
+
+namespace DB
+{
+template <typename T>
+void readBinary(std::pair<T, UInt32> & x, ReadBuffer & buf)
+{
+    readPODBinary(x, buf);
+}
+}

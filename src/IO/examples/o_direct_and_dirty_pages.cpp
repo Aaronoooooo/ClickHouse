@@ -8,8 +8,9 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/ReadBufferFromFile.h>
+#include <Examples/clickhouse_examples.h>
 
-int main(int, char **)
+int mainEntryExampleODirectAndDirtyPages(int, char **)
 {
     using namespace DB;
 
@@ -46,7 +47,7 @@ int main(int, char **)
         /// Write to file with O_DIRECT, read as usual.
 
         {
-            WriteBufferFromFile wb("test2", BUF_SIZE, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0666, nullptr, page_size);
+            WriteBufferFromFile wb("test2", BUF_SIZE, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, /* throttler= */ {}, 0666, nullptr, page_size);
 
             for (size_t i = 0; i < N; ++i)
                 writeStringBinary(test, wb);

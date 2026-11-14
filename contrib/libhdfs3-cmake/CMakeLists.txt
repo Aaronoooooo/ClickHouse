@@ -1,4 +1,15 @@
-if (${ENABLE_KRB5})
+if(NOT OS_FREEBSD AND NOT ARCH_PPC64LE)
+    option(ENABLE_HDFS "Enable HDFS" ${ENABLE_LIBRARIES})
+elseif(ENABLE_HDFS)
+    message (${RECONFIGURE_MESSAGE_LEVEL} "Cannot use HDFS3 with current configuration")
+endif()
+
+if(NOT ENABLE_HDFS)
+    message(STATUS "Not using HDFS")
+    return()
+endif()
+
+if (TARGET ch_contrib::krb5)
     SET(WITH_KERBEROS 1)
 else()
     SET(WITH_KERBEROS 0)
@@ -9,10 +20,22 @@ set(HDFS3_ROOT_DIR "${ClickHouse_SOURCE_DIR}/contrib/libhdfs3")
 set(HDFS3_SOURCE_DIR "${HDFS3_ROOT_DIR}/src")
 set(HDFS3_COMMON_DIR "${HDFS3_SOURCE_DIR}/common")
 
-# module
-set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake" ${CMAKE_MODULE_PATH})
-include(Platform)
-include(Options)
+ADD_DEFINITIONS(-DTEST_HDFS_PREFIX="${TEST_HDFS_PREFIX}")
+ADD_DEFINITIONS(-D__STDC_FORMAT_MACROS)
+ADD_DEFINITIONS(-D_GNU_SOURCE)
+ADD_DEFINITIONS(-D_GLIBCXX_USE_NANOSLEEP)
+ADD_DEFINITIONS(-DHAVE_NANOSLEEP)
+
+if (USE_MUSL OR APPLE)
+    ADD_DEFINITIONS(-DSTRERROR_R_RETURN_INT)
+endif ()
+
+set(HAVE_STEADY_CLOCK 1)
+set(HAVE_NESTED_EXCEPTION 1)
+SET(HAVE_BOOST_CHRONO 0)
+SET(HAVE_BOOST_ATOMIC 0)
+SET(HAVE_STD_CHRONO 1)
+SET(HAVE_STD_ATOMIC 1)
 
 # source
 set(PROTO_FILES
@@ -27,7 +50,7 @@ set(PROTO_FILES
     "${HDFS3_SOURCE_DIR}/proto/datatransfer.proto"
     )
 
-PROTOBUF_GENERATE_CPP(PROTO_SOURCES PROTO_HEADERS ${PROTO_FILES})
+PROTOBUF_GENERATE_CPP(PROTO_SOURCES PROTO_HEADERS ${PROTO_FILES} APPEND_PATH)
 
 configure_file("${HDFS3_SOURCE_DIR}/platform.h.in" "${CMAKE_CURRENT_BINARY_DIR}/platform.h")
 
@@ -58,6 +81,33 @@ set(SRCS
     "${HDFS3_SOURCE_DIR}/client/Token.cpp"
     "${HDFS3_SOURCE_DIR}/client/PacketPool.cpp"
     "${HDFS3_SOURCE_DIR}/client/OutputStream.cpp"
+    "${HDFS3_SOURCE_DIR}/client/AbstractNativeRawDecoder.cpp"
+    "${HDFS3_SOURCE_DIR}/client/AbstractNativeRawEncoder.cpp"
+    "${HDFS3_SOURCE_DIR}/client/ByteBufferDecodingState.cpp"
+    "${HDFS3_SOURCE_DIR}/client/ByteBufferEncodingState.cpp"
+    "${HDFS3_SOURCE_DIR}/client/CoderUtil.cpp"
+    "${HDFS3_SOURCE_DIR}/client/ECChunk.cpp"
+    "${HDFS3_SOURCE_DIR}/client/ErasureCoderOptions.cpp"
+    "${HDFS3_SOURCE_DIR}/client/GF256.cpp"
+    "${HDFS3_SOURCE_DIR}/client/GaloisField.cpp"
+    "${HDFS3_SOURCE_DIR}/client/NativeRSRawDecoder.cpp"
+    "${HDFS3_SOURCE_DIR}/client/NativeRSRawEncoder.cpp"
+    "${HDFS3_SOURCE_DIR}/client/Preconditions.cpp"
+    "${HDFS3_SOURCE_DIR}/client/RSUtil.cpp"
+    "${HDFS3_SOURCE_DIR}/client/RawErasureCoderFactory.cpp"
+    "${HDFS3_SOURCE_DIR}/client/RawErasureDecoder.cpp"
+    "${HDFS3_SOURCE_DIR}/client/RawErasureEncoder.cpp"
+    "${HDFS3_SOURCE_DIR}/client/StatefulStripeReader.cpp"
+    "${HDFS3_SOURCE_DIR}/client/PositionStripeReader.cpp"
+    "${HDFS3_SOURCE_DIR}/client/StripeReader.cpp"
+    "${HDFS3_SOURCE_DIR}/client/StripedBlockUtil.cpp"
+    "${HDFS3_SOURCE_DIR}/client/StripedInputStreamImpl.cpp"
+    "${HDFS3_SOURCE_DIR}/client/StripedOutputStreamImpl.cpp"
+    "${HDFS3_SOURCE_DIR}/client/SlowMetrics.cpp"
+    "${HDFS3_SOURCE_DIR}/client/SlowNodeTracker.cpp"
+    "${HDFS3_SOURCE_DIR}/client/SystemECPolicies.cpp"
+    "${HDFS3_SOURCE_DIR}/client/dump.cpp"
+    "${HDFS3_SOURCE_DIR}/client/erasure_coder.cpp"
     "${HDFS3_SOURCE_DIR}/rpc/RpcChannelKey.cpp"
     "${HDFS3_SOURCE_DIR}/rpc/RpcProtocolInfo.cpp"
     "${HDFS3_SOURCE_DIR}/rpc/RpcClient.cpp"
@@ -87,37 +137,68 @@ set(SRCS
     "${HDFS3_SOURCE_DIR}/common/Hash.cpp"
     "${HDFS3_SOURCE_DIR}/common/SWCrc32c.cpp"
     "${HDFS3_SOURCE_DIR}/common/Thread.cpp"
+    "${HDFS3_SOURCE_DIR}/common/IntelAsmCrc32c.cpp"
     ${PROTO_SOURCES}
 )
+
+if (ARCH_AMD64 AND NOT APPLE)
+    find_program(YASM_PATH NAMES yasm)
+    if (NOT YASM_PATH)
+        message(FATAL_ERROR "Please install the Yasm assembler to build ClickHouse with Hadoop Distributed File System (HDFS) support")
+    endif ()
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/crc_iscsi_v_pcl.o
+        COMMAND ${YASM_PATH} -f x64 -f elf64 -X gnu -g dwarf2 -D LINUX -o ${CMAKE_CURRENT_BINARY_DIR}/crc_iscsi_v_pcl.o ${HDFS3_SOURCE_DIR}/common/crc_iscsi_v_pcl.asm
+        COMMENT "Translating Intel CRC assembly to object code")
+    LIST(APPEND SRCS ${CMAKE_CURRENT_BINARY_DIR}/crc_iscsi_v_pcl.o)
+endif ()
 
 # old kernels (< 3.17) doesn't have SYS_getrandom. Always use POSIX implementation to have better compatibility
 set_source_files_properties("${HDFS3_SOURCE_DIR}/rpc/RpcClient.cpp" PROPERTIES COMPILE_FLAGS "-DBOOST_UUID_RANDOM_PROVIDER_FORCE_POSIX=1")
 
 # target
-add_library(hdfs3 ${SRCS})
+add_library(_hdfs3 ${SRCS})
 
-if(USE_INTERNAL_PROTOBUF_LIBRARY)
-    add_dependencies(hdfs3 protoc)
-endif()
+add_dependencies(_hdfs3 protoc)
+# `SHELL:` keeps the two `-include` options apart, otherwise CMake de-duplicates the repeated flag.
+target_compile_options(_hdfs3 PRIVATE
+    "SHELL:-include ${ClickHouse_SOURCE_DIR}/contrib/libhdfs3-cmake/absl_log_undef.h"
+    "SHELL:-include ${ClickHouse_SOURCE_DIR}/contrib/google-protobuf/src/google/protobuf/stubs/port.h"
+)
 
-target_include_directories(hdfs3 PRIVATE ${HDFS3_SOURCE_DIR})
-target_include_directories(hdfs3 PRIVATE ${HDFS3_COMMON_DIR})
-target_include_directories(hdfs3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+if (ENABLE_CLICKHOUSE_BENCHMARK)
+    message(STATUS "enable perf checksum")
+    target_include_directories(_hdfs3 PUBLIC ${HDFS3_SOURCE_DIR})
+    target_include_directories(_hdfs3 PUBLIC ${HDFS3_COMMON_DIR})
+    target_include_directories(_hdfs3 PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+else ()
+    target_include_directories(_hdfs3 PRIVATE ${HDFS3_SOURCE_DIR})
+    target_include_directories(_hdfs3 PRIVATE ${HDFS3_COMMON_DIR})
+    target_include_directories(_hdfs3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+endif ()
 
-target_include_directories(hdfs3 PRIVATE ${LIBGSASL_INCLUDE_DIR})
-target_include_directories(hdfs3 PRIVATE ${LIBXML2_INCLUDE_DIR})
+target_include_directories(_hdfs3 SYSTEM BEFORE INTERFACE "${ClickHouse_SOURCE_DIR}/contrib/libhdfs3/include")
 
-target_link_libraries(hdfs3 PRIVATE ${LIBGSASL_LIBRARY})
+target_link_libraries(_hdfs3 PRIVATE ch_contrib::gsasl)
 if (WITH_KERBEROS)
-    target_link_libraries(hdfs3 PRIVATE ${KRB5_LIBRARY})
+    target_link_libraries(_hdfs3 PRIVATE ch_contrib::krb5)
 endif()
-target_link_libraries(hdfs3 PRIVATE ${LIBXML2_LIBRARIES})
+target_link_libraries(_hdfs3 PRIVATE ch_contrib::libxml2)
 
 # inherit from parent cmake
-target_include_directories(hdfs3 PRIVATE ${Protobuf_INCLUDE_DIR})
-target_link_libraries(hdfs3 PRIVATE ${Protobuf_LIBRARY} boost::headers_only)
-
-if(OPENSSL_INCLUDE_DIR AND OPENSSL_LIBRARIES)
-    target_include_directories(hdfs3 PRIVATE ${OPENSSL_INCLUDE_DIR})
-    target_link_libraries(hdfs3 PRIVATE ${OPENSSL_LIBRARIES})
+target_link_libraries(_hdfs3 PRIVATE ch_contrib::protobuf boost::headers_only)
+if (TARGET OpenSSL::SSL)
+    target_link_libraries(_hdfs3 PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 endif()
+
+if (TARGET ch_contrib::isal)
+    target_link_libraries(_hdfs3 PRIVATE ch_contrib::isal)
+    add_definitions(-DHADOOP_ISAL_LIBRARY)
+endif()
+
+add_library(ch_contrib::hdfs ALIAS _hdfs3)
+
+if (ENABLE_CLICKHOUSE_BENCHMARK)
+    add_executable(perf_checksum ${HDFS3_SOURCE_DIR}/common/perf_checksum.cpp)
+     target_link_libraries(perf_checksum PRIVATE ch_contrib::hdfs)
+endif ()

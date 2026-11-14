@@ -2,8 +2,10 @@
 
 #include <Core/NamesAndAliases.h>
 #include <Interpreters/SystemLog.h>
-#include <Interpreters/ClientInfo.h>
+#include <Storages/ColumnsDescription.h>
 #include <Common/ZooKeeper/IKeeper.h>
+
+#include <Poco/Net/SocketAddress.h>
 
 
 namespace DB
@@ -21,11 +23,15 @@ struct ZooKeeperLogElement
 
     Type type = UNKNOWN;
     Decimal64 event_time = 0;
+    UInt64 thread_id = 0;
+    String query_id;
     Poco::Net::SocketAddress address;
     Int64 session_id = 0;
 
+    UInt64 duration_microseconds = 0;
+
     /// Common request info
-    Int32 xid = 0;
+    Int64 xid = 0;
     bool has_watch = false;
     Int32 op_num = 0;
     String path;
@@ -63,7 +69,7 @@ struct ZooKeeperLogElement
 
 
     static std::string name() { return "ZooKeeperLog"; }
-    static NamesAndTypesList getNamesAndTypes();
+    static ColumnsDescription getColumnsDescription();
     static NamesAndAliases getNamesAndAliases() { return {}; }
     void appendToBlock(MutableColumns & columns) const;
 };
@@ -71,6 +77,13 @@ struct ZooKeeperLogElement
 class ZooKeeperLog : public SystemLog<ZooKeeperLogElement>
 {
     using SystemLog<ZooKeeperLogElement>::SystemLog;
+    size_t duration_microseconds_threshold = 0;
+
+public:
+    static const char * getDefaultTTL() { return "event_date + INTERVAL 30 DAY"; }
+
+    void setDurationMicrosecondsThreshold(size_t duration_microseconds_threshold_) { duration_microseconds_threshold = duration_microseconds_threshold_; }
+    size_t getDurationMicrosecondsThreshold() const { return duration_microseconds_threshold; }
 };
 
 DataTypePtr getCoordinationErrorCodesEnumType();

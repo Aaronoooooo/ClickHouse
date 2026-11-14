@@ -1,23 +1,30 @@
 #pragma once
 
-#include <Common/Allocator.h>
-#include <Columns/IColumn.h>
 #include <Formats/FormatSettings.h>
+#include <IO/CompressionMethod.h>
 #include <Interpreters/Context_fwd.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <base/types.h>
+#include <Common/Allocator_fwd.h>
+#include <Common/Documentation.h>
+#include <Common/NamePrompter.h>
 
 #include <boost/noncopyable.hpp>
 
 #include <functional>
 #include <memory>
+#include <set>
 #include <unordered_map>
+
 
 namespace DB
 {
 
 class Block;
 struct Settings;
+class SettingsChanges;
 struct FormatFactorySettings;
+struct ReadSettings;
 
 class ReadBuffer;
 class WriteBuffer;
@@ -27,137 +34,440 @@ using ProcessorPtr = std::shared_ptr<IProcessor>;
 
 class IInputFormat;
 class IOutputFormat;
+class IRowOutputFormat;
 
 struct RowInputFormatParams;
-struct RowOutputFormatParams;
+
+class ISchemaReader;
+class IExternalSchemaReader;
+using SchemaReaderPtr = std::shared_ptr<ISchemaReader>;
+using ExternalSchemaReaderPtr = std::shared_ptr<IExternalSchemaReader>;
 
 using InputFormatPtr = std::shared_ptr<IInputFormat>;
 using OutputFormatPtr = std::shared_ptr<IOutputFormat>;
+using RowOutputFormatPtr = std::shared_ptr<IRowOutputFormat>;
 
 template <typename Allocator>
 struct Memory;
 
-FormatSettings getFormatSettings(ContextPtr context);
+struct FormatParserSharedResources;
+using FormatParserSharedResourcesPtr = std::shared_ptr<FormatParserSharedResources>;
 
-template <typename T>
-FormatSettings getFormatSettings(ContextPtr context, const T & settings);
+struct FormatFilterInfo;
+using FormatFilterInfoPtr = std::shared_ptr<FormatFilterInfo>;
+
+struct FileBucketInfo;
+using FileBucketInfoPtr = std::shared_ptr<FileBucketInfo>;
+
+struct IBucketSplitter;
+using BucketSplitter = std::shared_ptr<IBucketSplitter>;
+
+FormatSettings getFormatSettings(const ContextPtr & context);
+FormatSettings getFormatSettings(const ContextPtr & context, const Settings & settings);
+/// For the `Native` blocks of the native protocol. A secondary query carries type names in both directions,
+/// because a server-side `Connection` never takes format settings.
+FormatSettings getNativeWireFormatSettings(const ContextPtr & context);
+
+/** A hash of the session settings `getFormatSettings` derives a `FormatSettings` from, for whatever
+  * keys a value by the settings that produced it: a function that captured a `FormatSettings` when it
+  * was built contributes this to `IFunctionBase::updateHash`. The struct itself has too many members
+  * to hash one by one without leaving one out, while this covers every setting of
+  * `FORMAT_FACTORY_SETTINGS` (and the few core settings `getFormatSettings` reads besides) as they
+  * are declared: two sessions get the same hash exactly when their format settings have the same
+  * effective values, whether a default was left alone or spelled explicitly.
+  */
+UInt64 getFormatSettingsHash(const Settings & settings);
+
+/// `output_format_arrow_unsupported_types` supersedes the older boolean
+/// `output_format_arrow_unsupported_types_as_binary` (`0` means `throw`, `1` means `binary`). The boolean is
+/// only consulted while the new setting is left at its default, so an explicit `throw`/`text`/`binary` wins
+/// no matter which of the two was set last. Shared with the Arrow Flight server, which builds its Arrow
+/// conversion settings without going through `getFormatSettings`.
+FormatSettings::ArrowUnsupportedTypes getArrowUnsupportedTypesMode(const Settings & settings);
 
 /** Allows to create an IInputFormat or IOutputFormat by the name of the format.
   * Note: format and compression are independent things.
   */
-class FormatFactory final : private boost::noncopyable
+class FormatFactory final : private boost::noncopyable, public IHints<2>
 {
 public:
-    /// This callback allows to perform some additional actions after reading a single row.
-    /// It's initial purpose was to extract payload for virtual columns from Kafka Consumer ReadBuffer.
-    using ReadCallback = std::function<void()>;
-
     /** Fast reading data from buffer and save result to memory.
-      * Reads at least min_chunk_bytes and some more until the end of the chunk, depends on the format.
-      * Used in ParallelParsingBlockInputStream.
+      * Reads at least `min_bytes` and some more until the end of the chunk, depends on the format.
+      * If `max_rows` is non-zero the function also stops after reading the `max_rows` number of rows
+      * (even if the `min_bytes` boundary isn't reached yet).
+      * Used in ParallelParsingInputFormat.
       */
     using FileSegmentationEngine = std::function<std::pair<bool, size_t>(
         ReadBuffer & buf,
         DB::Memory<Allocator<false>> & memory,
-        size_t min_chunk_bytes)>;
+        size_t min_bytes,
+        size_t max_rows)>;
 
-    /// This callback allows to perform some additional actions after writing a single row.
-    /// It's initial purpose was to flush Kafka message for each row.
-    using WriteCallback = std::function<void(
-        const Columns & columns,
-        size_t row)>;
+    using FileSegmentationEngineCreator = std::function<FileSegmentationEngine(
+        const FormatSettings & settings)>;
 
+    VectorWithMemoryTracking<String> getAllRegisteredNames() const override;
 private:
+    // On the input side, there are two kinds of formats:
+    //  * InputCreator - formats parsed sequentially, e.g. CSV. Almost all formats are like this.
+    //    FormatFactory uses ParallelReadBuffer to read in parallel, and ParallelParsingInputFormat
+    //    to parse in parallel; the formats mostly don't need to worry about it.
+    //  * RandomAccessInputCreator - column-oriented formats that require seeking back and forth in
+    //    the file when reading. E.g. Parquet has metadata at the end of the file (needs to be read
+    //    before we can parse any data), can skip columns by seeking in the file, and often reads
+    //    many short byte ranges from the file. ParallelReadBuffer and ParallelParsingInputFormat
+    //    are a poor fit. Instead, the format implementation is in charge of parallelizing both
+    //    reading and parsing.
+
     using InputCreator = std::function<InputFormatPtr(
             ReadBuffer & buf,
             const Block & header,
             const RowInputFormatParams & params,
             const FormatSettings & settings)>;
 
+    using FileBucketInfoCreator = std::function<FileBucketInfoPtr()>;
+
+    using BucketSplitterCreator = std::function<BucketSplitter()>;
+
+    // Incompatible with FileSegmentationEngine.
+    using RandomAccessInputCreator = std::function<InputFormatPtr(
+        ReadBuffer & buf,
+        const Block & header,
+        const FormatSettings & settings,
+        const ReadSettings & read_settings,
+        bool is_remote_fs,
+        FormatParserSharedResourcesPtr parser_shared_resources,
+        FormatFilterInfoPtr format_filter_info)>;
+
+    using RandomAccessInputCreatorWithMetadata = std::function<InputFormatPtr(
+        ReadBuffer & buf,
+        const Block & header,
+        const FormatSettings & settings,
+        const ReadSettings & read_settings,
+        bool is_remote_fs,
+        FormatParserSharedResourcesPtr parser_shared_resources,
+        FormatFilterInfoPtr format_filter_info,
+        const std::optional<RelativePathWithMetadata> & object_with_metadata,
+        const ContextPtr & context)>;
+
     using OutputCreator = std::function<OutputFormatPtr(
-            WriteBuffer & buf,
-            const Block & sample,
-            const RowOutputFormatParams & params,
-            const FormatSettings & settings)>;
+        WriteBuffer & buf,
+        const Block & sample,
+        const FormatSettings & settings,
+        FormatFilterInfoPtr format_filter_info)>;
 
     /// Some input formats can have non trivial readPrefix() and readSuffix(),
     /// so in some cases there is no possibility to use parallel parsing.
     /// The checker should return true if parallel parsing should be disabled.
     using NonTrivialPrefixAndSuffixChecker = std::function<bool(ReadBuffer & buf)>;
 
+    /// Some formats can support append depending on settings.
+    /// The checker should return true if format support append.
+    using AppendSupportChecker = std::function<bool(const FormatSettings & settings)>;
+
+    /// Some formats may produce raw (non-UTF-8) bytes depending on settings or on the header, for
+    /// example `CustomSeparated` with `format_custom_escaping_rule = 'Raw'`, or `SQLInsert` with a
+    /// column name that is not valid UTF-8 (column names are written verbatim). The checker should
+    /// return true when the current settings and header make the output format write bytes verbatim
+    /// (see `may_produce_raw_bytes`). The header carries the column names, which some formats emit
+    /// verbatim independently of the row data.
+    using MayProduceRawBytesChecker = std::function<bool(const FormatSettings & settings, const Block & header)>;
+
+    /// Obtain HTTP content-type for the output format.
+    using ContentTypeGetter = std::function<String(const std::optional<FormatSettings> & settings)>;
+
+    using SchemaReaderCreator = std::function<SchemaReaderPtr(
+        ReadBuffer & in,
+        const FormatSettings & settings)>;
+
+    using ExternalSchemaReaderCreator = std::function<ExternalSchemaReaderPtr(const FormatSettings & settings)>;
+
+    /// Some formats can extract different schemas from the same source depending on
+    /// some settings. To process this case in schema cache we should add some additional
+    /// information to a cache key. This getter should return some string with information
+    /// about such settings. For example, for Protobuf format it's the path to the schema
+    /// and the name of the message.
+    using AdditionalInfoForSchemaCacheGetter = std::function<String(const FormatSettings & settings)>;
+
+    /// Some formats can support reading subset of columns depending on settings.
+    /// The checker should return true if format support append.
+    using SubsetOfColumnsSupportChecker = std::function<bool(const FormatSettings & settings)>;
+
+    using PrewhereSupportChecker = std::function<bool(const FormatSettings & settings)>;
+
     struct Creators
     {
+        String name;
         InputCreator input_creator;
+        FileBucketInfoCreator file_bucket_info_creator;
+        BucketSplitterCreator bucket_splitter_creator;
+        RandomAccessInputCreator random_access_input_creator;
+        RandomAccessInputCreatorWithMetadata random_access_input_creator_with_metadata;
         OutputCreator output_creator;
-        FileSegmentationEngine file_segmentation_engine;
+        FileSegmentationEngineCreator file_segmentation_engine_creator;
+        SchemaReaderCreator schema_reader_creator;
+        ExternalSchemaReaderCreator external_schema_reader_creator;
         bool supports_parallel_formatting{false};
-        bool is_column_oriented{false};
+        bool supports_reset_parser{false};
+        bool prefers_large_blocks{false};
+        bool is_tty_friendly{true}; /// If false, client will ask before output in the terminal.
+        /// If true, the output can contain arbitrary bytes that are not guaranteed to be valid UTF-8 text
+        /// (raw passthrough formats such as `RawBLOB`, `TSVRaw`, `LineAsString`). Such output cannot be
+        /// embedded into a text framing format (see `IFramingFormat::requiresTextPayload`), even though the
+        /// format advertises a textual content type. Binary formats are detected by their content type instead.
+        bool may_produce_raw_bytes{false};
+        /// The same, but settings-dependent (for example `CustomSeparated` with a `Raw` escaping rule).
+        MayProduceRawBytesChecker may_produce_raw_bytes_checker;
+        ContentTypeGetter content_type = [](const std::optional<FormatSettings> &){ return "text/plain; charset=UTF-8"; };
         NonTrivialPrefixAndSuffixChecker non_trivial_prefix_and_suffix_checker;
+        AppendSupportChecker append_support_checker;
+        AdditionalInfoForSchemaCacheGetter additional_info_for_schema_cache_getter;
+        SubsetOfColumnsSupportChecker subset_of_columns_support_checker;
+        PrewhereSupportChecker prewhere_support_checker;
+        Documentation documentation;
     };
 
     using FormatsDictionary = std::unordered_map<String, Creators>;
+    using FileExtensionFormats = std::unordered_map<String, String>;
 
+    InputFormatPtr getInputImpl(
+        const String & name,
+        ReadBuffer & buf,
+        const Block & sample,
+        const ContextPtr & context,
+        UInt64 max_block_size,
+        const std::optional<RelativePathWithMetadata> & object_with_metadata,
+        const std::optional<FormatSettings> & format_settings,
+        FormatParserSharedResourcesPtr parser_shared_resources,
+        FormatFilterInfoPtr format_filter_info,
+        bool is_remote_fs,
+        CompressionMethod compression,
+        bool need_only_count,
+        const std::optional<UInt64> & max_block_size_bytes,
+        const std::optional<UInt64> & min_block_size_rows,
+        const std::optional<UInt64> & min_block_size_bytes) const;
 public:
     static FormatFactory & instance();
 
+    /// This has two tricks up its sleeve:
+    ///  * Parallel reading.
+    ///    To enable it, make sure `buf` is a SeekableReadBuffer implementing readBigAt().
+    ///  * Parallel parsing.
+    /// `buf` must outlive the returned IInputFormat.
+    /// The caller should make sure getFormatParsingThreadPool() is initialized.
     InputFormatPtr getInput(
         const String & name,
         ReadBuffer & buf,
         const Block & sample,
-        ContextPtr context,
+        const ContextPtr & context,
         UInt64 max_block_size,
-        const std::optional<FormatSettings> & format_settings = std::nullopt) const;
+        const std::optional<FormatSettings> & format_settings = std::nullopt,
+        FormatParserSharedResourcesPtr parser_shared_resources = nullptr,
+        FormatFilterInfoPtr format_filter_info = nullptr,
+        // affects things like buffer sizes and parallel reading
+        bool is_remote_fs = false,
+        // allows to do: buf -> parallel read -> decompression,
+        // because parallel read after decompression is not possible
+        CompressionMethod compression = CompressionMethod::None,
+        bool need_only_count = false,
+        const std::optional<UInt64> & max_block_size_bytes = std::nullopt,
+        const std::optional<UInt64> & min_block_size_rows = std::nullopt,
+        const std::optional<UInt64> & min_block_size_bytes = std::nullopt) const;
 
-    InputFormatPtr getInputFormat(
+    /// much the same as getInput but allows for passing metadata from object storage
+    InputFormatPtr getInputWithMetadata(
         const String & name,
         ReadBuffer & buf,
         const Block & sample,
-        ContextPtr context,
+        const ContextPtr & context,
         UInt64 max_block_size,
-        const std::optional<FormatSettings> & format_settings = std::nullopt) const;
+        const std::optional<RelativePathWithMetadata> & object_with_metadata,
+        const std::optional<FormatSettings> & format_settings = std::nullopt,
+        FormatParserSharedResourcesPtr parser_shared_resources = nullptr,
+        FormatFilterInfoPtr format_filter_info = nullptr,
+        // affects things like buffer sizes and parallel reading
+        bool is_remote_fs = false,
+        // allows to do: buf -> parallel read -> decompression,
+        // because parallel read after decompression is not possible
+        CompressionMethod compression = CompressionMethod::None,
+        bool need_only_count = false,
+        const std::optional<UInt64> & max_block_size_bytes = std::nullopt,
+        const std::optional<UInt64> & min_block_size_rows = std::nullopt,
+        const std::optional<UInt64> & min_block_size_bytes = std::nullopt) const;
 
     /// Checks all preconditions. Returns ordinary format if parallel formatting cannot be done.
     OutputFormatPtr getOutputFormatParallelIfPossible(
         const String & name,
         WriteBuffer & buf,
         const Block & sample,
-        ContextPtr context,
-        WriteCallback callback = {},
-        const std::optional<FormatSettings> & format_settings = std::nullopt) const;
+        const ContextPtr & context,
+        const std::optional<FormatSettings> & format_settings = std::nullopt,
+        FormatFilterInfoPtr format_filter_info = nullptr) const;
 
     OutputFormatPtr getOutputFormat(
         const String & name,
         WriteBuffer & buf,
         const Block & sample,
-        ContextPtr context,
-        WriteCallback callback = {},
+        const ContextPtr & context,
+        const std::optional<FormatSettings> & _format_settings = std::nullopt,
+        FormatFilterInfoPtr format_filter_info = nullptr) const;
+
+    /// Creates a standalone JSONEachRow output format for debugging or testing.
+    OutputFormatPtr getDefaultJSONEachRowOutputFormat(WriteBuffer & buf, const Block & sample) const;
+
+    /// Content-Type to set when sending HTTP response with this output format.
+    String getContentType(const String & name, const std::optional<FormatSettings> & settings) const;
+
+    /// overload for formats that support object storage metadata
+    SchemaReaderPtr getSchemaReader(
+        const String & name,
+        ReadBuffer & buf,
+        const ContextPtr & context,
+        const RelativePathWithMetadata & metadata,
+        const std::optional<FormatSettings> & format_settings = std::nullopt) const;
+
+    SchemaReaderPtr getSchemaReader(
+        const String & name,
+        ReadBuffer & buf,
+        const ContextPtr & context,
+        const std::optional<FormatSettings> & format_settings = std::nullopt) const;
+
+    ExternalSchemaReaderPtr getExternalSchemaReader(
+        const String & name,
+        const ContextPtr & context,
         const std::optional<FormatSettings> & format_settings = std::nullopt) const;
 
     void registerFileSegmentationEngine(const String & name, FileSegmentationEngine file_segmentation_engine);
 
+    void registerFileSegmentationEngineCreator(const String & name, FileSegmentationEngineCreator file_segmentation_engine_creator);
+
     void registerNonTrivialPrefixAndSuffixChecker(const String & name, NonTrivialPrefixAndSuffixChecker non_trivial_prefix_and_suffix_checker);
 
+    void registerAppendSupportChecker(const String & name, AppendSupportChecker append_support_checker);
+
+    /// If format always doesn't support append, you can use this method instead of
+    /// registerAppendSupportChecker with append_support_checker that always returns false.
+    void markFormatHasNoAppendSupport(const String & name);
+
+    bool checkIfFormatSupportAppend(const String & name, const ContextPtr & context, const std::optional<FormatSettings> & format_settings_ = std::nullopt);
+
     /// Register format by its name.
-    void registerInputFormat(const String & name, InputCreator input_creator);
+    /// `supports_reset_parser`: `IInputFormat::resetParser` resets every per-input field, so the format
+    /// can be reused for the next input. Otherwise `StreamingFormatExecutor` creates a new one for each input.
+    void registerInputFormat(const String & name, InputCreator input_creator, bool supports_reset_parser = false);
+    void registerRandomAccessInputFormat(const String & name, RandomAccessInputCreator input_creator, bool supports_reset_parser = false);
+    void registerRandomAccessInputFormatWithMetadata(const String & name, RandomAccessInputCreatorWithMetadata input_creator_with_metadata);
     void registerOutputFormat(const String & name, OutputCreator output_creator);
 
-    void markOutputFormatSupportsParallelFormatting(const String & name);
-    void markFormatAsColumnOriented(const String & name);
+    /// Attach embedded documentation to a format by its name.
+    void setDocumentation(const String & name, Documentation documentation);
 
-    bool checkIfFormatIsColumnOriented(const String & name);
+    /// Register a file extension for the format. An extension can infer only one format, so
+    /// pass used_for_format_inference = false to register an extension that carries data
+    /// readable as the format but infers as a different one: e.g. NDJSON lakes commonly name
+    /// their files `.json`, which infers as `JSON`.
+    void registerFileExtension(const String & extension, const String & format_name, bool used_for_format_inference = true);
+    /// Register an interchangeable spelling of a format registered under another name, such as
+    /// `JSONLines` for `JSONEachRow`. Only getFileExtensionsForFormat consults it: the alias is
+    /// a format of its own everywhere else, and the file extensions are registered mostly for
+    /// the canonical spelling.
+    void registerFormatAlias(const String & alias, const String & format_name);
+    /// All file extensions registered for the format, for every interchangeable spelling of it
+    /// (both the format it is an alias of and the other aliases of that format), and for its
+    /// `WithNames`/`WithNamesAndTypes` base format, in a deterministic order. The lowercased
+    /// format name is always a part of the result, because format names are registered as
+    /// extensions of the format itself.
+    std::vector<String> getFileExtensionsForFormat(const String & format_name) const;
+    String getFormatFromFileName(String file_name);
+    std::optional<String> tryGetFormatFromFileName(String file_name);
+    String getFormatFromFileDescriptor(int fd);
+    std::optional<String> tryGetFormatFromFileDescriptor(int fd);
+
+    /// Register schema readers for format its name.
+    void registerSchemaReader(const String & name, SchemaReaderCreator schema_reader_creator);
+    void registerExternalSchemaReader(const String & name, ExternalSchemaReaderCreator external_schema_reader_creator);
+
+    void markOutputFormatSupportsParallelFormatting(const String & name);
+    void markOutputFormatPrefersLargeBlocks(const String & name);
+    void markOutputFormatNotTTYFriendly(const String & name);
+    void markOutputFormatMayProduceRawBytes(const String & name);
+    void registerOutputFormatMayProduceRawBytesChecker(const String & name, MayProduceRawBytesChecker checker);
+
+    void setContentType(const String & name, const String & content_type);
+    void setContentType(const String & name, ContentTypeGetter content_type);
+
+    void markFormatSupportsSubsetOfColumns(const String & name);
+    void registerSubsetOfColumnsSupportChecker(const String & name, SubsetOfColumnsSupportChecker subset_of_columns_support_checker);
+    bool checkIfFormatSupportsSubsetOfColumns(const String & name, const ContextPtr & context, const std::optional<FormatSettings> & format_settings_ = std::nullopt) const;
+
+    void registerPrewhereSupportChecker(const String & name, PrewhereSupportChecker prewhere_support_checker);
+    bool checkIfFormatSupportsPrewhere(const String & name, const ContextPtr & context, const std::optional<FormatSettings> & format_settings_ = std::nullopt) const;
+
+    bool checkIfFormatHasSchemaReader(const String & name) const;
+    bool checkIfFormatHasExternalSchemaReader(const String & name) const;
+    bool checkIfFormatHasAnySchemaReader(const String & name) const;
+    bool checkIfOutputFormatPrefersLargeBlocks(const String & name) const;
+    bool checkIfOutputFormatIsTTYFriendly(const String & name) const;
+    bool checkIfOutputFormatMayProduceRawBytes(const String & name, const FormatSettings & settings, const Block & header) const;
+    /// Whether reading `name` will seek instead of consuming the input from the start. A
+    /// random-access format reads its footer at the tail first, but only while it is allowed to
+    /// seek: with `input_format_allow_seeks = 0` it reads sequentially from the start instead.
+    bool checkIfFormatIsRandomAccessInput(
+        const String & name, const ContextPtr & context, const std::optional<FormatSettings> & format_settings_ = std::nullopt) const;
+
+    bool checkParallelizeOutputAfterReading(const String & name, const ContextPtr & context) const;
+    /// The same check for a read whose files can have any format, such as the data files of a data
+    /// lake snapshot: it allows parallelizing only when every format would.
+    bool checkParallelizeOutputAfterReadingForAnyFormat(const ContextPtr & context) const;
+
+    void registerAdditionalInfoForSchemaCacheGetter(const String & name, AdditionalInfoForSchemaCacheGetter additional_info_for_schema_cache_getter);
+    String getAdditionalInfoForSchemaCache(const String & name, const ContextPtr & context, const std::optional<FormatSettings> & format_settings_ = std::nullopt);
 
     const FormatsDictionary & getAllFormats() const
     {
         return dict;
     }
 
+    std::vector<String> getAllInputFormats() const;
+
     bool isInputFormat(const String & name) const;
     bool isOutputFormat(const String & name) const;
 
+    /// Check that format with specified name exists and throw an exception otherwise.
+    void checkFormatName(const String & name) const;
+    bool exists(const String & name) const;
+
+    FileBucketInfoPtr getFileBucketInfo(const String & format);
+    void registerFileBucketInfo(const String & format, FileBucketInfoCreator bucket_info);
+    void registerSplitter(const String & format, BucketSplitterCreator splitter);
+    BucketSplitter getSplitter(const String & format);
+    bool checkIfFormatHasSplitter(const String & format) const;
+
 private:
     FormatsDictionary dict;
+    FileExtensionFormats file_extension_formats;
+    /// Lowercased format name -> all extensions registered for it (including the ones with
+    /// used_for_format_inference = false, which are absent from file_extension_formats).
+    std::unordered_map<String, std::set<String>> format_file_extensions;
+    /// Lowercased alias -> lowercased canonical format name, see registerFormatAlias.
+    std::unordered_map<String, String> format_aliases;
+    /// The reverse of format_aliases: lowercased canonical format name -> all of its aliases.
+    /// Every spelling of a format is a format of its own and carries its own name as a file
+    /// extension, so the lookup has to walk the aliases in both directions.
+    std::unordered_map<String, std::set<String>> format_alias_groups;
 
     const Creators & getCreators(const String & name) const;
+    Creators & getOrCreateCreators(const String & name);
+
+    // Creates a ReadBuffer to give to an input format. Returns nullptr if we should use `buf` directly.
+    std::unique_ptr<ReadBuffer> wrapReadBufferIfNeeded(
+        ReadBuffer & buf,
+        CompressionMethod compression,
+        const Creators & creators,
+        const FormatSettings & format_settings,
+        const Settings & settings,
+        bool is_remote_fs,
+        const FormatParserSharedResourcesPtr & parser_shared_resources) const;
 };
 
 }

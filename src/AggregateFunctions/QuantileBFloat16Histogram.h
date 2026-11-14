@@ -1,7 +1,7 @@
 #pragma once
 
 #include <base/types.h>
-#include <base/bit_cast.h>
+#include <base/sort.h>
 #include <Common/HashTable/HashMap.h>
 
 #include <IO/ReadBuffer.h>
@@ -103,16 +103,29 @@ private:
     /// Take the most significant 16 bits of the floating point number.
     BFloat16 toBFloat16(const Value & x) const
     {
-        return bit_cast<UInt32>(static_cast<Float32>(x)) >> 16;
+        return std::bit_cast<UInt32>(static_cast<Float32>(x)) >> 16;
     }
 
     /// Put the bits into most significant 16 bits of the floating point number and fill other bits with zeros.
     Float32 toFloat32(const BFloat16 & x) const
     {
-        return bit_cast<Float32>(x << 16);
+        return std::bit_cast<Float32>(x << 16);
     }
 
     using Pair = PairNoInit<Float32, Weight>;
+
+    template <typename T>
+    static T safeCast(Float32 x)
+    {
+        if constexpr (!std::is_floating_point_v<T>)
+        {
+            if (x >= static_cast<Float32>(std::numeric_limits<T>::max())) [[unlikely]]
+                return std::numeric_limits<T>::max();
+            if (x <= std::numeric_limits<T>::min()) [[unlikely]]
+                return std::numeric_limits<T>::min();
+        }
+        return static_cast<T>(x);
+    }
 
     template <typename T>
     T getImpl(Float64 level) const
@@ -129,25 +142,25 @@ private:
         Pair * arr_it = array;
         for (const auto & pair : data)
         {
-            sum_weight += pair.getMapped();
+            sum_weight += static_cast<Float64>(pair.getMapped());
             *arr_it = {toFloat32(pair.getKey()), pair.getMapped()};
             ++arr_it;
         }
 
-        std::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.first < b.first; });
+        ::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.first < b.first; });
 
         Float64 threshold = std::ceil(sum_weight * level);
         Float64 accumulated = 0;
 
         for (const Pair * p = array; p != (array + size); ++p)
         {
-            accumulated += p->second;
+            accumulated += static_cast<Float64>(p->second);
 
             if (accumulated >= threshold)
-                return p->first;
+                return safeCast<T>(p->first);
         }
 
-        return array[size - 1].first;
+        return safeCast<T>(array[size - 1].first);
     }
 
     template <typename T>
@@ -170,12 +183,12 @@ private:
         Pair * arr_it = array;
         for (const auto & pair : data)
         {
-            sum_weight += pair.getMapped();
+            sum_weight += static_cast<Float64>(pair.getMapped());
             *arr_it = {toFloat32(pair.getKey()), pair.getMapped()};
             ++arr_it;
         }
 
-        std::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.first < b.first; });
+        ::sort(array, array + size, [](const Pair & a, const Pair & b) { return a.first < b.first; });
 
         size_t level_index = 0;
         Float64 accumulated = 0;
@@ -183,11 +196,11 @@ private:
 
         for (const Pair * p = array; p != (array + size); ++p)
         {
-            accumulated += p->second;
+            accumulated += static_cast<Float64>(p->second);
 
             while (accumulated >= threshold)
             {
-                result[indices[level_index]] = p->first;
+                result[indices[level_index]] = safeCast<T>(p->first);
                 ++level_index;
 
                 if (level_index == num_levels)
@@ -199,7 +212,7 @@ private:
 
         while (level_index < num_levels)
         {
-            result[indices[level_index]] = array[size - 1].first;
+            result[indices[level_index]] = safeCast<T>(array[size - 1].first);
             ++level_index;
         }
     }

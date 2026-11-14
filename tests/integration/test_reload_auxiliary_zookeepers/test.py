@@ -1,10 +1,9 @@
 import time
-import pytest
-import os
 
-from helpers.cluster import ClickHouseCluster
+import pytest
+
 from helpers.client import QueryRuntimeException
-from helpers.test_tools import assert_eq_with_retry
+from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
 node = cluster.add_instance("node", with_zookeeper=True)
@@ -20,7 +19,6 @@ def start_cluster():
 
 
 def test_reload_auxiliary_zookeepers(start_cluster):
-
     node.query(
         "CREATE TABLE simple (date Date, id UInt32) ENGINE = ReplicatedMergeTree('/clickhouse/tables/0/simple', 'node') ORDER BY tuple() PARTITION BY date;"
     )
@@ -60,7 +58,9 @@ def test_reload_auxiliary_zookeepers(start_cluster):
         </zookeeper2>
     </auxiliary_zookeepers>
 </clickhouse>"""
-    node.replace_config("/etc/clickhouse-server/conf.d/zookeeper_config.xml", new_config)
+    node.replace_config(
+        "/etc/clickhouse-server/conf.d/zookeeper_config.xml", new_config
+    )
 
     node.query("SYSTEM RELOAD CONFIG")
 
@@ -81,7 +81,9 @@ def test_reload_auxiliary_zookeepers(start_cluster):
         <session_timeout_ms>2000</session_timeout_ms>
     </zookeeper>
 </clickhouse>"""
-    node.replace_config("/etc/clickhouse-server/conf.d/zookeeper_config.xml", new_config)
+    node.replace_config(
+        "/etc/clickhouse-server/conf.d/zookeeper_config.xml", new_config
+    )
     node.query("SYSTEM RELOAD CONFIG")
     time.sleep(5)
 

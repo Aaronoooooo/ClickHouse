@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Tags: no-fasttest
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -13,18 +14,18 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 function test()
 {
-    timeout 5 ${CLICKHOUSE_LOCAL} --max_execution_time 10 --query "
+    timeout 5 ${CLICKHOUSE_LOCAL} --max_execution_time 10 --max_rows_to_read 0 --query "
         SELECT DISTINCT number % 5 FROM system.numbers" ||:
-    echo '---'
-    timeout 5 ${CLICKHOUSE_CURL} -sS --no-buffer "${CLICKHOUSE_URL}&max_execution_time=10" --data-binary "
+    echo -e '---'
+    timeout 5 ${CLICKHOUSE_CURL} -sS --no-buffer "${CLICKHOUSE_URL}&http_wait_end_of_query=0&http_response_buffer_size=0&max_execution_time=10&max_rows_to_read=0" --data-binary "
         SELECT DISTINCT number % 5 FROM system.numbers" ||:
-    echo '---'
+    echo -e '---'
 }
 
 # The test depends on timeouts. And there is a chance that under high system load the query
 # will not be able to finish in 5 seconds (this will lead to test flakiness).
 # Let's check that is will be able to show the expected result at least once.
-while true; do
+while clickhouse_test_time_left; do
     [[ $(test) == $(echo -ne "0\n1\n2\n3\n4\n---\n0\n1\n2\n3\n4\n---\n") ]] && break
     sleep 1
 done

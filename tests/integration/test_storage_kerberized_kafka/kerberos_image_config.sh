@@ -90,6 +90,7 @@ create_admin_user() {
 }
 
 create_keytabs() {
+  rm /tmp/keytab/*.keytab
 
   kadmin.local -q "addprinc -randkey zookeeper/kafka_kerberized_zookeeper@${REALM}"
   kadmin.local -q "ktadd -norandkey -k /tmp/keytab/kafka_kerberized_zookeeper.keytab zookeeper/kafka_kerberized_zookeeper@${REALM}"
@@ -103,6 +104,9 @@ create_keytabs() {
 
   kadmin.local -q "addprinc -randkey kafkauser/instance@${REALM}"
   kadmin.local -q "ktadd -norandkey -k /tmp/keytab/clickhouse.keytab kafkauser/instance@${REALM}"
+
+  kadmin.local -q "addprinc -randkey anotherkafkauser/instance@${REALM}"
+  kadmin.local -q "ktadd -norandkey -k /tmp/keytab/clickhouse.keytab anotherkafkauser/instance@${REALM}"
 
   chmod g+r /tmp/keytab/clickhouse.keytab
 

@@ -1,6 +1,9 @@
-#include <iostream>
 #include <Processors/Transforms/CountingTransform.h>
+
+#include <IO/Progress.h>
+#include <Interpreters/ProcessList.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ThreadStatus.h>
 
 
 namespace ProfileEvents
@@ -13,29 +16,26 @@ namespace ProfileEvents
 namespace DB
 {
 
-void CountingTransform::transform(Chunk & chunk)
+void CountingTransform::onConsume(Chunk chunk)
 {
-    Progress local_progress(chunk.getNumRows(), chunk.bytes(), 0);
-    progress.incrementPiecewiseAtomically(local_progress);
+    auto written_rows = chunk.getNumRows();
+    auto written_bytes = chunk.bytes();
 
-    //std::cerr << "============ counting adding progress for " << static_cast<const void *>(thread_status) << ' ' << chunk.getNumRows() << " rows\n";
+    if (quota)
+        quota->usedForQuery(normalized_query_hash, {{QuotaType::WRITTEN_ROWS, written_rows}, {QuotaType::WRITTEN_BYTES, written_bytes}});
 
-    if (thread_status)
-    {
-        thread_status->performance_counters.increment(ProfileEvents::InsertedRows, local_progress.read_rows);
-        thread_status->performance_counters.increment(ProfileEvents::InsertedBytes, local_progress.read_bytes);
-    }
-    else
-    {
-        ProfileEvents::increment(ProfileEvents::InsertedRows, local_progress.read_rows);
-        ProfileEvents::increment(ProfileEvents::InsertedBytes, local_progress.read_bytes);
-    }
+    Progress local_progress{WriteProgress(written_rows, written_bytes)};
+
+    ProfileEvents::increment(ProfileEvents::InsertedRows, local_progress.written_rows);
+    ProfileEvents::increment(ProfileEvents::InsertedBytes, written_bytes);
 
     if (process_elem)
         process_elem->updateProgressOut(local_progress);
 
     if (progress_callback)
         progress_callback(local_progress);
+
+    cur_chunk = std::move(chunk);
 }
 
 }

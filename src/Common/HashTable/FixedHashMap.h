@@ -16,11 +16,11 @@ struct FixedHashMapCell
     bool full;
     Mapped mapped;
 
-    FixedHashMapCell() {} //-V730
+    FixedHashMapCell() {} /// NOLINT
     FixedHashMapCell(const Key &, const State &) : full(true) {}
     FixedHashMapCell(const value_type & value_, const State &) : full(true), mapped(value_.second) {}
 
-    const VoidKey getKey() const { return {}; }
+    const VoidKey getKey() const { return {}; } /// NOLINT
     Mapped & getMapped() { return mapped; }
     const Mapped & getMapped() const { return mapped; }
 
@@ -31,7 +31,7 @@ struct FixedHashMapCell
     ///  Note that we have to assemble a continuous layout for the value_type on each call of getValue().
     struct CellExt
     {
-        CellExt() {} //-V730
+        CellExt() {} /// NOLINT
         CellExt(Key && key_, const FixedHashMapCell * ptr_) : key(key_), ptr(const_cast<FixedHashMapCell *>(ptr_)) {}
         void update(Key && key_, const FixedHashMapCell * ptr_)
         {
@@ -44,7 +44,7 @@ struct FixedHashMapCell
         const Key & getKey() const { return key; }
         Mapped & getMapped() { return ptr->mapped; }
         const Mapped & getMapped() const { return ptr->mapped; }
-        const value_type getValue() const { return {key, ptr->mapped}; }
+        const value_type getValue() const { return {key, ptr->mapped}; } /// NOLINT
     };
 };
 
@@ -61,11 +61,11 @@ struct FixedHashMapImplicitZeroCell
 
     Mapped mapped;
 
-    FixedHashMapImplicitZeroCell() {}
+    FixedHashMapImplicitZeroCell() {} /// NOLINT
     FixedHashMapImplicitZeroCell(const Key &, const State &) {}
     FixedHashMapImplicitZeroCell(const value_type & value_, const State &) : mapped(value_.second) {}
 
-    const VoidKey getKey() const { return {}; }
+    const VoidKey getKey() const { return {}; } /// NOLINT
     Mapped & getMapped() { return mapped; }
     const Mapped & getMapped() const { return mapped; }
 
@@ -76,7 +76,7 @@ struct FixedHashMapImplicitZeroCell
     ///  Note that we have to assemble a continuous layout for the value_type on each call of getValue().
     struct CellExt
     {
-        CellExt() {} //-V730
+        CellExt() {} /// NOLINT
         CellExt(Key && key_, const FixedHashMapImplicitZeroCell * ptr_) : key(key_), ptr(const_cast<FixedHashMapImplicitZeroCell *>(ptr_)) {}
         void update(Key && key_, const FixedHashMapImplicitZeroCell * ptr_)
         {
@@ -89,7 +89,7 @@ struct FixedHashMapImplicitZeroCell
         const Key & getKey() const { return key; }
         Mapped & getMapped() { return ptr->mapped; }
         const Mapped & getMapped() const { return ptr->mapped; }
-        const value_type getValue() const { return {key, ptr->mapped}; }
+        const value_type getValue() const { return {key, ptr->mapped}; } /// NOLINT
     };
 };
 
@@ -99,23 +99,56 @@ template <
     typename Mapped,
     typename Cell = FixedHashMapCell<Key, Mapped>,
     typename Size = FixedHashTableStoredSize<Cell>,
-    typename Allocator = HashTableAllocator>
-class FixedHashMap : public FixedHashTable<Key, Cell, Size, Allocator>
+    typename Allocator = HashTableAllocator,
+    size_t size_bits = sizeof(Key) * 8>
+class FixedHashMap : public FixedHashTable<Key, Cell, Size, Allocator, size_bits>
 {
 public:
-    using Base = FixedHashTable<Key, Cell, Size, Allocator>;
+    using Base = FixedHashTable<Key, Cell, Size, Allocator, size_bits>;
     using Self = FixedHashMap;
     using LookupResult = typename Base::LookupResult;
 
     using Base::Base;
 
+    FixedHashMap() = default;
+    FixedHashMap(size_t ) {} /// NOLINT
+
+    /// mergeToViaIndexFilter is a special mergeTo function to allow `total_worker` worker to merge without race condition.
     template <typename Func>
+    void ALWAYS_INLINE mergeToViaIndexFilter(Self & that, Func && func,
+        UInt32 worker_id, UInt32 total_worker)
+    {
+        UInt32 min_index = 0;
+        UInt32 max_index = static_cast<UInt32>(this->getBufferSizeInCells());
+        if (this->canUseMinMaxOptimization())
+        {
+            auto [min, max] = this->getMinMaxIndex();
+            min_index = min;
+            max_index = max + 1;
+        }
+        UInt32 start_index = (min_index / total_worker) * total_worker + worker_id;
+
+        /// Increment by total_worker to make distribution of merge evenly. We use index directly instead of iterator
+        /// because we need to precisely control the cells for each worker. Iterator however would skip zero cells.
+        for (UInt32 i = start_index; i < max_index; i += total_worker)
+        {
+            if (!this->buf[i].isZero(*this))
+            {
+                typename Self::LookupResult res_it;
+                bool inserted = false;
+                that.emplace(static_cast<Key>(i), res_it, inserted, i);
+                func(res_it->getMapped(), this->buf[i].getMapped(), inserted);
+            }
+        }
+    }
+
+    template <typename Func, bool>
     void ALWAYS_INLINE mergeToViaEmplace(Self & that, Func && func)
     {
         for (auto it = this->begin(), end = this->end(); it != end; ++it)
         {
             typename Self::LookupResult res_it;
-            bool inserted;
+            bool inserted = false;
             that.emplace(it->getKey(), res_it, inserted, it.getHash());
             func(res_it->getMapped(), it->getMapped(), inserted);
         }
@@ -145,13 +178,23 @@ public:
     void forEachMapped(Func && func)
     {
         for (auto & v : *this)
-            func(v.getMapped());
+        {
+            if constexpr (std::is_same_v<decltype(func(v.getMapped())), bool>)
+            {
+                if (!func(v.getMapped()))
+                    break;
+            }
+            else
+            {
+                func(v.getMapped());
+            }
+        }
     }
 
     Mapped & ALWAYS_INLINE operator[](const Key & x)
     {
         LookupResult it;
-        bool inserted;
+        bool inserted = false;
         this->emplace(x, it, inserted);
         if (inserted)
             new (&it->getMapped()) Mapped();
@@ -176,3 +219,22 @@ using FixedImplicitZeroHashMapWithCalculatedSize = FixedHashMap<
     FixedHashMapImplicitZeroCell<Key, Mapped>,
     FixedHashTableCalculatedSize<FixedHashMapImplicitZeroCell<Key, Mapped>>,
     Allocator>;
+
+template <typename Key, typename Mapped, size_t size_bits>
+using FixedHashMapWithSizeBits = FixedHashMap<
+    Key,
+    Mapped,
+    FixedHashMapCell<Key, Mapped>,
+    FixedHashTableStoredSize<FixedHashMapCell<Key, Mapped>>,
+    HashTableAllocator,
+    size_bits>;
+
+/// Keeps no element counter, so `size` walks all cells. Cheaper for a table that several threads fill at once.
+template <typename Key, typename Mapped, size_t size_bits, typename Cell = FixedHashMapCell<Key, Mapped>>
+using FixedHashMapWithSizeBitsAndCalculatedSize = FixedHashMap<
+    Key,
+    Mapped,
+    Cell,
+    FixedHashTableCalculatedSize<Cell>,
+    HashTableAllocator,
+    size_bits>;

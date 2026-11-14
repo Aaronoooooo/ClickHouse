@@ -8,12 +8,16 @@
 #include <Columns/ColumnString.h>
 #include <Interpreters/Context.h>
 #include <base/scope_guard.h>
+#include <Common/thread_local_rng.h>
+#include <Common/ErrnoException.h>
+#include <Common/VectorWithMemoryTracking.h>
 
 #include <thread>
 #include <memory>
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <dlfcn.h>
 
 
 namespace DB
@@ -22,18 +26,16 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int BAD_ARGUMENTS;
     extern const int CANNOT_ALLOCATE_MEMORY;
+    extern const int CANNOT_DLOPEN;
+    extern const int LOGICAL_ERROR;
 }
 
 
 /// Various illegal actions to test diagnostic features of ClickHouse itself. Should not be enabled in production builds.
-class FunctionTrap : public IFunction
+class FunctionTrap final : public IFunction, private WithContext
 {
-private:
-    ContextPtr context;
-
 public:
     static constexpr auto name = "trap";
     static FunctionPtr create(ContextPtr context)
@@ -41,7 +43,7 @@ public:
         return std::make_shared<FunctionTrap>(context);
     }
 
-    FunctionTrap(ContextPtr context_) : context(context_) {}
+    explicit FunctionTrap(ContextPtr context_) : WithContext(context_) {}
 
     String getName() const override
     {
@@ -55,12 +57,9 @@ public:
 
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    String getSignatureString() const override
     {
-        if (!isString(arguments[0]))
-            throw Exception("The only argument for function " + getName() + " must be constant String", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-        return std::make_shared<DataTypeUInt8>();
+        return "(const String) -> UInt8";
     }
 
     [[clang::optnone]]
@@ -132,11 +131,11 @@ public:
             }
             else if (mode == "throw exception")
             {
-                std::vector<int>().at(0);
+                VectorWithMemoryTracking<int>().at(0);
             }
             else if (mode == "access context")
             {
-                (void)context.getCurrentQueryId();
+                (void)getContext()->getCurrentQueryId();
             }
             else if (mode == "stack overflow")
             {
@@ -149,7 +148,7 @@ public:
             }
             else if (mode == "mmap many")
             {
-                std::vector<void *> maps;
+                VectorWithMemoryTracking<void *> maps;
                 SCOPE_EXIT(
                 {
                     //for (void * map : maps)
@@ -162,34 +161,36 @@ public:
                         std::uniform_int_distribution<intptr_t>(0x100000000000UL, 0x700000000000UL)(thread_local_rng));
                     void * map = mmap(hint, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                     if (MAP_FAILED == map)
-                        throwFromErrno("Allocator: Cannot mmap", ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+                        throw ErrnoException(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Allocator: Cannot mmap");
                     maps.push_back(map);
                 }
             }
+            else if (mode == "dlopen")
+            {
+                void * handle = dlopen("libc.so.6", RTLD_NOW);
+                if (!handle)
+                    throw Exception(ErrorCodes::CANNOT_DLOPEN, "Cannot dlopen: ({})", dlerror()); // NOLINT(concurrency-mt-unsafe) // MT-Safe on Linux, see man dlerror
+            }
+            else if (mode == "logical error")
+            {
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Trap");
+            }
             else
-                throw Exception("Unknown trap mode", ErrorCodes::BAD_ARGUMENTS);
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown trap mode");
         }
         else
-            throw Exception("The only argument for function " + getName() + " must be constant String", ErrorCodes::ILLEGAL_COLUMN);
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "The only argument for function {} must be constant String", getName());
 
         return result_type->createColumnConst(input_rows_count, 0ULL);
     }
 };
 
 
-void registerFunctionTrap(FunctionFactory & factory)
+REGISTER_FUNCTION(Trap)
 {
     factory.registerFunction<FunctionTrap>();
 }
 
-}
-
-#else
-
-namespace DB
-{
-    class FunctionFactory;
-    void registerFunctionTrap(FunctionFactory &) {}
 }
 
 #endif

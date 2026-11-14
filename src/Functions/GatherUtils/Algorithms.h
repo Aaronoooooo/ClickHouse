@@ -1,18 +1,22 @@
 #pragma once
 
+#include <base/arithmeticOverflow.h>
 #include <base/types.h>
 #include <Common/FieldVisitorConvertToNumber.h>
-#include "Sources.h"
-#include "Sinks.h"
+#include <Common/VectorWithMemoryTracking.h>
+#include <Functions/GatherUtils/Sources.h>
+#include <Functions/GatherUtils/Sinks.h>
 #include <Core/AccurateComparison.h>
-#include <base/range.h>
-#include "GatherUtils.h"
+#include <Functions/GatherUtils/GatherUtils.h>
+#include <Functions/GatherUtils/sliceEqualElements.h>
+#include <Functions/GatherUtils/sliceHasImplAnyAll.h>
 
 
 namespace DB::ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int TOO_LARGE_ARRAY_SIZE;
+    extern const int ARGUMENT_OUT_OF_BOUND;
 }
 
 namespace DB::GatherUtils
@@ -77,8 +81,7 @@ inline ALWAYS_INLINE void writeSlice(const GenericArraySlice & slice, GenericArr
         sink.current_offset += slice.size;
     }
     else
-        throw Exception("Function writeSlice expects same column types for GenericArraySlice and GenericArraySink.",
-                        ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Function writeSlice expects same column types for GenericArraySlice and GenericArraySink.");
 }
 
 template <typename T>
@@ -157,8 +160,7 @@ inline ALWAYS_INLINE void writeSlice(const GenericValueSlice & slice, GenericArr
         ++sink.current_offset;
     }
     else
-        throw Exception("Function writeSlice expects same column types for GenericValueSlice and GenericArraySink.",
-                        ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Function writeSlice expects same column types for GenericValueSlice and GenericArraySink.");
 }
 
 template <typename T>
@@ -198,34 +200,34 @@ void NO_INLINE concat(SourceA && src_a, SourceB && src_b, Sink && sink)
 }
 
 template <typename Source, typename Sink>
-void concat(const std::vector<std::unique_ptr<IArraySource>> & array_sources, Sink && sink)
+void concat(const VectorWithMemoryTracking<std::unique_ptr<IArraySource>> & array_sources, Sink && sink)
 {
     size_t sources_num = array_sources.size();
-    std::vector<char> is_const(sources_num);
+    VectorWithMemoryTracking<char> is_const(sources_num);
 
-    auto checkAndGetSizeToReserve = [] (auto source, IArraySource * array_source)
+    auto check_and_get_size_to_reserve = [] (auto source, IArraySource * array_source)
     {
         if (source == nullptr)
-            throw Exception("Concat function expected " + demangle(typeid(Source).name()) + " or "
-                            + demangle(typeid(ConstSource<Source>).name()) + " but got "
-                            + demangle(typeid(*array_source).name()), ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Concat function expected {} or {} but got {}",
+                            demangle(typeid(Source).name()), demangle(typeid(ConstSource<Source>).name()),
+                            demangle(typeid(*array_source).name()));
         return source->getSizeForReserve();
     };
 
     size_t size_to_reserve = 0;
-    for (auto i : collections::range(0, sources_num))
+    for (size_t i = 0; i < sources_num; ++i)
     {
-        auto & source = array_sources[i];
+        const auto & source = array_sources[i];
         is_const[i] = source->isConst();
         if (is_const[i])
-            size_to_reserve += checkAndGetSizeToReserve(typeid_cast<ConstSource<Source> *>(source.get()), source.get());
+            size_to_reserve += check_and_get_size_to_reserve(typeid_cast<ConstSource<Source> *>(source.get()), source.get());
         else
-            size_to_reserve += checkAndGetSizeToReserve(typeid_cast<Source *>(source.get()), source.get());
+            size_to_reserve += check_and_get_size_to_reserve(typeid_cast<Source *>(source.get()), source.get());
     }
 
     sink.reserve(size_to_reserve);
 
-    auto writeNext = [& sink] (auto source)
+    auto write_next = [& sink] (auto source)
     {
         writeSlice(source->getWhole(), sink);
         source->next();
@@ -233,13 +235,13 @@ void concat(const std::vector<std::unique_ptr<IArraySource>> & array_sources, Si
 
     while (!sink.isEnd())
     {
-        for (auto i : collections::range(0, sources_num))
+        for (size_t i = 0; i < sources_num; ++i)
         {
-            auto & source = array_sources[i];
+            const auto & source = array_sources[i];
             if (is_const[i])
-                writeNext(static_cast<ConstSource<Source> *>(source.get()));
+                write_next(static_cast<ConstSource<Source> *>(source.get()));
             else
-                writeNext(static_cast<Source *>(source.get()));
+                write_next(static_cast<Source *>(source.get()));
         }
         sink.next();
     }
@@ -306,7 +308,7 @@ void NO_INLINE sliceFromRightConstantOffsetBounded(Source && src, Sink && sink, 
     {
         ssize_t size = length;
         if (size < 0)
-            size += static_cast<ssize_t>(src.getElementSize()) - offset;
+            size += offset;
 
         if (size > 0)
             writeSlice(src.getSliceFromRight(offset, size), sink);
@@ -347,18 +349,31 @@ void NO_INLINE sliceDynamicOffsetUnbounded(Source && src, Sink && sink, const IC
     }
 }
 
-template <typename Source, typename Sink>
-void NO_INLINE sliceDynamicOffsetBounded(Source && src, Sink && sink, const IColumn & offset_column, const IColumn & length_column)
-{
-    const bool is_offset_null = offset_column.onlyNull();
-    const auto * offset_nullable = typeid_cast<const ColumnNullable *>(&offset_column);
-    const ColumnUInt8::Container * offset_null_map = offset_nullable ? &offset_nullable->getNullMapData() : nullptr;
-    const IColumn * offset_nested_column = offset_nullable ? &offset_nullable->getNestedColumn() : &offset_column;
 
-    const bool is_length_null = length_column.onlyNull();
-    const auto * length_nullable = typeid_cast<const ColumnNullable *>(&length_column);
-    const ColumnUInt8::Container * length_null_map = length_nullable ? &length_nullable->getNullMapData() : nullptr;
-    const IColumn * length_nested_column = length_nullable ? &length_nullable->getNestedColumn() : &length_column;
+template <bool inverse, typename Source, typename Sink>
+static void sliceDynamicOffsetBoundedImpl(Source && src, Sink && sink, const IColumn * offset_column, const IColumn * length_column)
+{
+    const bool is_offset_null = !offset_column || offset_column->onlyNull();
+    const ColumnUInt8::Container * offset_null_map = nullptr;
+    const IColumn * offset_nested_column = nullptr;
+
+    if (!is_offset_null)
+    {
+        const auto * offset_nullable = typeid_cast<const ColumnNullable *>(offset_column);
+        offset_null_map = offset_nullable ? &offset_nullable->getNullMapData() : nullptr;
+        offset_nested_column = offset_nullable ? &offset_nullable->getNestedColumn() : offset_column;
+    }
+
+    const bool is_length_null = !length_column || length_column->onlyNull();
+    const ColumnUInt8::Container * length_null_map = nullptr;
+    const IColumn * length_nested_column = nullptr;
+
+    if (!is_length_null)
+    {
+        const auto * length_nullable = typeid_cast<const ColumnNullable *>(length_column);
+        length_null_map = length_nullable ? &length_nullable->getNullMapData() : nullptr;
+        length_nested_column = length_nullable ? &length_nullable->getNestedColumn() : length_column;
+    }
 
     while (!src.isEnd())
     {
@@ -369,16 +384,47 @@ void NO_INLINE sliceDynamicOffsetBounded(Source && src, Sink && sink, const ICol
         Int64 size = has_length ? length_nested_column->getInt(row_num) : static_cast<Int64>(src.getElementSize());
 
         if (size < 0)
-            size += offset > 0 ? static_cast<Int64>(src.getElementSize()) - (offset - 1) : -UInt64(offset);
+        {
+            Int64 abs_size = 0;
+            if (common::subOverflow(Int64(0), size, abs_size))
+                throw Exception(DB::ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                    "Overflow in length argument of substring-like function: {}", size);
+            Int64 adjustment = 0;
+            if (offset > 0)
+            {
+                adjustment = static_cast<Int64>(src.getElementSize()) - (offset - 1);
+            }
+            else
+            {
+                if (common::subOverflow(Int64(0), offset, adjustment))
+                    throw Exception(DB::ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                        "Overflow in offset argument of substring-like function: {}", offset);
+            }
+            Int64 new_size = 0;
+            if (common::addOverflow(size, adjustment, new_size))
+                throw Exception(DB::ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                    "Overflow when computing slice size in substring-like function: size={}, adjustment={}", size, adjustment);
+            size = new_size;
+        }
 
         if (offset != 0 && size > 0)
         {
             typename std::decay_t<Source>::Slice slice;
 
             if (offset > 0)
-                slice = src.getSliceFromLeft(offset - 1, size);
+            {
+                if constexpr (inverse)
+                    slice = src.getSliceFromRight(UInt64(size) + UInt64(offset) - 1, size);
+                else
+                    slice = src.getSliceFromLeft(UInt64(offset) - 1, size);
+            }
             else
-                slice = src.getSliceFromRight(-UInt64(offset), size);
+            {
+                if constexpr (inverse)
+                    slice = src.getSliceFromLeft(-UInt64(offset), size);
+                else
+                    slice = src.getSliceFromRight(-UInt64(offset), size);
+            }
 
             writeSlice(slice, sink);
         }
@@ -386,6 +432,26 @@ void NO_INLINE sliceDynamicOffsetBounded(Source && src, Sink && sink, const ICol
         sink.next();
         src.next();
     }
+}
+
+
+template <typename Source, typename Sink>
+void NO_INLINE sliceDynamicOffsetBounded(Source && src, Sink && sink, const IColumn & offset_column, const IColumn & length_column)
+{
+    sliceDynamicOffsetBoundedImpl<false>(std::forward<Source>(src), std::forward<Sink>(sink), &offset_column, &length_column);
+}
+
+/// Similar to above, but with no offset.
+template <typename Source, typename Sink>
+void NO_INLINE sliceFromLeftDynamicLength(Source && src, Sink && sink, const IColumn & length_column)
+{
+    sliceDynamicOffsetBoundedImpl<false>(std::forward<Source>(src), std::forward<Sink>(sink), nullptr, &length_column);
+}
+
+template <typename Source, typename Sink>
+void NO_INLINE sliceFromRightDynamicLength(Source && src, Sink && sink, const IColumn & length_column)
+{
+    sliceDynamicOffsetBoundedImpl<true>(std::forward<Source>(src), std::forward<Sink>(sink), nullptr, &length_column);
 }
 
 
@@ -397,9 +463,6 @@ void NO_INLINE conditional(SourceA && src_a, SourceB && src_b, Sink && sink, con
     const UInt8 * cond_pos = condition.data();
     const UInt8 * cond_end = cond_pos + condition.size();
 
-    bool a_is_short = src_a.getColumnSize() < condition.size();
-    bool b_is_short = src_b.getColumnSize() < condition.size();
-
     while (cond_pos < cond_end)
     {
         if (*cond_pos)
@@ -407,10 +470,8 @@ void NO_INLINE conditional(SourceA && src_a, SourceB && src_b, Sink && sink, con
         else
             writeSlice(src_b.getWhole(), sink);
 
-        if (!a_is_short || *cond_pos)
-            src_a.next();
-        if (!b_is_short || !*cond_pos)
-            src_b.next();
+        src_a.next();
+        src_b.next();
 
         ++cond_pos;
         sink.next();
@@ -418,49 +479,54 @@ void NO_INLINE conditional(SourceA && src_a, SourceB && src_b, Sink && sink, con
 }
 
 
-/// Methods to check if first array has elements from second array, overloaded for various combinations of types.
+template <typename T>
+bool insliceEqualElements(const NumericArraySlice<T> & first [[maybe_unused]],
+                          size_t first_ind [[maybe_unused]],
+                          size_t second_ind [[maybe_unused]])
+{
+    if constexpr (is_decimal<T>)
+        return accurate::equalsOp(first.data[first_ind].value, first.data[second_ind].value);
+    else
+        return accurate::equalsOp(first.data[first_ind], first.data[second_ind]);
+}
+inline ALWAYS_INLINE bool insliceEqualElements(const GenericArraySlice & first, size_t first_ind, size_t second_ind)
+{
+    return first.elements->compareAt(first_ind + first.begin, second_ind + first.begin, *first.elements, -1) == 0;
+}
+
 template <
     ArraySearchType search_type,
     typename FirstSliceType,
     typename SecondSliceType,
           bool (*isEqual)(const FirstSliceType &, const SecondSliceType &, size_t, size_t)>
-bool sliceHasImplAnyAll(const FirstSliceType & first, const SecondSliceType & second, const UInt8 * first_null_map, const UInt8 * second_null_map)
+bool sliceHasImplStartsEndsWith(const FirstSliceType & first, const SecondSliceType & second, const UInt8 * first_null_map, const UInt8 * second_null_map)
 {
     const bool has_first_null_map = first_null_map != nullptr;
     const bool has_second_null_map = second_null_map != nullptr;
 
-    for (size_t i = 0; i < second.size; ++i)
+    if (first.size < second.size)
+        return false;
+
+    size_t first_index = (search_type == ArraySearchType::StartsWith) ? 0 : first.size - second.size;
+    for (size_t second_index = 0; second_index < second.size; ++second_index, ++first_index)
     {
-        bool has = false;
-        for (size_t j = 0; j < first.size && !has; ++j)
-        {
-            const bool is_first_null = has_first_null_map && first_null_map[j];
-            const bool is_second_null = has_second_null_map && second_null_map[i];
-
-            if (is_first_null && is_second_null)
-                has = true;
-
-            if (!is_first_null && !is_second_null && isEqual(first, second, j, i))
-                has = true;
-        }
-
-        if (has && search_type == ArraySearchType::Any)
-            return true;
-
-        if (!has && search_type == ArraySearchType::All)
+        const bool is_first_null = has_first_null_map && first_null_map[first_index];
+        const bool is_second_null = has_second_null_map && second_null_map[second_index];
+        if (is_first_null != is_second_null)
+            return false;
+        if (!is_first_null && !is_second_null && !isEqual(first, second, first_index, second_index))
             return false;
     }
-    return search_type == ArraySearchType::All;
+    return true;
 }
-
 
 /// For details of Knuth-Morris-Pratt string matching algorithm see
 /// https://en.wikipedia.org/wiki/Knuth%E2%80%93Morris%E2%80%93Pratt_algorithm.
 /// A "prefix-function" is defined as: i-th element is the length of the longest of all prefixes that end in i-th position
 template <typename SliceType, typename EqualityFunc>
-std::vector<size_t> buildKMPPrefixFunction(const SliceType & pattern, const EqualityFunc & isEqualFunc)
+VectorWithMemoryTracking<size_t> buildKMPPrefixFunction(const SliceType & pattern, const EqualityFunc & isEqualFunc)
 {
-    std::vector<size_t> result(pattern.size);
+    VectorWithMemoryTracking<size_t> result(pattern.size);
     result[0] = 0;
 
     for (size_t i = 1; i < pattern.size; ++i)
@@ -490,10 +556,13 @@ bool sliceHasImplSubstr(const FirstSliceType & first, const SecondSliceType & se
     if (second.size == 0)
         return true;
 
+    if (first.size < second.size)
+        return false;
+
     const bool has_first_null_map = first_null_map != nullptr;
     const bool has_second_null_map = second_null_map != nullptr;
 
-    std::vector<size_t> prefix_function;
+    VectorWithMemoryTracking<size_t> prefix_function;
     if (has_second_null_map)
     {
         prefix_function = buildKMPPrefixFunction(second,
@@ -508,31 +577,31 @@ bool sliceHasImplSubstr(const FirstSliceType & first, const SecondSliceType & se
                 [](const SecondSliceType & pattern, size_t i, size_t j) { return isEqualUnary(pattern, i, j); });
     }
 
-    size_t firstCur = 0;
-    size_t secondCur = 0;
-    while (firstCur < first.size && secondCur < second.size)
+    size_t first_cur = 0;
+    size_t second_cur = 0;
+    while (first_cur < first.size && second_cur < second.size)
     {
-        const bool is_first_null = has_first_null_map && first_null_map[firstCur];
-        const bool is_second_null = has_second_null_map && second_null_map[secondCur];
+        const bool is_first_null = has_first_null_map && first_null_map[first_cur];
+        const bool is_second_null = has_second_null_map && second_null_map[second_cur];
 
         const bool cond_both_null_match = is_first_null && is_second_null;
         const bool cond_both_not_null = !is_first_null && !is_second_null;
-        if (cond_both_null_match || (cond_both_not_null && isEqual(first, second, firstCur, secondCur)))
+        if (cond_both_null_match || (cond_both_not_null && isEqual(first, second, first_cur, second_cur)))
         {
-            ++firstCur;
-            ++secondCur;
+            ++first_cur;
+            ++second_cur;
         }
-        else if (secondCur > 0)
+        else if (second_cur > 0)
         {
-            secondCur = prefix_function[secondCur - 1];
+            second_cur = prefix_function[second_cur - 1];
         }
         else
         {
-            ++firstCur;
+            ++first_cur;
         }
     }
 
-    return secondCur == second.size;
+    return second_cur == second.size;
 }
 
 
@@ -546,56 +615,10 @@ bool sliceHasImpl(const FirstSliceType & first, const SecondSliceType & second, 
 {
     if constexpr (search_type == ArraySearchType::Substr)
         return sliceHasImplSubstr<FirstSliceType, SecondSliceType, isEqual, isEqualSecond>(first, second, first_null_map, second_null_map);
+    else if constexpr (search_type == ArraySearchType::StartsWith || search_type == ArraySearchType::EndsWith)
+        return sliceHasImplStartsEndsWith<search_type, FirstSliceType, SecondSliceType, isEqual>(first, second, first_null_map, second_null_map);
     else
         return sliceHasImplAnyAll<search_type, FirstSliceType, SecondSliceType, isEqual>(first, second, first_null_map, second_null_map);
-}
-
-
-template <typename T, typename U>
-bool sliceEqualElements(const NumericArraySlice<T> & first [[maybe_unused]],
-                        const NumericArraySlice<U> & second [[maybe_unused]],
-                        size_t first_ind [[maybe_unused]],
-                        size_t second_ind [[maybe_unused]])
-{
-    /// TODO: Decimal scale
-    if constexpr (is_decimal<T> && is_decimal<U>)
-        return accurate::equalsOp(first.data[first_ind].value, second.data[second_ind].value);
-    else if constexpr (is_decimal<T> || is_decimal<U>)
-        return false;
-    else
-        return accurate::equalsOp(first.data[first_ind], second.data[second_ind]);
-}
-
-template <typename T>
-bool sliceEqualElements(const NumericArraySlice<T> &, const GenericArraySlice &, size_t, size_t)
-{
-    return false;
-}
-
-template <typename U>
-bool sliceEqualElements(const GenericArraySlice &, const NumericArraySlice<U> &, size_t, size_t)
-{
-    return false;
-}
-
-inline ALWAYS_INLINE bool sliceEqualElements(const GenericArraySlice & first, const GenericArraySlice & second, size_t first_ind, size_t second_ind)
-{
-    return first.elements->compareAt(first_ind + first.begin, second_ind + second.begin, *second.elements, -1) == 0;
-}
-
-template <typename T>
-bool insliceEqualElements(const NumericArraySlice<T> & first [[maybe_unused]],
-                          size_t first_ind [[maybe_unused]],
-                          size_t second_ind [[maybe_unused]])
-{
-    if constexpr (is_decimal<T>)
-        return accurate::equalsOp(first.data[first_ind].value, first.data[second_ind].value);
-    else
-        return accurate::equalsOp(first.data[first_ind], first.data[second_ind]);
-}
-inline ALWAYS_INLINE bool insliceEqualElements(const GenericArraySlice & first, size_t first_ind, size_t second_ind)
-{
-    return first.elements->compareAt(first_ind + first.begin, second_ind + first.begin, *first.elements, -1) == 0;
 }
 
 template <ArraySearchType search_type, typename T, typename U>
@@ -610,7 +633,7 @@ bool sliceHas(const GenericArraySlice & first, const GenericArraySlice & second)
 {
     /// Generic arrays should have the same type in order to use column.compareAt(...)
     if (!first.elements->structureEquals(*second.elements))
-        throw Exception("Function sliceHas expects same column types for slices.", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Function sliceHas expects same column types for slices.");
 
     auto impl = sliceHasImpl<search_type, GenericArraySlice, GenericArraySlice, sliceEqualElements, insliceEqualElements>;
     return impl(first, second, nullptr, nullptr);
@@ -629,49 +652,32 @@ bool sliceHas(const NumericArraySlice<T> & /*first*/, const GenericArraySlice & 
 }
 
 template <ArraySearchType search_type, typename FirstArraySlice, typename SecondArraySlice>
-bool sliceHas(const FirstArraySlice & first, NullableSlice<SecondArraySlice> & second)
+bool sliceHas(const FirstArraySlice & first, const NullableSlice<SecondArraySlice> & second)
 {
-    auto impl = sliceHasImpl<
-        search_type,
-        FirstArraySlice,
-        SecondArraySlice,
-        sliceEqualElements<FirstArraySlice, SecondArraySlice>,
-        insliceEqualElements<SecondArraySlice>>;
+    auto impl = sliceHasImpl<search_type, FirstArraySlice, SecondArraySlice, sliceEqualElements, insliceEqualElements>;
     return impl(first, second, nullptr, second.null_map);
 }
 
 template <ArraySearchType search_type, typename FirstArraySlice, typename SecondArraySlice>
-bool sliceHas(const NullableSlice<FirstArraySlice> & first, SecondArraySlice & second)
+bool sliceHas(const NullableSlice<FirstArraySlice> & first, const SecondArraySlice & second)
 {
-    auto impl = sliceHasImpl<
-        search_type,
-        FirstArraySlice,
-        SecondArraySlice,
-        sliceEqualElements<FirstArraySlice, SecondArraySlice>,
-        insliceEqualElements<SecondArraySlice>>;
+    auto impl = sliceHasImpl<search_type, FirstArraySlice, SecondArraySlice, sliceEqualElements, insliceEqualElements>;
     return impl(first, second, first.null_map, nullptr);
 }
 
 template <ArraySearchType search_type, typename FirstArraySlice, typename SecondArraySlice>
-bool sliceHas(const NullableSlice<FirstArraySlice> & first, NullableSlice<SecondArraySlice> & second)
+bool sliceHas(const NullableSlice<FirstArraySlice> & first, const NullableSlice<SecondArraySlice> & second)
 {
-    auto impl = sliceHasImpl<
-        search_type,
-        FirstArraySlice,
-        SecondArraySlice,
-        sliceEqualElements<FirstArraySlice, SecondArraySlice>,
-        insliceEqualElements<SecondArraySlice>>;
+    auto impl = sliceHasImpl<search_type, FirstArraySlice, SecondArraySlice, sliceEqualElements, insliceEqualElements>;
     return impl(first, second, first.null_map, second.null_map);
 }
 
 template <ArraySearchType search_type, typename FirstSource, typename SecondSource>
-void NO_INLINE arrayAllAny(FirstSource && first, SecondSource && second, ColumnUInt8 & result)
+void NO_INLINE arrayAllAny(FirstSource && first, SecondSource && second, UInt8 * result, size_t size)
 {
-    auto size = result.size();
-    auto & data = result.getData();
-    for (auto row : collections::range(0, size))
+    for (UInt8 * result_end = result + size; result < result_end; ++result)
     {
-        data[row] = static_cast<UInt8>(sliceHas<search_type>(first.getWhole(), second.getWhole()));
+        *result = static_cast<UInt8>(sliceHas<search_type>(first.getWhole(), second.getWhole()));
         first.next();
         second.next();
     }
@@ -783,4 +789,3 @@ void resizeConstantSize(ArraySource && array_source, ValueSource && value_source
 }
 
 }
-

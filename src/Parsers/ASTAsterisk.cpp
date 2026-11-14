@@ -1,26 +1,75 @@
 #include <Parsers/ASTAsterisk.h>
+#include <Parsers/ASTColumnsTransformers.h>
+#include <Parsers/ASTJSONHelpers.h>
+#include <Parsers/ASTJSONReadHelpers.h>
 #include <IO/WriteBuffer.h>
 #include <IO/Operators.h>
 
 namespace DB
 {
 
+void ASTAsterisk::writeJSON(WriteBuffer & out) const
+{
+    JSONObjectWriter w(out, "Asterisk");
+    w.writeChild("expression", expression);
+    w.writeChild("transformers", transformers);
+}
+
+void ASTAsterisk::readJSON(const Poco::JSON::Object & json)
+{
+    JSONObjectReader r(json);
+    auto child = r.readChild("expression");
+    if (child)
+    {
+        this->expression = child;
+        this->children.push_back(this->expression);
+    }
+    /// The parser only attaches an `ASTColumnsTransformerList` here; analyzer paths call
+    /// `buildColumnTransformers(asterisk->transformers, ...)` and treat it as the transformer-list
+    /// container, so reject any other node type from malformed `clickhouse_json`.
+    child = r.readChildOfType<ASTColumnsTransformerList>("transformers");
+    if (child)
+    {
+        this->transformers = child;
+        this->children.push_back(this->transformers);
+    }
+}
+
 ASTPtr ASTAsterisk::clone() const
 {
-    auto clone = std::make_shared<ASTAsterisk>(*this);
-    clone->cloneChildren();
+    auto clone = make_intrusive<ASTAsterisk>(*this);
+    clone->children.clear();
+
+    if (expression) { clone->expression = expression->clone(); clone->children.push_back(clone->expression); }
+    if (transformers) { clone->transformers = transformers->clone(); clone->children.push_back(clone->transformers); }
+
     return clone;
 }
 
-void ASTAsterisk::appendColumnName(WriteBuffer & ostr) const { ostr.write('*'); }
-
-void ASTAsterisk::formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
+void ASTAsterisk::appendColumnName(WriteBuffer & ostr) const
 {
-    settings.ostr << "*";
-    for (const auto & child : children)
+    if (expression)
     {
-        settings.ostr << ' ';
-        child->formatImpl(settings, state, frame);
+        expression->appendColumnName(ostr);
+        writeCString(".", ostr);
+    }
+
+    ostr.write('*');
+}
+
+void ASTAsterisk::formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
+{
+    if (expression)
+    {
+        expression->format(ostr, settings, state, frame);
+        ostr << ".";
+    }
+
+    ostr << "*";
+
+    if (transformers)
+    {
+        transformers->format(ostr, settings, state, frame);
     }
 }
 

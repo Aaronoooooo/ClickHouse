@@ -30,22 +30,26 @@ add_compile_definitions(
     HAVE_CHECK_SHA256
     HAVE_DECODERS
     HAVE_DECODER_ARM
+    HAVE_DECODER_ARM64
     HAVE_DECODER_ARMTHUMB
     HAVE_DECODER_DELTA
     HAVE_DECODER_IA64
     HAVE_DECODER_LZMA1
     HAVE_DECODER_LZMA2
     HAVE_DECODER_POWERPC
+    HAVE_DECODER_RISCV
     HAVE_DECODER_SPARC
     HAVE_DECODER_X86
     HAVE_ENCODERS
     HAVE_ENCODER_ARM
+    HAVE_ENCODER_ARM64
     HAVE_ENCODER_ARMTHUMB
     HAVE_ENCODER_DELTA
     HAVE_ENCODER_IA64
     HAVE_ENCODER_LZMA1
     HAVE_ENCODER_LZMA2
     HAVE_ENCODER_POWERPC
+    HAVE_ENCODER_RISCV
     HAVE_ENCODER_SPARC
     HAVE_ENCODER_X86
     HAVE_MF_BT2
@@ -62,6 +66,9 @@ add_compile_definitions(
 
     HAVE___BUILTIN_BSWAPXX
     HAVE___BUILTIN_ASSUME_ALIGNED
+
+    # Select the CRC implementation in a constructor, not with an unsynchronized write on the first call.
+    HAVE_FUNC_ATTRIBUTE_CONSTRUCTOR
 
     _GNU_SOURCE
     __EXTENSIONS__
@@ -94,10 +101,16 @@ if (ARCH_AMD64 OR ARCH_AARCH64)
     add_compile_definitions(TUKLIB_FAST_UNALIGNED_ACCESS=1)
 endif ()
 
-find_package(Threads REQUIRED)
+if (ARCH_AMD64)
+    add_compile_definitions(HAVE_USABLE_CLMUL)
+endif ()
+
+if (ARCH_S390X)
+    add_compile_definitions(WORDS_BIGENDIAN)
+endif ()
 
 
-add_library(liblzma
+add_library(_liblzma
     ${SRC_DIR}/src/common/mythread.h
     ${SRC_DIR}/src/common/sysdefs.h
     ${SRC_DIR}/src/common/tuklib_common.h
@@ -124,15 +137,16 @@ add_library(liblzma
     ${SRC_DIR}/src/liblzma/api/lzma/vli.h
     ${SRC_DIR}/src/liblzma/check/check.c
     ${SRC_DIR}/src/liblzma/check/check.h
+    ${SRC_DIR}/src/liblzma/check/crc32_arm64.h
     ${SRC_DIR}/src/liblzma/check/crc32_fast.c
-    ${SRC_DIR}/src/liblzma/check/crc32_table.c
+    ${SRC_DIR}/src/liblzma/check/crc32_loongarch.h
     ${SRC_DIR}/src/liblzma/check/crc32_table_be.h
     ${SRC_DIR}/src/liblzma/check/crc32_table_le.h
     ${SRC_DIR}/src/liblzma/check/crc64_fast.c
-    ${SRC_DIR}/src/liblzma/check/crc64_table.c
     ${SRC_DIR}/src/liblzma/check/crc64_table_be.h
     ${SRC_DIR}/src/liblzma/check/crc64_table_le.h
-    ${SRC_DIR}/src/liblzma/check/crc_macros.h
+    ${SRC_DIR}/src/liblzma/check/crc_common.h
+    ${SRC_DIR}/src/liblzma/check/crc_x86_clmul.h
     ${SRC_DIR}/src/liblzma/check/sha256.c
     ${SRC_DIR}/src/liblzma/common/alone_decoder.c
     ${SRC_DIR}/src/liblzma/common/alone_decoder.h
@@ -176,19 +190,25 @@ add_library(liblzma
     ${SRC_DIR}/src/liblzma/common/index_encoder.c
     ${SRC_DIR}/src/liblzma/common/index_encoder.h
     ${SRC_DIR}/src/liblzma/common/index_hash.c
+    ${SRC_DIR}/src/liblzma/common/lzip_decoder.c
+    ${SRC_DIR}/src/liblzma/common/lzip_decoder.h
     ${SRC_DIR}/src/liblzma/common/memcmplen.h
+    ${SRC_DIR}/src/liblzma/common/microlzma_decoder.c
+    ${SRC_DIR}/src/liblzma/common/microlzma_encoder.c
     ${SRC_DIR}/src/liblzma/common/outqueue.c
     ${SRC_DIR}/src/liblzma/common/outqueue.h
     ${SRC_DIR}/src/liblzma/common/stream_buffer_decoder.c
     ${SRC_DIR}/src/liblzma/common/stream_buffer_encoder.c
     ${SRC_DIR}/src/liblzma/common/stream_decoder.c
     ${SRC_DIR}/src/liblzma/common/stream_decoder.h
+    ${SRC_DIR}/src/liblzma/common/stream_decoder_mt.c
     ${SRC_DIR}/src/liblzma/common/stream_encoder.c
     ${SRC_DIR}/src/liblzma/common/stream_encoder_mt.c
     ${SRC_DIR}/src/liblzma/common/stream_flags_common.c
     ${SRC_DIR}/src/liblzma/common/stream_flags_common.h
     ${SRC_DIR}/src/liblzma/common/stream_flags_decoder.c
     ${SRC_DIR}/src/liblzma/common/stream_flags_encoder.c
+    ${SRC_DIR}/src/liblzma/common/string_conversion.c
     ${SRC_DIR}/src/liblzma/common/vli_decoder.c
     ${SRC_DIR}/src/liblzma/common/vli_encoder.c
     ${SRC_DIR}/src/liblzma/common/vli_size.c
@@ -227,9 +247,11 @@ add_library(liblzma
     ${SRC_DIR}/src/liblzma/rangecoder/range_decoder.h
     ${SRC_DIR}/src/liblzma/rangecoder/range_encoder.h
     ${SRC_DIR}/src/liblzma/simple/arm.c
+    ${SRC_DIR}/src/liblzma/simple/arm64.c
     ${SRC_DIR}/src/liblzma/simple/armthumb.c
     ${SRC_DIR}/src/liblzma/simple/ia64.c
     ${SRC_DIR}/src/liblzma/simple/powerpc.c
+    ${SRC_DIR}/src/liblzma/simple/riscv.c
     ${SRC_DIR}/src/liblzma/simple/simple_coder.c
     ${SRC_DIR}/src/liblzma/simple/simple_coder.h
     ${SRC_DIR}/src/liblzma/simple/simple_decoder.c
@@ -241,7 +263,7 @@ add_library(liblzma
     ${SRC_DIR}/src/liblzma/simple/x86.c
 )
 
-target_include_directories(liblzma PRIVATE
+target_include_directories(_liblzma SYSTEM PRIVATE
     ${SRC_DIR}/src/liblzma/api
     ${SRC_DIR}/src/liblzma/common
     ${SRC_DIR}/src/liblzma/check
@@ -252,12 +274,15 @@ target_include_directories(liblzma PRIVATE
     ${SRC_DIR}/src/liblzma/simple
     ${SRC_DIR}/src/common
 )
+target_include_directories(_liblzma SYSTEM BEFORE PUBLIC ${SRC_DIR}/src/liblzma/api)
 
-target_link_libraries(liblzma Threads::Threads)
+target_link_libraries(_liblzma Threads::Threads)
 
 # Put the tuklib functions under the lzma_ namespace.
-target_compile_definitions(liblzma PRIVATE TUKLIB_SYMBOL_PREFIX=lzma_)
+target_compile_definitions(_liblzma PRIVATE TUKLIB_SYMBOL_PREFIX=lzma_)
 
 if (ENABLE_SSE2)
-    target_compile_definitions(liblzma PRIVATE HAVE_IMMINTRIN_H HAVE__MM_MOVEMASK_EPI8)
+    target_compile_definitions(_liblzma PRIVATE HAVE_IMMINTRIN_H HAVE__MM_MOVEMASK_EPI8)
 endif()
+
+add_library(ch_contrib::xz ALIAS _liblzma)

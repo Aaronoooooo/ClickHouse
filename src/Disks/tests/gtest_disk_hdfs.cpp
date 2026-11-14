@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
-#include "gtest_disk.h"
+#include <Disks/tests/gtest_disk.h>
 
 
 #define RUN_HDFS_TEST 0
@@ -52,8 +52,8 @@ TEST(DiskTestHDFS, WriteReadHDFS)
     }
 
     {
-        DB::String result;
-        auto in = disk.readFile(file_name, {}, 1024);
+        String result;
+        auto in = disk.readFile(file_name, {}, 1024, 1024);
         readString(result, *in);
         EXPECT_EQ("Test write to file", result);
     }
@@ -76,7 +76,7 @@ TEST(DiskTestHDFS, RewriteFileHDFS)
 
     {
         String result;
-        auto in = disk.readFile(file_name, {}, 1024);
+        auto in = disk.readFile(file_name, {}, 1024, 1024);
         readString(result, *in);
         EXPECT_EQ("Text10", result);
         readString(result, *in);
@@ -104,7 +104,7 @@ TEST(DiskTestHDFS, AppendFileHDFS)
 
     {
         String result, expected;
-        auto in = disk.readFile(file_name, {}, 1024);
+        auto in = disk.readFile(file_name, {}, 1024, 1024);
 
         readString(result, *in);
         EXPECT_EQ("Text0123456789", result);
@@ -131,7 +131,7 @@ TEST(DiskTestHDFS, SeekHDFS)
     /// Test SEEK_SET
     {
         String buf(4, '0');
-        std::unique_ptr<DB::SeekableReadBuffer> in = disk.readFile(file_name, {}, 1024);
+        std::unique_ptr<DB::SeekableReadBuffer> in = disk.readFile(file_name, {}, 1024, 1024);
 
         in->seek(5, SEEK_SET);
 
@@ -141,7 +141,7 @@ TEST(DiskTestHDFS, SeekHDFS)
 
     /// Test SEEK_CUR
     {
-        std::unique_ptr<DB::SeekableReadBuffer> in = disk.readFile(file_name, {}, 1024);
+        std::unique_ptr<DB::SeekableReadBuffer> in = disk.readFile(file_name, {}, 1024, 1024);
         String buf(4, '0');
 
         in->readStrict(buf.data(), 4);

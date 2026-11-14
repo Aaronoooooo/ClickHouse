@@ -1,11 +1,10 @@
 #pragma once
 
-#include "config_core.h"
+#include "config.h"
 
 #if USE_EMBEDDED_COMPILER
-#    include <Common/LRUCache.h>
+#    include <Common/CacheBase.h>
 #    include <Common/HashTable/Hash.h>
-#    include <Interpreters/JIT/CHJIT.h>
 
 namespace DB
 {
@@ -19,7 +18,7 @@ public:
 
     size_t getCompiledExpressionSize() const { return compiled_expression_size; }
 
-    virtual ~CompiledExpressionCacheEntry() {}
+    virtual ~CompiledExpressionCacheEntry() = default;
 
 private:
 
@@ -35,10 +34,10 @@ struct CompiledFunctionWeightFunction
     }
 };
 
-class CompiledExpressionCache : public LRUCache<UInt128, CompiledExpressionCacheEntry, UInt128Hash, CompiledFunctionWeightFunction>
+class CompiledExpressionCache : public CacheBase<UInt128, CompiledExpressionCacheEntry, UInt128Hash, CompiledFunctionWeightFunction>
 {
 public:
-    using Base = LRUCache<UInt128, CompiledExpressionCacheEntry, UInt128Hash, CompiledFunctionWeightFunction>;
+    using Base = CacheBase<UInt128, CompiledExpressionCacheEntry, UInt128Hash, CompiledFunctionWeightFunction>;
     using Base::Base;
 };
 

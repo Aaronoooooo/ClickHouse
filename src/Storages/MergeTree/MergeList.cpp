@@ -1,103 +1,82 @@
+#include <Storages/MergeTree/FutureMergedMutatedPart.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
-#include <Storages/MergeTree/FutureMergedMutatedPart.h>
-#include <Common/CurrentMetrics.h>
 #include <base/getThreadId.h>
+#include <Common/CurrentMetrics.h>
 #include <Common/CurrentThread.h>
+#include <Common/MemoryTrackerUtils.h>
+#include <Common/ThreadStatus.h>
+#include <Common/MemoryTracker.h>
 
+#include <Common/logger_useful.h>
+
+namespace CurrentMetrics
+{
+    extern const Metric MergeParts;
+}
 
 namespace DB
 {
 
-
-MemoryTrackerThreadSwitcher::MemoryTrackerThreadSwitcher(MergeListEntry & merge_list_entry_)
-    : merge_list_entry(merge_list_entry_)
+namespace ErrorCodes
 {
-    // Each merge is executed into separate background processing pool thread
-    background_thread_memory_tracker = CurrentThread::getMemoryTracker();
-    if (background_thread_memory_tracker)
-    {
-        /// From the query context it will be ("for thread") memory tracker with VariableContext::Thread level,
-        /// which does not have any limits and sampling settings configured.
-        /// And parent for this memory tracker should be ("(for query)") with VariableContext::Process level,
-        /// that has limits and sampling configured.
-        MemoryTracker * parent;
-        if (background_thread_memory_tracker->level == VariableContext::Thread &&
-            (parent = background_thread_memory_tracker->getParent()) &&
-            parent != &total_memory_tracker)
-        {
-            background_thread_memory_tracker = parent;
-        }
-
-        background_thread_memory_tracker_prev_parent = background_thread_memory_tracker->getParent();
-        background_thread_memory_tracker->setParent(&merge_list_entry->memory_tracker);
-    }
-
-    prev_untracked_memory_limit = current_thread->untracked_memory_limit;
-    current_thread->untracked_memory_limit = merge_list_entry->max_untracked_memory;
-
-    /// Avoid accounting memory from another mutation/merge
-    /// (NOTE: consider moving such code to ThreadFromGlobalPool and related places)
-    prev_untracked_memory = current_thread->untracked_memory;
-    current_thread->untracked_memory = merge_list_entry->untracked_memory;
-
-    prev_query_id = current_thread->getQueryId().toString();
-    current_thread->setQueryId(merge_list_entry->query_id);
+    extern const int LOGICAL_ERROR;
 }
 
+const MergeTreePartInfo MergeListElement::FAKE_RESULT_PART_FOR_PROJECTION = {"all", 0, 0, 0};
 
-MemoryTrackerThreadSwitcher::~MemoryTrackerThreadSwitcher()
-{
-    // Unplug memory_tracker from current background processing pool thread
-
-    if (background_thread_memory_tracker)
-        background_thread_memory_tracker->setParent(background_thread_memory_tracker_prev_parent);
-
-    current_thread->untracked_memory_limit = prev_untracked_memory_limit;
-
-    merge_list_entry->untracked_memory = current_thread->untracked_memory;
-    current_thread->untracked_memory = prev_untracked_memory;
-
-    current_thread->setQueryId(prev_query_id);
-}
-
-MergeListElement::MergeListElement(
-    const StorageID & table_id_,
-    FutureMergedMutatedPartPtr future_part,
-    UInt64 memory_profiler_step,
-    UInt64 memory_profiler_sample_probability,
-    UInt64 max_untracked_memory_)
+MergeListElement::MergeListElement(const StorageID & table_id_, FutureMergedMutatedPartPtr future_part, const ContextPtr & context)
     : table_id{table_id_}
-    , partition_id{future_part->part_info.partition_id}
+    , partition_id{future_part->part_info.getPartitionId()}
     , result_part_name{future_part->name}
     , result_part_path{future_part->path}
     , result_part_info{future_part->part_info}
     , num_parts{future_part->parts.size()}
-    , max_untracked_memory(max_untracked_memory_)
-    , query_id(table_id.getShortName() + "::" + result_part_name)
     , thread_id{getThreadId()}
     , merge_type{future_part->merge_type}
     , merge_algorithm{MergeAlgorithm::Undecided}
+    , num_parts_metric_increment(CurrentMetrics::MergeParts, num_parts)
 {
+    auto format_version = MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING;
+    if (result_part_name != result_part_info.getPartNameV1())
+        format_version = MERGE_TREE_DATA_OLD_FORMAT_VERSION;
+
+    /// FIXME why do we need a merge list element for projection parts at all?
+    bool is_fake_projection_part = future_part->part_info == FAKE_RESULT_PART_FOR_PROJECTION;
+
+    size_t normal_parts_count = 0;
     for (const auto & source_part : future_part->parts)
     {
+        if (!is_fake_projection_part && !source_part->getParentPart())
+        {
+            ++normal_parts_count;
+            if (!result_part_info.contains(MergeTreePartInfo::fromPartName(source_part->name, format_version)))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Source part {} is not covered by result part {}", source_part->name, result_part_info.getPartNameV1());
+        }
+
         source_part_names.emplace_back(source_part->name);
-        source_part_paths.emplace_back(source_part->getFullPath());
+        source_part_paths.emplace_back(source_part->getDataPartStorage().getFullPath());
 
         total_size_bytes_compressed += source_part->getBytesOnDisk();
+        total_size_bytes_uncompressed += source_part->getTotalColumnsSize().data_uncompressed;
         total_size_marks += source_part->getMarksCount();
-        total_rows_count += source_part->index_granularity.getTotalRows();
+        total_rows_count += source_part->rows_count;
     }
 
     if (!future_part->parts.empty())
     {
         source_data_version = future_part->parts[0]->info.getDataVersion();
-        is_mutation = (result_part_info.getDataVersion() != source_data_version);
+        is_mutation = (result_part_info.level == future_part->parts[0]->info.level) && !is_fake_projection_part;
+
+        const auto & part = future_part->parts[0];
+        partition = part->partition.serializeToString(*part);
     }
 
-    memory_tracker.setDescription("Mutate/Merge");
-    memory_tracker.setProfilerStep(memory_profiler_step);
-    memory_tracker.setSampleProbability(memory_profiler_sample_probability);
+    if (!is_fake_projection_part && is_mutation && normal_parts_count != 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Got {} source parts for mutation {}: {}", future_part->parts.size(),
+                        result_part_info.getPartNameV1(), fmt::join(source_part_names, ", "));
+
+    thread_group = ThreadGroup::createForMergeMutate(context);
 }
 
 MergeInfo MergeListElement::getInfo() const
@@ -108,11 +87,13 @@ MergeInfo MergeListElement::getInfo() const
     res.result_part_name = result_part_name;
     res.result_part_path = result_part_path;
     res.partition_id = partition_id;
+    res.partition = partition;
     res.is_mutation = is_mutation;
     res.elapsed = watch.elapsedSeconds();
     res.progress = progress.load(std::memory_order_relaxed);
     res.num_parts = num_parts;
     res.total_size_bytes_compressed = total_size_bytes_compressed;
+    res.total_size_bytes_uncompressed = total_size_bytes_uncompressed;
     res.total_size_marks = total_size_marks;
     res.total_rows_count = total_rows_count;
     res.bytes_read_uncompressed = bytes_read_uncompressed.load(std::memory_order_relaxed);
@@ -120,7 +101,7 @@ MergeInfo MergeListElement::getInfo() const
     res.rows_read = rows_read.load(std::memory_order_relaxed);
     res.rows_written = rows_written.load(std::memory_order_relaxed);
     res.columns_written = columns_written.load(std::memory_order_relaxed);
-    res.memory_usage = memory_tracker.get();
+    res.memory_usage = getMemoryTracker().get();
     res.thread_id = thread_id;
     res.merge_type = toString(merge_type);
     res.merge_algorithm = toString(merge_algorithm.load(std::memory_order_relaxed));
@@ -131,10 +112,31 @@ MergeInfo MergeListElement::getInfo() const
     for (const auto & source_part_path : source_part_paths)
         res.source_part_paths.emplace_back(source_part_path);
 
+    {
+        std::lock_guard lock(projection_introspection_mutex);
+        res.current_projection = current_projection;
+        for (const auto & name : projections_done)
+            res.projections_completed.emplace_back(name);
+        for (const auto & name : projections_pending)
+            res.projections_remaining.emplace_back(name);
+    }
+    res.current_projection_progress = current_projection_progress.load(std::memory_order_relaxed);
+    res.current_projection_parts_merging = current_projection_parts_merging.load(std::memory_order_relaxed);
+    res.current_projection_parts_remaining = current_projection_parts_remaining.load(std::memory_order_relaxed);
+
     return res;
 }
 
-MergeListElement::~MergeListElement() = default;
+const MemoryTracker & MergeListElement::getMemoryTracker() const
+{
+    return thread_group->memory_tracker;
+}
 
+MergeListElement::~MergeListElement()
+{
+    /// The part produced goes to the table; also marks the caller for an `OPTIMIZE` merging inline.
+    thread_group->memory_tracker.setDriftExpected();
+    setCurrentQueryMemoryDriftExpected();
+}
 
 }

@@ -1,24 +1,21 @@
 #pragma once
 
-#include <unordered_set>
-
-#include <Parsers/IAST.h>
+#include <Core/SettingsEnums.h>
 #include <Interpreters/InDepthNodeVisitor.h>
-
-#include <Core/Settings.h>
-#include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/IAST_fwd.h>
 
 namespace DB
 {
 
 class ASTFunction;
+class ASTSelectWithUnionQuery;
 
 class NormalizeSelectWithUnionQueryMatcher
 {
 public:
     struct Data
     {
-        const UnionMode & union_default_mode;
+        const SetOperationMode union_default_mode;
     };
 
     static void getSelectsFromUnionListNode(ASTPtr ast_select, ASTs & selects);

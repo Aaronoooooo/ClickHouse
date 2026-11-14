@@ -18,19 +18,25 @@ namespace DB
   * INSERT INTO [db.]table (c1, c2, c3) FORMAT format \n ...
   * INSERT INTO [db.]table FORMAT format \n ...
   *
-  * Insert the result of the SELECT or WATCH query.
-  * INSERT INTO [db.]table (c1, c2, c3) SELECT | WATCH  ...
-  * INSERT INTO [db.]table SELECT | WATCH ...
+  * Insert the result of the SELECT query.
+  * INSERT INTO [db.]table (c1, c2, c3) SELECT ...
+  * INSERT INTO [db.]table SELECT ...
   */
 class ParserInsertQuery : public IParserBase
 {
 private:
     const char * end;
+    bool allow_settings_after_format_in_insert;
 
     const char * getName() const override { return "INSERT query"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
 public:
-    explicit ParserInsertQuery(const char * end_) : end(end_) {}
+    explicit ParserInsertQuery(const char * end_, bool allow_settings_after_format_in_insert_)
+        : end(end_)
+        , allow_settings_after_format_in_insert(allow_settings_after_format_in_insert_)
+    {}
+
+    std::map<String, Documentation> getDocumentation() const override;
 };
 
 /** Insert accepts an identifier and an asterisk with variants.

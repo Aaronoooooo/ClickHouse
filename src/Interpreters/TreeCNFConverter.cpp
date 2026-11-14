@@ -3,6 +3,7 @@
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Common/checkStackSize.h>
+#include <IO/Operators.h>
 
 
 namespace DB
@@ -26,7 +27,7 @@ bool isLogicalFunction(const ASTFunction & func)
 size_t countAtoms(const ASTPtr & node)
 {
     checkStackSize();
-    if (node->as<ASTIdentifier>())
+    if (node->as<ASTIdentifier>() || node->as<ASTLiteral>())
         return 1;
 
     const auto * func = node->as<ASTFunction>();
@@ -48,13 +49,13 @@ void splitMultiLogic(ASTPtr & node)
     if (func && (func->name == "and" || func->name == "or"))
     {
         if (func->arguments->children.size() < 2)
-            throw Exception("Bad AND or OR function. Expected at least 2 arguments", ErrorCodes::INCORRECT_QUERY);
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "Bad AND or OR function. Expected at least 2 arguments");
 
         if (func->arguments->children.size() > 2)
         {
             ASTPtr res = func->arguments->children[0]->clone();
             for (size_t i = 1; i < func->arguments->children.size(); ++i)
-                res = makeASTFunction(func->name, res, func->arguments->children[i]->clone());
+                res = makeASTOperator(func->name, res, func->arguments->children[i]->clone());
 
             node = res;
         }
@@ -81,10 +82,10 @@ void traversePushNot(ASTPtr & node, bool add_negation)
         if (add_negation)
         {
             if (func->arguments->children.size() != 2)
-                throw Exception("Bad AND or OR function. Expected at least 2 arguments", ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Bad AND or OR function. Expected at least 2 arguments");
 
             /// apply De Morgan's Law
-            node = makeASTFunction(
+            node = makeASTOperator(
                 (func->name == "and" ? "or" : "and"),
                 func->arguments->children[0]->clone(),
                 func->arguments->children[1]->clone());
@@ -97,7 +98,7 @@ void traversePushNot(ASTPtr & node, bool add_negation)
     else if (func && func->name == "not")
     {
         if (func->arguments->children.size() != 1)
-            throw Exception("Bad NOT function. Expected 1 argument", ErrorCodes::INCORRECT_QUERY);
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "Bad NOT function. Expected 1 argument");
         /// delete NOT
         node = func->arguments->children[0]->clone();
 
@@ -106,7 +107,7 @@ void traversePushNot(ASTPtr & node, bool add_negation)
     else
     {
         if (add_negation)
-            node = makeASTFunction("not", node->clone());
+            node = makeASTOperator("not", node->clone());
     }
 }
 
@@ -128,7 +129,7 @@ bool traversePushOr(ASTPtr & node, size_t num_atoms, size_t max_atoms)
 
     if (func && func->name == "or")
     {
-        assert(func->arguments->children.size() == 2);
+        chassert(func->arguments->children.size() == 2);
         size_t and_node_id = func->arguments->children.size();
         for (size_t i = 0; i < func->arguments->children.size(); ++i)
         {
@@ -149,10 +150,10 @@ bool traversePushOr(ASTPtr & node, size_t num_atoms, size_t max_atoms)
         auto c = and_func->arguments->children[1];
 
         /// apply the distributive law ( a or (b and c) -> (a or b) and (a or c) )
-        node = makeASTFunction(
+        node = makeASTOperator(
             "and",
-            makeASTFunction("or", a->clone(), b),
-            makeASTFunction("or", a, c));
+            makeASTOperator("or", a->clone(), b),
+            makeASTOperator("or", a, c));
 
         /// Count all atoms from 'a', because it was cloned.
         num_atoms += countAtoms(a);
@@ -188,12 +189,12 @@ void traverseCNF(const ASTPtr & node, CNFQuery::AndGroup & and_group, CNFQuery::
     else if (func && func->name == "not")
     {
         if (func->arguments->children.size() != 1)
-            throw Exception("Bad NOT function. Expected 1 argument", ErrorCodes::INCORRECT_QUERY);
-        or_group.insert(CNFQuery::AtomicFormula{true, func->arguments->children.front()});
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "Bad NOT function. Expected 1 argument");
+        or_group.insert(CNFQueryAtomicFormula{true, func->arguments->children.front()});
     }
     else
     {
-        or_group.insert(CNFQuery::AtomicFormula{false, node});
+        or_group.insert(CNFQueryAtomicFormula{false, node});
     }
 }
 
@@ -208,7 +209,7 @@ void traverseCNF(const ASTPtr & node, CNFQuery::AndGroup & result)
 }
 
 std::optional<CNFQuery> TreeCNFConverter::tryConvertToCNF(
-    const ASTPtr & query, size_t max_growth_multipler)
+    const IAST * query, size_t max_growth_multiplier)
 {
     auto cnf = query->clone();
     size_t num_atoms = countAtoms(cnf);
@@ -216,8 +217,8 @@ std::optional<CNFQuery> TreeCNFConverter::tryConvertToCNF(
     splitMultiLogic(cnf);
     traversePushNot(cnf, false);
 
-    size_t max_atoms = max_growth_multipler
-        ? std::max(MAX_ATOMS_WITHOUT_CHECK, num_atoms * max_growth_multipler)
+    size_t max_atoms = max_growth_multiplier
+        ? std::max(MAX_ATOMS_WITHOUT_CHECK, num_atoms * max_growth_multiplier)
         : 0;
 
     if (!traversePushOr(cnf, num_atoms, max_atoms))
@@ -232,13 +233,14 @@ std::optional<CNFQuery> TreeCNFConverter::tryConvertToCNF(
 }
 
 CNFQuery TreeCNFConverter::toCNF(
-    const ASTPtr & query, size_t max_growth_multipler)
+    const IAST * query, size_t max_growth_multiplier)
 {
-    auto cnf = tryConvertToCNF(query, max_growth_multipler);
+    auto cnf = tryConvertToCNF(query, max_growth_multiplier);
     if (!cnf)
         throw Exception(ErrorCodes::TOO_MANY_TEMPORARY_COLUMNS,
-            "Cannot expression '{}' to CNF, because it produces to many clauses."
-            "Size of formula inCNF can be exponential of size of source formula.");
+            "Cannot convert expression '{}' to CNF, because it produces to many clauses. "
+            "Size of boolean formula in CNF can be exponential of size of source formula.",
+            query->formatForErrorMessage());
 
     return *cnf;
 }
@@ -255,18 +257,18 @@ ASTPtr TreeCNFConverter::fromCNF(const CNFQuery & cnf)
         if (group.size() == 1)
         {
             if ((*group.begin()).negative)
-                or_groups.push_back(makeASTFunction("not", (*group.begin()).ast->clone()));
+                or_groups.push_back(makeASTOperator("not", (*group.begin()).ast->clone()));
             else
                 or_groups.push_back((*group.begin()).ast->clone());
         }
         else if (group.size() > 1)
         {
-            or_groups.push_back(makeASTFunction("or"));
+            or_groups.push_back(makeASTOperator("or"));
             auto * func = or_groups.back()->as<ASTFunction>();
             for (const auto & atom : group)
             {
                 if (atom.negative)
-                    func->arguments->children.push_back(makeASTFunction("not", atom.ast->clone()));
+                    func->arguments->children.push_back(makeASTOperator("not", atom.ast->clone()));
                 else
                     func->arguments->children.push_back(atom.ast->clone());
             }
@@ -276,7 +278,7 @@ ASTPtr TreeCNFConverter::fromCNF(const CNFQuery & cnf)
     if (or_groups.size() == 1)
         return or_groups.front();
 
-    ASTPtr res = makeASTFunction("and");
+    ASTPtr res = makeASTOperator("and");
     auto * func = res->as<ASTFunction>();
     for (const auto & group : or_groups)
         func->arguments->children.push_back(group);
@@ -284,7 +286,7 @@ ASTPtr TreeCNFConverter::fromCNF(const CNFQuery & cnf)
     return res;
 }
 
-static void pushPullNotInAtom(CNFQuery::AtomicFormula & atom, const std::unordered_map<std::string, std::string> & inverse_relations)
+static void pushPullNotInAtom(CNFQueryAtomicFormula & atom, const std::unordered_map<std::string, std::string> & inverse_relations)
 {
     auto * func = atom.ast->as<ASTFunction>();
     if (!func)
@@ -300,7 +302,7 @@ static void pushPullNotInAtom(CNFQuery::AtomicFormula & atom, const std::unorder
     }
 }
 
-static void pullNotOut(CNFQuery::AtomicFormula & atom)
+static void pullNotOut(CNFQueryAtomicFormula & atom)
 {
     static const std::unordered_map<std::string, std::string> inverse_relations = {
         {"notEquals", "equals"},
@@ -308,13 +310,14 @@ static void pullNotOut(CNFQuery::AtomicFormula & atom)
         {"greater", "lessOrEquals"},
         {"notIn", "in"},
         {"notLike", "like"},
+        {"notSimilarTo", "similarTo"},
         {"notEmpty", "empty"},
     };
 
     pushPullNotInAtom(atom, inverse_relations);
 }
 
-void pushNotIn(CNFQuery::AtomicFormula & atom)
+void pushNotIn(CNFQueryAtomicFormula & atom)
 {
     if (!atom.negative)
         return;
@@ -325,12 +328,14 @@ void pushNotIn(CNFQuery::AtomicFormula & atom)
         {"lessOrEquals", "greater"},
         {"in", "notIn"},
         {"like", "notLike"},
+        {"similarTo", "notSimilarTo"},
         {"empty", "notEmpty"},
         {"notEquals", "equals"},
         {"greaterOrEquals", "less"},
         {"greater", "lessOrEquals"},
         {"notIn", "in"},
         {"notLike", "like"},
+        {"notSimilarTo", "similarTo"},
         {"notEmpty", "empty"},
     };
 
@@ -339,104 +344,37 @@ void pushNotIn(CNFQuery::AtomicFormula & atom)
 
 CNFQuery & CNFQuery::pullNotOutFunctions()
 {
-    transformAtoms([](const AtomicFormula & atom) -> AtomicFormula
+    transformAtoms([](const CNFQueryAtomicFormula & atom) -> CNFQueryAtomicFormula
                     {
-                        AtomicFormula result{atom.negative, atom.ast->clone()};
+                        CNFQueryAtomicFormula result{atom.negative, atom.ast->clone()};
                         pullNotOut(result);
                         return result;
                     });
     return *this;
 }
 
-CNFQuery & CNFQuery::pushNotInFuntions()
+CNFQuery & CNFQuery::pushNotInFunctions()
 {
-    transformAtoms([](const AtomicFormula & atom) -> AtomicFormula
+    transformAtoms([](const CNFQueryAtomicFormula & atom) -> CNFQueryAtomicFormula
                    {
-                       AtomicFormula result{atom.negative, atom.ast->clone()};
+                       CNFQueryAtomicFormula result{atom.negative, atom.ast->clone()};
                        pushNotIn(result);
                        return result;
                    });
     return *this;
 }
 
-namespace
-{
-    CNFQuery::AndGroup reduceOnce(const CNFQuery::AndGroup & groups)
-    {
-        CNFQuery::AndGroup result;
-        for (const CNFQuery::OrGroup & group : groups)
-        {
-            CNFQuery::OrGroup copy(group);
-            bool inserted = false;
-            for (const CNFQuery::AtomicFormula & atom : group)
-            {
-                copy.erase(atom);
-                CNFQuery::AtomicFormula negative_atom(atom);
-                negative_atom.negative = !atom.negative;
-                copy.insert(negative_atom);
-
-                if (groups.contains(copy))
-                {
-                    copy.erase(negative_atom);
-                    result.insert(copy);
-                    inserted = true;
-                    break;
-                }
-
-                copy.erase(negative_atom);
-                copy.insert(atom);
-            }
-            if (!inserted)
-                result.insert(group);
-        }
-        return result;
-    }
-
-    bool isSubset(const CNFQuery::OrGroup & left, const CNFQuery::OrGroup & right)
-    {
-        if (left.size() > right.size())
-            return false;
-        for (const auto & elem : left)
-            if (!right.contains(elem))
-                return false;
-        return true;
-    }
-
-    CNFQuery::AndGroup filterSubsets(const CNFQuery::AndGroup & groups)
-    {
-        CNFQuery::AndGroup result;
-        for (const CNFQuery::OrGroup & group : groups)
-        {
-            bool insert = true;
-
-            for (const CNFQuery::OrGroup & other_group : groups)
-            {
-                if (isSubset(other_group, group) && group != other_group)
-                {
-                    insert = false;
-                    break;
-                }
-            }
-
-            if (insert)
-                result.insert(group);
-        }
-        return result;
-    }
-}
-
 CNFQuery & CNFQuery::reduce()
 {
     while (true)
     {
-        AndGroup new_statements = reduceOnce(statements);
+        AndGroup new_statements = reduceOnceCNFStatements(statements);
         if (statements == new_statements)
         {
-            statements = filterSubsets(statements);
+            statements = filterCNFSubsets(statements);
             return *this;
         }
-        else
-            statements = new_statements;
+        statements = new_statements;
     }
 }
 

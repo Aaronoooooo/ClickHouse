@@ -1,9 +1,11 @@
 #pragma once
 
+#include <Common/Exception.h>
 #include <Poco/Timestamp.h>
-#include "IDictionarySource.h"
+#include <QueryPipeline/BlockIO.h>
+#include <Dictionaries/IDictionarySource.h>
 #include <Core/Block.h>
-#include <Interpreters/Context.h>
+#include <Interpreters/Context_fwd.h>
 
 namespace DB
 {
@@ -21,19 +23,19 @@ public:
 
     FileDictionarySource(const FileDictionarySource & other);
 
-    Pipe loadAll() override;
+    BlockIO loadAll() override;
 
-    Pipe loadUpdatedAll() override
+    BlockIO loadUpdatedAll() override
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method loadUpdatedAll is unsupported for FileDictionarySource");
     }
 
-    Pipe loadIds(const std::vector<UInt64> & /*ids*/) override
+    BlockIO loadIds(const VectorWithMemoryTracking<UInt64> & /*ids*/) override
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method loadIds is unsupported for FileDictionarySource");
     }
 
-    Pipe loadKeys(const Columns & /*key_columns*/, const std::vector<size_t> & /*requested_rows*/) override
+    BlockIO loadKeys(const Columns & /*key_columns*/, const VectorWithMemoryTracking<size_t> & /*requested_rows*/) override
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method loadKeys is unsupported for FileDictionarySource");
     }
@@ -51,7 +53,7 @@ public:
     ///Not supported for FileDictionarySource
     bool hasUpdateField() const override { return false; }
 
-    DictionarySourcePtr clone() const override { return std::make_unique<FileDictionarySource>(*this); }
+    DictionarySourcePtr clone() const override { return std::make_shared<FileDictionarySource>(*this); }
 
     std::string toString() const override;
 

@@ -1,21 +1,30 @@
-#include <Storages/StorageSet.h>
-#include <Storages/StorageFactory.h>
-#include <IO/ReadBufferFromFile.h>
-#include <Compression/CompressedReadBuffer.h>
-#include <IO/WriteBufferFromFile.h>
-#include <Compression/CompressedWriteBuffer.h>
-#include <Formats/NativeWriter.h>
-#include <Formats/NativeReader.h>
-#include <QueryPipeline/ProfileInfo.h>
-#include <Disks/IDisk.h>
-#include <Common/formatReadable.h>
-#include <Common/StringUtils/StringUtils.h>
-#include <Interpreters/Set.h>
-#include <Interpreters/Context.h>
-#include <Processors/Sinks/SinkToStorage.h>
-#include <Parsers/ASTCreateQuery.h>
-#include <Parsers/ASTLiteral.h>
 #include <filesystem>
+#include <optional>
+#include <Access/Common/AccessFlags.h>
+#include <Access/EnabledRowPolicies.h>
+#include <Compression/CompressedReadBuffer.h>
+#include <Compression/CompressedWriteBuffer.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeString.h>
+#include <Disks/IDisk.h>
+#include <Formats/NativeReader.h>
+#include <Formats/NativeWriter.h>
+#include <IO/ReadBufferFromFileBase.h>
+#include <IO/WriteBufferFromFile.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/Set.h>
+#include <Parsers/ASTCreateQuery.h>
+#include <Processors/Sinks/SinkToStorage.h>
+#include <QueryPipeline/ProfileInfo.h>
+#include <Storages/SetSettings.h>
+#include <Storages/StorageFactory.h>
+#include <Storages/StorageSet.h>
+#include <Common/CurrentThread.h>
+#include <Common/MemoryTrackerBlockerInThread.h>
+#include <Common/MemoryTrackerUtils.h>
+#include <Common/StringUtils.h>
+#include <Common/formatReadable.h>
+#include <Common/logger_useful.h>
 
 namespace fs = std::filesystem;
 
@@ -23,39 +32,43 @@ namespace fs = std::filesystem;
 namespace DB
 {
 
+namespace SetSetting
+{
+    extern const SetSettingsString disk;
+    extern const SetSettingsBool persistent;
+}
+
 namespace ErrorCodes
 {
+    extern const int ACCESS_DENIED;
+    extern const int INCORRECT_FILE_NAME;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
-
-namespace ErrorCodes
-{
-    extern const int INCORRECT_FILE_NAME;
-}
-
-
-class SetOrJoinSink : public SinkToStorage, WithContext
+class SetOrJoinSink final : public SinkToStorage, WithContext
 {
 public:
     SetOrJoinSink(
         ContextPtr ctx, StorageSetOrJoinBase & table_, const StorageMetadataPtr & metadata_snapshot_,
         const String & backup_path_, const String & backup_tmp_path_,
         const String & backup_file_name_, bool persistent_);
+    ~SetOrJoinSink() override;
 
     String getName() const override { return "SetOrJoinSink"; }
-    void consume(Chunk chunk) override;
+    void consume(Chunk & chunk) override;
     void onFinish() override;
 
 private:
+    void cancelBuffers() noexcept;
+
     StorageSetOrJoinBase & table;
     StorageMetadataPtr metadata_snapshot;
     String backup_path;
     String backup_tmp_path;
     String backup_file_name;
     std::unique_ptr<WriteBufferFromFileBase> backup_buf;
-    CompressedWriteBuffer compressed_backup_buf;
-    NativeWriter backup_stream;
+    std::optional<CompressedWriteBuffer> compressed_backup_buf;
+    std::optional<NativeWriter> backup_stream;
     bool persistent;
 };
 
@@ -68,38 +81,57 @@ SetOrJoinSink::SetOrJoinSink(
     const String & backup_tmp_path_,
     const String & backup_file_name_,
     bool persistent_)
-    : SinkToStorage(metadata_snapshot_->getSampleBlock())
+    : SinkToStorage(std::make_shared<const Block>(metadata_snapshot_->getSampleBlock()))
     , WithContext(ctx)
     , table(table_)
     , metadata_snapshot(metadata_snapshot_)
     , backup_path(backup_path_)
     , backup_tmp_path(backup_tmp_path_)
     , backup_file_name(backup_file_name_)
-    , backup_buf(table_.disk->writeFile(fs::path(backup_tmp_path) / backup_file_name))
-    , compressed_backup_buf(*backup_buf)
-    , backup_stream(compressed_backup_buf, 0, metadata_snapshot->getSampleBlock())
     , persistent(persistent_)
 {
 }
 
-void SetOrJoinSink::consume(Chunk chunk)
+SetOrJoinSink::~SetOrJoinSink()
 {
-    /// Sort columns in the block. This is necessary, since Set and Join count on the same column order in different blocks.
-    Block sorted_block = getHeader().cloneWithColumns(chunk.detachColumns()).sortColumns();
+    if (isCancelled())
+        cancelBuffers();
+}
 
-    table.insertBlock(sorted_block, getContext());
+void SetOrJoinSink::cancelBuffers() noexcept
+{
+    if (compressed_backup_buf)
+        compressed_backup_buf->cancel();
+    if (backup_buf)
+        backup_buf->cancel();
+}
+
+
+void SetOrJoinSink::consume(Chunk & chunk)
+{
+    Block block = getHeader().cloneWithColumns(chunk.getColumns());
+
+    table.insertBlock(block, getContext());
     if (persistent)
-        backup_stream.write(sorted_block);
+    {
+        if (!backup_buf)
+        {
+            backup_buf = table.disk->writeFile(fs::path(backup_tmp_path) / backup_file_name);
+            compressed_backup_buf.emplace(*backup_buf);
+            backup_stream.emplace(*compressed_backup_buf, 0, std::make_shared<const Block>(metadata_snapshot->getSampleBlock()));
+        }
+        backup_stream->write(block);
+    }
 }
 
 void SetOrJoinSink::onFinish()
 {
     table.finishInsert();
-    if (persistent)
+    setCurrentQueryMemoryDriftExpected();
+    if (backup_buf)
     {
-        backup_stream.flush();
-        compressed_backup_buf.next();
-        backup_buf->next();
+        backup_stream->flush();
+        compressed_backup_buf->finalize();
         backup_buf->finalize();
 
         table.disk->replaceFile(fs::path(backup_tmp_path) / backup_file_name, fs::path(backup_path) / backup_file_name);
@@ -107,7 +139,7 @@ void SetOrJoinSink::onFinish()
 }
 
 
-SinkToStoragePtr StorageSetOrJoinBase::write(const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, ContextPtr context)
+SinkToStoragePtr StorageSetOrJoinBase::write(const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, ContextPtr context, bool /*async_insert*/)
 {
     UInt64 id = ++increment;
     return std::make_shared<SetOrJoinSink>(
@@ -123,19 +155,27 @@ StorageSetOrJoinBase::StorageSetOrJoinBase(
     const ConstraintsDescription & constraints_,
     const String & comment,
     bool persistent_)
-    : IStorage(table_id_), disk(disk_), persistent(persistent_)
+    : StorageWithCommonVirtualColumns(table_id_), disk(disk_), persistent(persistent_)
 {
     StorageInMemoryMetadata storage_metadata;
     storage_metadata.setColumns(columns_);
     storage_metadata.setConstraints(constraints_);
     storage_metadata.setComment(comment);
+    storage_metadata.setVirtuals(createVirtuals());
     setInMemoryMetadata(storage_metadata);
 
-
     if (relative_path_.empty())
-        throw Exception("Join and Set storages require data path", ErrorCodes::INCORRECT_FILE_NAME);
+        throw Exception(ErrorCodes::INCORRECT_FILE_NAME, "Join and Set storages require data path");
 
     path = relative_path_;
+}
+
+VirtualColumnsDescription StorageSetOrJoinBase::createVirtuals()
+{
+    VirtualColumnsDescription desc;
+    desc.addEphemeral("_table", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "", VirtualsMaterializationPlace::Plan);
+    desc.addEphemeral("_database", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "", VirtualsMaterializationPlace::Plan);
+    return desc;
 }
 
 
@@ -148,56 +188,135 @@ StorageSet::StorageSet(
     const String & comment,
     bool persistent_)
     : StorageSetOrJoinBase{disk_, relative_path_, table_id_, columns_, constraints_, comment, persistent_}
-    , set(std::make_shared<Set>(SizeLimits(), false, true))
+    , set(std::make_shared<Set>(SizeLimits(), 0, true))
 {
-
-    Block header = getInMemoryMetadataPtr()->getSampleBlock();
-    header = header.sortColumns();
+    auto metadata_snapshot = getInMemoryMetadataPtr(CurrentThread::tryGetQueryContext(), false);
+    Block header = metadata_snapshot->getSampleBlock();
     set->setHeader(header.getColumnsWithTypeAndName());
 
     restore();
 }
 
 
-void StorageSet::insertBlock(const Block & block, ContextPtr) { set->insertFromBlock(block.getColumnsWithTypeAndName()); }
-void StorageSet::finishInsert() { set->finishInsert(); }
+SetPtr StorageSet::getSet() const
+{
+    std::lock_guard lock(mutex);
+    return set;
+}
 
-size_t StorageSet::getSize(ContextPtr) const { return set->getTotalRowCount(); }
-std::optional<UInt64> StorageSet::totalRows(const Settings &) const { return set->getTotalRowCount(); }
-std::optional<UInt64> StorageSet::totalBytes(const Settings &) const { return set->getTotalByteCount(); }
+
+void StorageSet::checkNoRowPolicy(const ContextPtr & context) const
+{
+    auto storage_id = getStorageID();
+    auto metadata_snapshot = getInMemoryMetadataPtr(context, false);
+    context->checkAccess(AccessType::SELECT, storage_id, metadata_snapshot->getColumns().getNamesOfPhysical());
+
+    auto row_policy_filter
+        = context->getRowPolicyFilter(storage_id.getDatabaseName(), storage_id.getTableName(), RowPolicyFilterType::SELECT_FILTER);
+
+    if (row_policy_filter && !row_policy_filter->isAlwaysTrue())
+        throw Exception(
+            ErrorCodes::ACCESS_DENIED,
+            "Cannot use table {} on the right side of IN because a row policy applies to it. "
+            "The Set engine has no read path that could filter the rows",
+            storage_id.getNameForLogs());
+}
+
+
+void StorageSet::insertBlock(const Block & block, ContextPtr)
+{
+    SetPtr current_set;
+    {
+        std::lock_guard lock(mutex);
+        current_set = set;
+    }
+    current_set->insertFromBlock(block.getColumnsWithTypeAndName());
+}
+
+void StorageSet::finishInsert()
+{
+    SetPtr current_set;
+    {
+        std::lock_guard lock(mutex);
+        current_set = set;
+    }
+    current_set->finishInsert();
+}
+
+size_t StorageSet::getSize(ContextPtr) const
+{
+    SetPtr current_set;
+    {
+        std::lock_guard lock(mutex);
+        current_set = set;
+    }
+    return current_set->getTotalRowCount();
+}
+
+std::optional<UInt64> StorageSet::totalRows(ContextPtr) const
+{
+    SetPtr current_set;
+    {
+        std::lock_guard lock(mutex);
+        current_set = set;
+    }
+    return current_set->getTotalRowCount();
+}
+
+std::optional<UInt64> StorageSet::totalBytes(ContextPtr) const
+{
+    SetPtr current_set;
+    {
+        std::lock_guard lock(mutex);
+        current_set = set;
+    }
+    return current_set->getTotalByteCount();
+}
 
 void StorageSet::truncate(const ASTPtr &, const StorageMetadataPtr & metadata_snapshot, ContextPtr, TableExclusiveLockHolder &)
 {
-    disk->removeRecursive(path);
+    if (disk->existsDirectory(path))
+        disk->removeRecursive(path);
+    else
+        LOG_INFO(getLogger("StorageSet"), "Path {} is already removed from disk {}", path, disk->getName());
+
     disk->createDirectories(path);
     disk->createDirectories(fs::path(path) / "tmp/");
 
     Block header = metadata_snapshot->getSampleBlock();
-    header = header.sortColumns();
 
     increment = 0;
-    set = std::make_shared<Set>(SizeLimits(), false, true);
-    set->setHeader(header.getColumnsWithTypeAndName());
+
+    auto new_set = std::make_shared<Set>(SizeLimits(), 0, true);
+    new_set->setHeader(header.getColumnsWithTypeAndName());
+    {
+        /// Table data belongs to the server, not to the query releasing it.
+        MemoryTrackerBlockerInThread table_data_not_charged_to_the_query;
+        std::lock_guard lock(mutex);
+        set = new_set;
+    }
 }
 
 
 void StorageSetOrJoinBase::restore()
 {
-    if (!disk->exists(fs::path(path) / "tmp/"))
+    if (!disk->existsDirectory(fs::path(path) / "tmp"))
     {
-        disk->createDirectories(fs::path(path) / "tmp/");
+        disk->createDirectories(fs::path(path) / "tmp");
         return;
     }
 
     static const char * file_suffix = ".bin";
     static const auto file_suffix_size = strlen(".bin");
 
+    using FilePriority = std::pair<UInt64, String>;
+    std::priority_queue<FilePriority, std::vector<FilePriority>, std::greater<>> backup_files;
     for (auto dir_it{disk->iterateDirectory(path)}; dir_it->isValid(); dir_it->next())
     {
         const auto & name = dir_it->name();
         const auto & file_path = dir_it->path();
 
-        if (disk->isFile(file_path)
+        if (disk->existsFile(file_path)
             && endsWith(name, file_suffix)
             && disk->getFileSize(file_path) > 0)
         {
@@ -206,8 +325,17 @@ void StorageSetOrJoinBase::restore()
             if (file_num > increment)
                 increment = file_num;
 
-            restoreFromFile(dir_it->path());
+            backup_files.push({file_num, file_path});
         }
+    }
+
+    /// Restore in the same order as blocks were written
+    /// It may be important for storage Join, user expect to get the first row (unless `join_any_take_last_row` setting is set)
+    /// but after restart we may have different order of blocks in memory.
+    while (!backup_files.empty())
+    {
+        restoreFromFile(backup_files.top().second);
+        backup_files.pop();
     }
 }
 
@@ -215,12 +343,12 @@ void StorageSetOrJoinBase::restore()
 void StorageSetOrJoinBase::restoreFromFile(const String & file_path)
 {
     ContextPtr ctx = nullptr;
-    auto backup_buf = disk->readFile(file_path);
+    auto backup_buf = disk->readFile(file_path, getReadSettings());
     CompressedReadBuffer compressed_backup_buf(*backup_buf);
     NativeReader backup_stream(compressed_backup_buf, 0);
 
     ProfileInfo info;
-    while (Block block = backup_stream.read())
+    for (Block block = backup_stream.read(); !block.empty(); block = backup_stream.read())
     {
         info.update(block);
         insertBlock(block, ctx);
@@ -229,7 +357,7 @@ void StorageSetOrJoinBase::restoreFromFile(const String & file_path)
     finishInsert();
 
     /// TODO Add speed, compressed bytes, data volume in memory, compression ratio ... Generalize all statistics logging in project.
-    LOG_INFO(&Poco::Logger::get("StorageSetOrJoinBase"), "Loaded from backup file {}. {} rows, {}. State has {} unique rows.",
+    LOG_INFO(getLogger("StorageSetOrJoinBase"), "Loaded from backup file {}. {} rows, {}. State has {} unique rows.",
         file_path, info.rows, ReadableSize(info.bytes), getSize(ctx));
 }
 
@@ -244,24 +372,58 @@ void StorageSetOrJoinBase::rename(const String & new_path_to_table_data, const S
 }
 
 
+void registerStorageSet(StorageFactory & factory);
 void registerStorageSet(StorageFactory & factory)
 {
     factory.registerStorage("Set", [](const StorageFactory::Arguments & args)
     {
         if (!args.engine_args.empty())
-            throw Exception(
-                "Engine " + args.engine_name + " doesn't support any arguments (" + toString(args.engine_args.size()) + " given)",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Engine {} doesn't support any arguments ({} given)",
+                args.engine_name, args.engine_args.size());
 
         bool has_settings = args.storage_def->settings;
         SetSettings set_settings;
         if (has_settings)
             set_settings.loadFromQuery(*args.storage_def);
 
-        DiskPtr disk = args.getContext()->getDisk(set_settings.disk);
-        return StorageSet::create(
-            disk, args.relative_data_path, args.table_id, args.columns, args.constraints, args.comment, set_settings.persistent);
-    }, StorageFactory::StorageFeatures{ .supports_settings = true, });
+        DiskPtr disk = args.getDisk(set_settings[SetSetting::disk]);
+        return std::make_shared<StorageSet>(
+            disk, args.relative_data_path, args.table_id, args.columns, args.constraints, args.comment, set_settings[SetSetting::persistent]);
+    }, SecretArgumentsSpec{}, StorageFactory::StorageFeatures{ .supports_settings = true, .has_builtin_setting_fn = SetSettings::hasBuiltin, .stores_data_on_disk = true, .supports_temporary = true, },
+    Documentation{
+        .description = R"DOCS_MD(
+<Note>
+In ClickHouse Cloud, if your service was created with a version earlier than 25.4, you will need to set the compatibility to at least 25.4 using  `SET compatibility=25.4`.
+</Note>
+
+A data set that is always in RAM. It is intended for use on the right side of the `IN` operator (see the section "IN operators").
+
+You can use `INSERT` to insert data in the table. New elements will be added to the data set, while duplicates will be ignored.
+But you can't perform `SELECT` from the table. The only way to retrieve data is by using it in the right half of the `IN` operator.
+
+Data is always located in RAM. For `INSERT`, the blocks of inserted data are also written to the directory of tables on the disk. When starting the server, this data is loaded to RAM. In other words, after restarting, the data remains in place.
+
+For a rough server restart, the block of data on the disk might be lost or damaged. In the latter case, you may need to manually delete the file with damaged data.
+
+### Limitations and settings {#join-limitations-and-settings}
+
+When creating a table, the following settings are applied:
+
+#### Persistent {#persistent}
+
+Disables persistency for the Set and [Join](/reference/engines/table-engines/special/join) table engines.
+
+Reduces the I/O overhead. Suitable for scenarios that pursue performance and do not require persistence.
+
+Possible values:
+
+- 1 — Enabled.
+- 0 — Disabled.
+
+Default value: `1`.
+)DOCS_MD",
+        .syntax = "ENGINE = Set",
+        .related = {"Join"}});
 }
 
 

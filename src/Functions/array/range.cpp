@@ -1,25 +1,35 @@
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/getLeastSupertype.h>
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnVector.h>
+#include <Columns/ColumnsCommon.h>
+#include <Core/Settings.h>
 #include <Interpreters/castColumn.h>
 #include <Interpreters/Context.h>
+#include <base/TypeLists.h>
 #include <numeric>
+#include <vector>
 
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsUInt64 function_range_max_elements_in_block;
+}
 
 namespace ErrorCodes
 {
     extern const int ARGUMENT_OUT_OF_BOUND;
     extern const int ILLEGAL_COLUMN;
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int BAD_ARGUMENTS;
 }
 
 
@@ -28,41 +38,64 @@ namespace ErrorCodes
   * range(start, end): [start, end)
   * range(start, end, step): [start, end) with step increments.
   */
-class FunctionRange : public IFunction
+class FunctionRange final : public IFunction
 {
 public:
     static constexpr auto name = "range";
 
     const size_t max_elements;
     static FunctionPtr create(ContextPtr context_) { return std::make_shared<FunctionRange>(std::move(context_)); }
-    explicit FunctionRange(ContextPtr context) : max_elements(context->getSettingsRef().function_range_max_elements_in_block) {}
+    explicit FunctionRange(ContextPtr context) : max_elements(context->getSettingsRef()[Setting::function_range_max_elements_in_block]) { }
 
 private:
+    using TypeListNativeUInt = TypeList<UInt8, UInt16, UInt32, UInt64>;
+    using TypeListNativeSInt = TypeList<Int8, Int16, Int32, Int64>;
+
+    /// Calls try_one<T> for each T in the list, in order, until one returns a non-null column.
+    template <typename... Ts, typename F>
+    static ColumnPtr tryEachType(TypeList<Ts...>, F && try_one)
+    {
+        ColumnPtr res;
+        TypeListUtils::forEach(TypeList<Ts...>{}, [&]<typename T>(TypeList<T>)
+        {
+            if (!res)
+                res = try_one.template operator()<T>();
+        });
+        return res;
+    }
+
     String getName() const override { return name; }
 
     size_t getNumberOfArguments() const override { return 0; }
     bool isVariadic() const override { return true; }
+    bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForConstants() const override { return true; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    /// Authoritative: accepts 1..3 integer (or `IPv4`, in the first two positions) arguments and
+    /// returns an array whose element type is their least common supertype. The result-type
+    /// computation lives in the `rangeResult` type function, which mirrors the historical
+    /// `getReturnTypeImpl`: a `Nullable` argument is stripped (not propagated) around the array,
+    /// an `onlyNull` argument collapses the whole result to a scalar `Nullable(Nothing)`, and an
+    /// `IPv4` counts as `UInt32`. The `Nothing` alternative accepts a bare `NULL` literal in any
+    /// position so `range(NULL)` keeps reaching `rangeResult`.
+    String getSignatureString() const override
     {
-        if (arguments.size() > 3 || arguments.empty())
-        {
-            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
-                "Function {} needs 1..3 arguments; passed {}.",
-                getName(), arguments.size());
-        }
-
-        for (const auto & arg : arguments)
-        {
-            if (!isUnsignedInteger(arg))
-                throw Exception{"Illegal type " + arg->getName() + " of argument of function " + getName(),
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
-        }
-
-        DataTypePtr common_type = getLeastSupertype(arguments);
-        return std::make_shared<DataTypeArray>(common_type);
+        /// One arm per arity: the `rangeResult` type function cannot reference an absent optional
+        /// capture, so the three lengths are spelled out explicitly instead of using `[optional]`.
+        return "(A1 : MaybeNullable(Integer | IPv4) | Nothing) -> rangeResult(A1) "
+               "OR (A1 : MaybeNullable(Integer | IPv4) | Nothing, A2 : MaybeNullable(Integer | IPv4) | Nothing) -> rangeResult(A1, A2) "
+               "OR (A1 : MaybeNullable(Integer | IPv4) | Nothing, A2 : MaybeNullable(Integer | IPv4) | Nothing, A3 : MaybeNullable(Integer) | Nothing) -> rangeResult(A1, A2, A3) "
+               /// A single `NULL` argument makes the result `NULL` whatever the other arguments
+               /// are — the historical `getReturnTypeImpl` returns `Nullable(Nothing)` before it
+               /// looks at any type at all. These trailing arms reproduce that short circuit;
+               /// they are last so that a well-typed call still reports a type mismatch against
+               /// the arms above.
+               "OR (Nothing, Any) -> NULL "
+               "OR (Any, Nothing) -> NULL "
+               "OR (Nothing, Any, Any) -> NULL "
+               "OR (Any, Nothing, Any) -> NULL "
+               "OR (Any, Any, Nothing) -> NULL";
     }
 
     template <typename T>
@@ -72,20 +105,26 @@ private:
         {
             const auto & in_data = in->getData();
             const auto total_values = std::accumulate(std::begin(in_data), std::end(in_data), size_t{},
-                [this] (const size_t lhs, const size_t rhs)
+                [this] (const size_t lhs, const T rhs)
                 {
+                    if (rhs < 0)
+                        throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                        "A call to function {} overflows, only support positive values when only end is provided", getName());
+
                     const auto sum = lhs + rhs;
                     if (sum < lhs)
-                        throw Exception{"A call to function " + getName() + " overflows, investigate the values of arguments you are passing",
-                            ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                        throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                        "A call to function {} overflows, investigate the values "
+                                        "of arguments you are passing", getName());
 
                     return sum;
                 });
 
             if (total_values > max_elements)
-                throw Exception{"A call to function " + getName() + " would produce " + std::to_string(total_values) +
-                    " array elements, which is greater than the allowed maximum of " + std::to_string(max_elements),
-                    ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                "A call to function {} would produce {} array elements, which "
+                                "is greater than the allowed maximum of {}",
+                                getName(), std::to_string(total_values), std::to_string(max_elements));
 
             auto data_col = ColumnVector<T>::create(total_values);
             auto offsets_col = ColumnArray::ColumnOffsets::create(in->size());
@@ -96,7 +135,7 @@ private:
             IColumn::Offset offset{};
             for (size_t row_idx = 0, rows = in->size(); row_idx < rows; ++row_idx)
             {
-                for (size_t elem_idx = 0, elems = in_data[row_idx]; elem_idx < elems; ++elem_idx)
+                for (T elem_idx = 0, elems = in_data[row_idx]; elem_idx < elems; ++elem_idx)
                     out_data[offset + elem_idx] = elem_idx;
 
                 offset += in_data[row_idx];
@@ -105,8 +144,23 @@ private:
 
             return ColumnArray::create(std::move(data_col), std::move(offsets_col));
         }
-        else
-            return nullptr;
+        return nullptr;
+    }
+
+    /// Out of line so ThinLTO cannot inline it into `executeImpl`, where surrounding code decides the
+    /// loop's alignment. The value comes from the index, not an accumulator: ranges here are short, so
+    /// the vectoriser's scalar remainder dominates and independent values fill it better. `iotaWithStep`
+    /// keeps an accumulator because its caller generates whole blocks, where a multiply would cost more.
+    template <typename T>
+    static NO_INLINE void fillConstStartStep(T * out, size_t n, T start, T step)
+    {
+        /// Same as in `iota`: a portable AArch64 build keeps LLVM's default interleave factor of 2,
+        /// while x86-64-v3 is already at 4.
+#if defined(__aarch64__) && !defined(OS_DARWIN)
+#pragma clang loop interleave_count(4)
+#endif
+        for (size_t idx = 0; idx < n; ++idx)
+            out[idx] = static_cast<T>(start + idx * step);
     }
 
     template <typename T>
@@ -121,25 +175,33 @@ private:
 
         size_t total_values = 0;
         size_t pre_values = 0;
+        PODArray<size_t> row_length(input_rows_count);
 
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
-            if (start < end_data[row_idx] && step == 0)
-                throw Exception{"A call to function " + getName() + " overflows, the 3rd argument step can't be zero",
-                            ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+            if (step == 0)
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "A call to function {} overflows, the 3rd argument step can't be zero", getName());
 
-            pre_values += start >= end_data[row_idx] ? 0
-                            : (end_data[row_idx] - start - 1) / step + 1;
+            if (start < end_data[row_idx] && step > 0)
+                row_length[row_idx] = static_cast<size_t>((static_cast<__int128_t>(end_data[row_idx]) - static_cast<__int128_t>(start) - 1) / static_cast<__int128_t>(step) + 1);
+            else if (start > end_data[row_idx] && step < 0)
+                row_length[row_idx] = static_cast<size_t>((static_cast<__int128_t>(end_data[row_idx]) - static_cast<__int128_t>(start) + 1) / static_cast<__int128_t>(step) + 1);
+            else
+                row_length[row_idx] = 0;
+
+            pre_values += row_length[row_idx];
 
             if (pre_values < total_values)
-                throw Exception{"A call to function " + getName() + " overflows, investigate the values of arguments you are passing",
-                            ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                        "A call to function {} overflows, investigate the values "
+                                        "of arguments you are passing", getName());
 
             total_values = pre_values;
             if (total_values > max_elements)
-                throw Exception{"A call to function " + getName() + " would produce " + std::to_string(total_values) +
-                    " array elements, which is greater than the allowed maximum of " + std::to_string(max_elements),
-                    ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                "A call to function {} would produce {} array elements, which "
+                                "is greater than the allowed maximum of {}",
+                                getName(), std::to_string(total_values), std::to_string(max_elements));
         }
 
         auto data_col = ColumnVector<T>::create(total_values);
@@ -151,15 +213,9 @@ private:
         IColumn::Offset offset{};
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
-            for (size_t st = start, ed = end_data[row_idx]; st < ed; st += step)
-            {
-                out_data[offset++] = st;
-
-                if (st > st + step)
-                    throw Exception{"A call to function " + getName() + " overflows, investigate the values of arguments you are passing",
-                                ErrorCodes::ARGUMENT_OUT_OF_BOUND};
-            }
-
+            const size_t n = row_length[row_idx];
+            fillConstStartStep(out_data.data() + offset, n, start, step);
+            offset += n;
             out_offsets[row_idx] = offset;
         }
 
@@ -180,25 +236,33 @@ private:
 
         size_t total_values = 0;
         size_t pre_values = 0;
+        PODArray<size_t> row_length(input_rows_count);
 
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
-            if (start_data[row_idx] < end_data[row_idx] && step == 0)
-                throw Exception{"A call to function " + getName() + " overflows, the 3rd argument step can't be zero",
-                            ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+            if (step == 0)
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "A call to function {} overflows, the 3rd argument step can't be zero", getName());
 
-            pre_values += start_data[row_idx] >= end_data[row_idx] ? 0
-                            : (end_data[row_idx] - start_data[row_idx] - 1) / step + 1;
+            if (start_data[row_idx] < end_data[row_idx] && step > 0)
+                row_length[row_idx] = static_cast<size_t>((static_cast<__int128_t>(end_data[row_idx]) - static_cast<__int128_t>(start_data[row_idx]) - 1) / static_cast<__int128_t>(step) + 1);
+            else if (start_data[row_idx] > end_data[row_idx] && step < 0)
+                row_length[row_idx] = static_cast<size_t>((static_cast<__int128_t>(end_data[row_idx]) - static_cast<__int128_t>(start_data[row_idx]) + 1) / static_cast<__int128_t>(step) + 1);
+            else
+                row_length[row_idx] = 0;
+
+            pre_values += row_length[row_idx];
 
             if (pre_values < total_values)
-                throw Exception{"A call to function " + getName() + " overflows, investigate the values of arguments you are passing",
-                            ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                        "A call to function {} overflows, investigate the values "
+                                        "of arguments you are passing", getName());
 
             total_values = pre_values;
             if (total_values > max_elements)
-                throw Exception{"A call to function " + getName() + " would produce " + std::to_string(total_values) +
-                    " array elements, which is greater than the allowed maximum of " + std::to_string(max_elements),
-                    ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                "A call to function {} would produce {} array elements, which "
+                                "is greater than the allowed maximum of {}",
+                                getName(), std::to_string(total_values), std::to_string(max_elements));
         }
 
         auto data_col = ColumnVector<T>::create(total_values);
@@ -210,15 +274,11 @@ private:
         IColumn::Offset offset{};
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
-            for (size_t st = start_data[row_idx], ed = end_data[row_idx]; st < ed; st += step)
+            for (size_t idx = 0; idx < row_length[row_idx]; ++idx)
             {
-                out_data[offset++] = st;
-
-                if (st > st + step)
-                    throw Exception{"A call to function " + getName() + " overflows, investigate the values of arguments you are passing",
-                                ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                out_data[offset] = static_cast<T>(start_data[row_idx] + idx * step);
+                ++offset;
             }
-
             out_offsets[row_idx] = offset;
         }
 
@@ -239,25 +299,33 @@ private:
 
         size_t total_values = 0;
         size_t pre_values = 0;
+        PODArray<size_t> row_length(input_rows_count);
 
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
-            if (start < end_data[row_idx] && step_data[row_idx] == 0)
-                throw Exception{"A call to function " + getName() + " overflows, the 3rd argument step can't be zero",
-                            ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+            if (step_data[row_idx] == 0)
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "A call to function {} overflows, the 3rd argument step can't be zero", getName());
 
-            pre_values += start >= end_data[row_idx] ? 0
-                            : (end_data[row_idx] - start - 1) / step_data[row_idx] + 1;
+            if (start < end_data[row_idx] && step_data[row_idx] > 0)
+                row_length[row_idx] = static_cast<size_t>((static_cast<__int128_t>(end_data[row_idx]) - static_cast<__int128_t>(start) - 1) / static_cast<__int128_t>(step_data[row_idx]) + 1);
+            else if (start > end_data[row_idx] && step_data[row_idx] < 0)
+                row_length[row_idx] = static_cast<size_t>((static_cast<__int128_t>(end_data[row_idx]) - static_cast<__int128_t>(start) + 1) / static_cast<__int128_t>(step_data[row_idx]) + 1);
+            else
+                row_length[row_idx] = 0;
+
+            pre_values += row_length[row_idx];
 
             if (pre_values < total_values)
-                throw Exception{"A call to function " + getName() + " overflows, investigate the values of arguments you are passing",
-                            ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                        "A call to function {} overflows, investigate the values "
+                                        "of arguments you are passing", getName());
 
             total_values = pre_values;
             if (total_values > max_elements)
-                throw Exception{"A call to function " + getName() + " would produce " + std::to_string(total_values) +
-                    " array elements, which is greater than the allowed maximum of " + std::to_string(max_elements),
-                    ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                "A call to function {} would produce {} array elements, which "
+                                "is greater than the allowed maximum of {}",
+                                getName(), std::to_string(total_values), std::to_string(max_elements));
         }
 
         auto data_col = ColumnVector<T>::create(total_values);
@@ -269,15 +337,11 @@ private:
         IColumn::Offset offset{};
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
-            for (size_t st = start, ed = end_data[row_idx]; st < ed; st += step_data[row_idx])
+            for (size_t idx = 0; idx < row_length[row_idx]; ++idx)
             {
-                out_data[offset++] = st;
-
-                if (st > st + step_data[row_idx])
-                    throw Exception{"A call to function " + getName() + " overflows, investigate the values of arguments you are passing",
-                                ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                out_data[offset] = static_cast<T>(start + idx * step_data[row_idx]);
+                ++offset;
             }
-
             out_offsets[row_idx] = offset;
         }
 
@@ -301,25 +365,33 @@ private:
 
         size_t total_values = 0;
         size_t pre_values = 0;
+        PODArray<size_t> row_length(input_rows_count);
 
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
-            if (start_data[row_idx] < end_start[row_idx] && step_data[row_idx] == 0)
-                throw Exception{"A call to function " + getName() + " overflows, the 3rd argument step can't be zero",
-                            ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+            if (step_data[row_idx] == 0)
+                throw Exception{ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                    "A call to function {} underflows, the 3rd argument step can't be less or equal to zero", getName()};
+            if (start_data[row_idx] < end_start[row_idx] && step_data[row_idx] > 0)
+                row_length[row_idx] = static_cast<size_t>((static_cast<__int128_t>(end_start[row_idx]) - static_cast<__int128_t>(start_data[row_idx]) - 1) / static_cast<__int128_t>(step_data[row_idx]) + 1);
+            else if (start_data[row_idx] > end_start[row_idx] && step_data[row_idx] < 0)
+                row_length[row_idx] = static_cast<size_t>((static_cast<__int128_t>(end_start[row_idx]) - static_cast<__int128_t>(start_data[row_idx]) + 1) / static_cast<__int128_t>(step_data[row_idx]) + 1);
+            else
+                row_length[row_idx] = 0;
 
-            pre_values += start_data[row_idx] >= end_start[row_idx] ? 0
-                            : (end_start[row_idx] -start_data[row_idx] - 1) / (step_data[row_idx]) + 1;
+            pre_values += row_length[row_idx];
 
             if (pre_values < total_values)
-                throw Exception{"A call to function " + getName() + " overflows, investigate the values of arguments you are passing",
-                            ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                        "A call to function {} overflows, investigate the values "
+                                        "of arguments you are passing", getName());
 
             total_values = pre_values;
             if (total_values > max_elements)
-                throw Exception{"A call to function " + getName() + " would produce " + std::to_string(total_values) +
-                    " array elements, which is greater than the allowed maximum of " + std::to_string(max_elements),
-                    ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                                "A call to function {} would produce {} array elements, which "
+                                "is greater than the allowed maximum of {}",
+                                getName(), std::to_string(total_values), std::to_string(max_elements));
         }
 
         auto data_col = ColumnVector<T>::create(total_values);
@@ -331,15 +403,11 @@ private:
         IColumn::Offset offset{};
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
-            for (size_t st = start_data[row_idx], ed = end_start[row_idx]; st < ed; st += step_data[row_idx])
+            for (size_t idx = 0; idx < row_length[row_idx]; ++idx)
             {
-                out_data[offset++] = st;
-
-                if (st > st + step_data[row_idx])
-                    throw Exception{"A call to function " + getName() + " overflows, investigate the values of arguments you are passing",
-                                ErrorCodes::ARGUMENT_OUT_OF_BOUND};
+                out_data[offset] = static_cast<T>(start_data[row_idx] + idx * step_data[row_idx]);
+                ++offset;
             }
-
             out_offsets[row_idx] = offset;
         }
 
@@ -348,29 +416,48 @@ private:
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
+        NullPresence null_presence = getNullPresense(arguments);
+        if (null_presence.has_null_constant)
+            return result_type->createColumnConstWithDefaultValue(input_rows_count);
+
         DataTypePtr elem_type = checkAndGetDataType<DataTypeArray>(result_type.get())->getNestedType();
         WhichDataType which(elem_type);
 
-        if (!which.isUInt8()
-            && !which.isUInt16()
-            && !which.isUInt32()
-            && !which.isUInt64())
+        if (!which.isNativeUInt() && !which.isNativeInt())
         {
-            throw Exception{"Illegal columns of arguments of function " + getName()
-                + ", the function only implemented for unsigned integers up to 64 bit", ErrorCodes::ILLEGAL_COLUMN};
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN,
+                            "Illegal columns of arguments of function {}, the function only implemented "
+                            "for unsigned/signed integers up to 64 bit", getName());
         }
+
+        auto throw_if_null_value = [&](const ColumnWithTypeAndName & col)
+        {
+            if (!col.type->isNullable())
+                return;
+            const ColumnNullable * nullable_col = checkAndGetColumn<ColumnNullable>(col.column.get());
+            if (!nullable_col)
+                nullable_col = checkAndGetColumnConstData<ColumnNullable>(col.column.get());
+            if (!nullable_col)
+                return;
+            const auto & null_map = nullable_col->getNullMapData();
+            if (!memoryIsZero(null_map.data(), 0, null_map.size()))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Illegal (null) value column {} of argument of function {}", col.column->getName(), getName());
+        };
 
         ColumnPtr res;
         if (arguments.size() == 1)
         {
+            throw_if_null_value(arguments[0]);
             const auto * col = arguments[0].column.get();
-            if (!((res = executeInternal<UInt8>(col))
-                || (res = executeInternal<UInt16>(col))
-                || (res = executeInternal<UInt32>(col))
-                || (res = executeInternal<UInt64>(col))))
+            if (arguments[0].type->isNullable())
             {
-                throw Exception{"Illegal column " + col->getName() + " of argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN};
+                const auto & nullable = checkAndGetColumn<ColumnNullable>(*arguments[0].column);
+                col = nullable.getNestedColumnPtr().get();
             }
+
+            res = tryEachType(TypeListNativeInt{}, [&]<typename T>() { return executeInternal<T>(col); });
+            if (!res)
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}", col->getName(), getName());
             return res;
         }
 
@@ -379,6 +466,7 @@ private:
 
         for (size_t i = 0; i < arguments.size(); ++i)
         {
+            throw_if_null_value(arguments[i]);
             if (i == 1)
                 columns_holder[i] = castColumn(arguments[i], elem_type)->convertToFullColumnIfConst();
             else
@@ -402,51 +490,80 @@ private:
         bool is_step_const = isColumnConst(*column_ptrs[2]);
         if (is_start_const && is_step_const)
         {
-            UInt64 start = assert_cast<const ColumnConst &>(*column_ptrs[0]).getUInt(0);
-            UInt64 step = assert_cast<const ColumnConst &>(*column_ptrs[2]).getUInt(0);
-
-            if ((res = executeConstStartStep<UInt8>(column_ptrs[1], start, step, input_rows_count)) ||
-                (res = executeConstStartStep<UInt16>(column_ptrs[1], start, step, input_rows_count)) ||
-                (res = executeConstStartStep<UInt32>(column_ptrs[1], start, step, input_rows_count)) ||
-                (res = executeConstStartStep<UInt64>(column_ptrs[1], start, step, input_rows_count)))
+            if (which.isNativeUInt())
             {
+                UInt64 start = assert_cast<const ColumnConst &>(*column_ptrs[0]).getUInt(0);
+                UInt64 step = assert_cast<const ColumnConst &>(*column_ptrs[2]).getUInt(0);
+
+                res = tryEachType(TypeListNativeUInt{}, [&]<typename T>()
+                {
+                    return executeConstStartStep<T>(column_ptrs[1], static_cast<T>(start), static_cast<T>(step), input_rows_count);
+                });
+            }
+            else if (which.isNativeInt())
+            {
+                Int64 start = assert_cast<const ColumnConst &>(*column_ptrs[0]).getInt(0);
+                Int64 step = assert_cast<const ColumnConst &>(*column_ptrs[2]).getInt(0);
+
+                res = tryEachType(TypeListNativeSInt{}, [&]<typename T>()
+                {
+                    return executeConstStartStep<T>(column_ptrs[1], static_cast<T>(start), static_cast<T>(step), input_rows_count);
+                });
             }
         }
         else if (is_start_const && !is_step_const)
         {
-            UInt64 start = assert_cast<const ColumnConst &>(*column_ptrs[0]).getUInt(0);
-
-            if ((res = executeConstStart<UInt8>(column_ptrs[1], column_ptrs[2], start, input_rows_count)) ||
-                (res = executeConstStart<UInt16>(column_ptrs[1], column_ptrs[2], start, input_rows_count)) ||
-                (res = executeConstStart<UInt32>(column_ptrs[1], column_ptrs[2], start, input_rows_count)) ||
-                (res = executeConstStart<UInt64>(column_ptrs[1], column_ptrs[2], start, input_rows_count)))
+            if (which.isNativeUInt())
             {
+                UInt64 start = assert_cast<const ColumnConst &>(*column_ptrs[0]).getUInt(0);
+
+                res = tryEachType(TypeListNativeUInt{}, [&]<typename T>()
+                {
+                    return executeConstStart<T>(column_ptrs[1], column_ptrs[2], static_cast<T>(start), input_rows_count);
+                });
+            }
+            else if (which.isNativeInt())
+            {
+                Int64 start = assert_cast<const ColumnConst &>(*column_ptrs[0]).getInt(0);
+
+                res = tryEachType(TypeListNativeSInt{}, [&]<typename T>()
+                {
+                    return executeConstStart<T>(column_ptrs[1], column_ptrs[2], static_cast<T>(start), input_rows_count);
+                });
             }
         }
         else if (!is_start_const && is_step_const)
         {
-            UInt64 step = assert_cast<const ColumnConst &>(*column_ptrs[2]).getUInt(0);
-
-            if ((res = executeConstStep<UInt8>(column_ptrs[0], column_ptrs[1], step, input_rows_count)) ||
-                (res = executeConstStep<UInt16>(column_ptrs[0], column_ptrs[1], step, input_rows_count)) ||
-                (res = executeConstStep<UInt32>(column_ptrs[0], column_ptrs[1], step, input_rows_count)) ||
-                (res = executeConstStep<UInt64>(column_ptrs[0], column_ptrs[1], step, input_rows_count)))
+            if (which.isNativeUInt())
             {
+                UInt64 step = assert_cast<const ColumnConst &>(*column_ptrs[2]).getUInt(0);
+
+                res = tryEachType(TypeListNativeUInt{}, [&]<typename T>()
+                {
+                    return executeConstStep<T>(column_ptrs[0], column_ptrs[1], static_cast<T>(step), input_rows_count);
+                });
+            }
+            else if (which.isNativeInt())
+            {
+                Int64 step = assert_cast<const ColumnConst &>(*column_ptrs[2]).getInt(0);
+
+                res = tryEachType(TypeListNativeSInt{}, [&]<typename T>()
+                {
+                    return executeConstStep<T>(column_ptrs[0], column_ptrs[1], static_cast<T>(step), input_rows_count);
+                });
             }
         }
         else
         {
-            if ((res = executeGeneric<UInt8>(column_ptrs[0], column_ptrs[1], column_ptrs[2], input_rows_count)) ||
-                (res = executeGeneric<UInt16>(column_ptrs[0], column_ptrs[1], column_ptrs[2], input_rows_count)) ||
-                (res = executeGeneric<UInt32>(column_ptrs[0], column_ptrs[1], column_ptrs[2], input_rows_count)) ||
-                (res = executeGeneric<UInt64>(column_ptrs[0], column_ptrs[1], column_ptrs[2], input_rows_count)))
+            res = tryEachType(TypeListNativeInt{}, [&]<typename T>()
             {
-            }
+                return executeGeneric<T>(column_ptrs[0], column_ptrs[1], column_ptrs[2], input_rows_count);
+            });
         }
 
         if (!res)
         {
-            throw Exception{"Illegal columns " + column_ptrs[0]->getName() + " of argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN};
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal columns {} of argument of function {}", column_ptrs[0]->getName(), getName());
         }
 
         return res;
@@ -455,9 +572,35 @@ private:
 };
 
 
-void registerFunctionRange(FunctionFactory & factory)
+REGISTER_FUNCTION(Range)
 {
-    factory.registerFunction<FunctionRange>();
+    FunctionDocumentation::Description description = R"(
+Returns an array of numbers from `start` to `end - 1` by `step`.
+
+The supported types are:
+- `UInt8/16/32/64`
+- `Int8/16/32/64]`
+
+- All arguments `start`, `end`, `step` must be one of the above supported types. Elements of the returned array will be a super type of the arguments.
+- An exception is thrown if the function returns an array with a total length more than the number of elements specified by setting [`function_range_max_elements_in_block`](/reference/settings/session-settings/function#function_range_max_elements_in_block).
+- Returns `NULL` if any argument has Nullable(nothing) type. An exception is thrown if any argument has `NULL` value (Nullable(T) type).
+    )";
+    FunctionDocumentation::Syntax syntax = "range([start, ] end [, step])";
+    FunctionDocumentation::Arguments arguments = {
+        {"start", "Optional. The first element of the array. Required if `step` is used. Default value: `0`."},
+        {"end", "Required. The number before which the array is constructed."},
+        {"step", "Optional. Determines the incremental step between each element in the array. Default value: `1`."},};
+    FunctionDocumentation::ReturnedValue returned_value = {"Array of numbers from `start` to `end - 1` by `step`.", {"Array(T)"}};
+    FunctionDocumentation::Examples examples = {{"Usage example", "SELECT range(5), range(1, 5), range(1, 5, 2), range(-1, 5, 2);", R"(
+┌─range(5)────┬─range(1, 5)─┬─range(1, 5, 2)─┬─range(-1, 5, 2)─┐
+│ [0,1,2,3,4] │ [1,2,3,4]   │ [1,3]          │ [-1,1,3]        │
+└─────────────┴─────────────┴────────────────┴─────────────────┘
+    )"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Array;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionRange>(documentation);
 }
 
 }

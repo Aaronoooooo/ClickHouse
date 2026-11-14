@@ -1,22 +1,37 @@
 #include <Storages/ConstraintsDescription.h>
 
+#include <Common/quoteString.h>
+#include <Core/Block.h>
+#include <Interpreters/ComparisonGraph.h>
+#include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ExpressionAnalyzer.h>
+#include <Interpreters/TreeCNFConverter.h>
 #include <Interpreters/TreeRewriter.h>
+#include <Interpreters/createSubcolumnsExtractionActions.h>
 
-#include <Parsers/formatAST.h>
+#include <Parsers/ASTConstraintDeclaration.h>
 #include <Parsers/ParserCreateQuery.h>
 #include <Parsers/parseQuery.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTSubquery.h>
+#include <Interpreters/ExpressionContainsArrayJoin.h>
 
 #include <Core/Defines.h>
 
+#include <Analyzer/QueryTreeBuilder.h>
+#include <Analyzer/FunctionNode.h>
+#include <Analyzer/Passes/CNF.h>
+#include <Analyzer/Passes/QueryAnalysisPass.h>
+
+#include <Interpreters/Context.h>
 
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int INCORRECT_QUERY;
 }
 
 String ConstraintsDescription::toString() const
@@ -28,7 +43,7 @@ String ConstraintsDescription::toString() const
     for (const auto & constraint : constraints)
         list.children.push_back(constraint);
 
-    return serializeAST(list, true);
+    return list.formatIgnoringRedundantParentheses();
 }
 
 ConstraintsDescription ConstraintsDescription::parse(const String & str)
@@ -38,7 +53,7 @@ ConstraintsDescription ConstraintsDescription::parse(const String & str)
 
     ConstraintsDescription res;
     ParserConstraintDeclarationList parser;
-    ASTPtr list = parseQuery(parser, str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH);
+    ASTPtr list = parseQuery(parser, str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
 
     for (const auto & constraint : list->children)
         res.constraints.push_back(constraint);
@@ -57,7 +72,7 @@ ASTs ConstraintsDescription::filterConstraints(ConstraintType selection) const
             case ASTConstraintDeclaration::Type::ASSUME:
                 return static_cast<UInt8>(ConstraintType::ASSUME);
         }
-        throw Exception("Unknown constraint type.", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown constraint type.");
     };
 
     ASTs res;
@@ -72,12 +87,25 @@ ASTs ConstraintsDescription::filterConstraints(ConstraintType selection) const
     return res;
 }
 
-std::vector<std::vector<CNFQuery::AtomicFormula>> ConstraintsDescription::buildConstraintData() const
+ASTs ConstraintsDescription::filterConstraintsForOptimization() const
 {
-    std::vector<std::vector<CNFQuery::AtomicFormula>> constraint_data;
+    ASTs res;
     for (const auto & constraint : filterConstraints(ConstraintsDescription::ConstraintType::ALWAYS_TRUE))
     {
-        const auto cnf = TreeCNFConverter::toCNF(constraint->as<ASTConstraintDeclaration>()->expr->ptr())
+        const auto & declaration = constraint->as<const ASTConstraintDeclaration &>();
+        if (declaration.expr && expressionContainsArrayJoin(*declaration.expr))
+            continue;
+        res.push_back(constraint);
+    }
+    return res;
+}
+
+std::vector<std::vector<CNFQueryAtomicFormula>> ConstraintsDescription::buildConstraintData() const
+{
+    std::vector<std::vector<CNFQueryAtomicFormula>> constraint_data;
+    for (const auto & constraint : filterConstraintsForOptimization())
+    {
+        const auto cnf = TreeCNFConverter::toCNF(constraint->as<ASTConstraintDeclaration>()->expr)
             .pullNotOutFunctions(); /// TODO: move prepare stage to ConstraintsDescription
         for (const auto & group : cnf.getStatements())
             constraint_data.emplace_back(std::begin(group), std::end(group));
@@ -86,12 +114,12 @@ std::vector<std::vector<CNFQuery::AtomicFormula>> ConstraintsDescription::buildC
     return constraint_data;
 }
 
-std::vector<CNFQuery::AtomicFormula> ConstraintsDescription::getAtomicConstraintData() const
+std::vector<CNFQueryAtomicFormula> ConstraintsDescription::getAtomicConstraintData() const
 {
-    std::vector<CNFQuery::AtomicFormula> constraint_data;
-    for (const auto & constraint : filterConstraints(ConstraintsDescription::ConstraintType::ALWAYS_TRUE))
+    std::vector<CNFQueryAtomicFormula> constraint_data;
+    for (const auto & constraint : filterConstraintsForOptimization())
     {
-        const auto cnf = TreeCNFConverter::toCNF(constraint->as<ASTConstraintDeclaration>()->expr->ptr())
+        const auto cnf = TreeCNFConverter::toCNF(constraint->as<ASTConstraintDeclaration>()->expr)
              .pullNotOutFunctions();
         for (const auto & group : cnf.getStatements())
         {
@@ -103,30 +131,42 @@ std::vector<CNFQuery::AtomicFormula> ConstraintsDescription::getAtomicConstraint
     return constraint_data;
 }
 
-std::unique_ptr<ComparisonGraph> ConstraintsDescription::buildGraph() const
+std::unique_ptr<ComparisonGraph<ASTPtr>> ConstraintsDescription::buildGraph() const
 {
     static const NameSet relations = { "equals", "less", "lessOrEquals", "greaterOrEquals", "greater" };
 
-    std::vector<ASTPtr> constraints_for_graph;
+    ASTs constraints_for_graph;
     auto atomic_formulas = getAtomicConstraintData();
     for (const auto & atomic_formula : atomic_formulas)
     {
-        CNFQuery::AtomicFormula atom{atomic_formula.negative, atomic_formula.ast->clone()};
+        CNFQueryAtomicFormula atom{atomic_formula.negative, atomic_formula.ast->clone()};
         pushNotIn(atom);
+
+        /// `pushNotIn` does not always manage to remove the negation: `NOT (x < c)` is not `x >= c` when
+        /// `x` can be a `NaN`, so an ordered comparison keeps its `NOT`. The comparison graph stores plain
+        /// relations and has nowhere to put the negation, so such an atom is left out of it - taking it in
+        /// as if it were positive would state the opposite of what the constraint says.
+        if (atom.negative)
+            continue;
+
         auto * func = atom.ast->as<ASTFunction>();
-        if (func && relations.count(func->name))
-        {
-            assert(!atom.negative);
+        if (func && relations.contains(func->name))
             constraints_for_graph.push_back(atom.ast);
-        }
     }
 
-    return std::make_unique<ComparisonGraph>(constraints_for_graph);
+    return std::make_unique<ComparisonGraph<ASTPtr>>(constraints_for_graph);
 }
 
 ConstraintsExpressions ConstraintsDescription::getExpressions(const DB::ContextPtr context,
                                                               const DB::NamesAndTypesList & source_columns_) const
 {
+    /// The columns that are physically available when the constraint is checked (the top-level table columns).
+    /// A constraint expression may reference subcolumns (e.g. `x.null` of a `Nullable` column, `arr.size0` of an
+    /// `Array`) that are not present in this block; they have to be extracted from their parent columns first.
+    Block available_columns;
+    for (const auto & column : source_columns_)
+        available_columns.insert({column.type->createColumn(), column.type, column.name});
+
     ConstraintsExpressions res;
     res.reserve(constraints.size());
     for (const auto & constraint : constraints)
@@ -137,39 +177,173 @@ ConstraintsExpressions ConstraintsDescription::getExpressions(const DB::ContextP
             // TreeRewriter::analyze has query as non-const argument so to avoid accidental query changes we clone it
             ASTPtr expr = constraint_ptr->expr->clone();
             auto syntax_result = TreeRewriter(context).analyze(expr, source_columns_);
-            res.push_back(ExpressionAnalyzer(constraint_ptr->expr->clone(), syntax_result, context).getActions(false, true, CompileExpressions::yes));
+            auto constraint_dag = ExpressionAnalyzer(constraint_ptr->expr->clone(), syntax_result, context).getActionsDAG(false, true);
+
+            /// Prepend actions that extract the required subcolumns from their parent columns, so the expression
+            /// can be evaluated on a block that contains only the top-level columns.
+            auto extract_subcolumns_dag = createSubcolumnsExtractionActions(available_columns, constraint_dag.getRequiredColumnsNames(), context);
+            res.push_back(std::make_shared<ExpressionActions>(
+                ActionsDAG::merge(std::move(extract_subcolumns_dag), std::move(constraint_dag)),
+                ExpressionActionsSettings(context, CompileExpressions::yes)));
         }
     }
     return res;
 }
 
-const ComparisonGraph & ConstraintsDescription::getGraph() const
+void ConstraintsDescription::checkExpressionsPreserveRowCount() const
+{
+    for (const auto & constraint : constraints)
+    {
+        const auto & declaration = constraint->as<const ASTConstraintDeclaration &>();
+        if (declaration.expr && expressionContainsArrayJoin(*declaration.expr))
+            throw Exception(ErrorCodes::INCORRECT_QUERY,
+                "Constraint {} cannot contain arrayJoin, because it changes the number of rows",
+                backQuote(declaration.name));
+    }
+}
+
+void ConstraintsDescription::checkNamesAreUnique() const
+{
+    NameSet names;
+    for (const auto & constraint : constraints)
+    {
+        const auto & declaration = constraint->as<const ASTConstraintDeclaration &>();
+        if (!names.insert(declaration.name).second)
+            throw Exception(ErrorCodes::INCORRECT_QUERY,
+                "Constraint {} is declared more than once", backQuote(declaration.name));
+    }
+}
+
+const ComparisonGraph<ASTPtr> & ConstraintsDescription::getGraph() const
 {
     return *graph;
 }
 
-const std::vector<std::vector<CNFQuery::AtomicFormula>> & ConstraintsDescription::getConstraintData() const
+const std::vector<std::vector<CNFQueryAtomicFormula>> & ConstraintsDescription::getConstraintData() const
 {
     return cnf_constraints;
 }
 
-const std::vector<ASTPtr> & ConstraintsDescription::getConstraints() const
+const ASTs & ConstraintsDescription::getConstraints() const
 {
     return constraints;
 }
 
 std::optional<ConstraintsDescription::AtomIds> ConstraintsDescription::getAtomIds(const ASTPtr & ast) const
 {
-    const auto hash = ast->getTreeHash();
+    const auto hash = ast->getTreeHash(/*ignore_aliases=*/ true);
     auto it = ast_to_atom_ids.find(hash);
     if (it != ast_to_atom_ids.end())
         return it->second;
     return std::nullopt;
 }
 
-std::vector<CNFQuery::AtomicFormula> ConstraintsDescription::getAtomsById(const ConstraintsDescription::AtomIds & ids) const
+std::vector<CNFQueryAtomicFormula> ConstraintsDescription::getAtomsById(const ConstraintsDescription::AtomIds & ids) const
 {
-    std::vector<CNFQuery::AtomicFormula> result;
+    std::vector<CNFQueryAtomicFormula> result;
+    for (const auto & id : ids)
+        result.push_back(cnf_constraints[id.group_id][id.atom_id]);
+    return result;
+}
+
+ConstraintsDescription::QueryTreeData ConstraintsDescription::getQueryTreeData(const ContextPtr & context, const TableExpressionNodePtr & table_node) const
+{
+    QueryTreeData data;
+    std::vector<Analyzer::CNFAtomicFormula> atomic_constraints_data;
+
+    QueryAnalysisPass pass(table_node);
+
+    for (const auto & constraint : filterConstraintsForOptimization())
+    {
+        auto expr = constraint->as<ASTConstraintDeclaration>()->expr->ptr();
+        // Wrap the scalar expression with a function call "equals(SELECT..., 1)".
+        if (dynamic_cast<ASTSubquery *>(expr.get()))
+        {
+            auto func = make_intrusive<ASTFunction>();
+            func ->name = "equals";
+            func->children.push_back(make_intrusive<ASTExpressionList>());
+            auto args = make_intrusive<ASTExpressionList>();
+            args->children.push_back(expr);
+            args->children.push_back(make_intrusive<ASTLiteral>(Field{static_cast<UInt8>(1)}));
+            func->arguments = args;
+            expr = func;
+        }
+        auto query_tree = buildQueryTree(expr, context);
+        pass.run(query_tree, context);
+
+        const auto cnf = Analyzer::CNF::toCNF(query_tree, context)
+            .pullNotOutFunctions(context);
+        for (const auto & group : cnf.getStatements())
+        {
+            data.cnf_constraints.emplace_back(group.begin(), group.end());
+
+            if (group.size() == 1)
+                atomic_constraints_data.emplace_back(*group.begin());
+        }
+
+        data.constraints.push_back(std::move(query_tree));
+    }
+
+    for (size_t i = 0; i < data.cnf_constraints.size(); ++i)
+        for (size_t j = 0; j < data.cnf_constraints[i].size(); ++j)
+            data.query_node_to_atom_ids[data.cnf_constraints[i][j].node_with_hash].push_back({i, j});
+
+    /// build graph
+    if (constraints.empty())
+    {
+        data.graph = std::make_unique<ComparisonGraph<QueryTreeNodePtr>>(QueryTreeNodes(), context);
+    }
+    else
+    {
+        static const NameSet relations = { "equals", "less", "lessOrEquals", "greaterOrEquals", "greater" };
+
+        QueryTreeNodes constraints_for_graph;
+        for (const auto & atomic_formula : atomic_constraints_data)
+        {
+            Analyzer::CNFAtomicFormula atom{atomic_formula.negative, atomic_formula.node_with_hash.node->clone()};
+            atom = Analyzer::CNF::pushNotIntoFunction(atom, context);
+
+            /// See the same check in `buildGraph`: an ordered comparison over an argument that can be a
+            /// `NaN` keeps its negation, which the comparison graph cannot represent.
+            if (atom.negative)
+                continue;
+
+            auto * function_node = atom.node_with_hash.node->as<FunctionNode>();
+            if (function_node && relations.contains(function_node->getFunctionName()))
+                constraints_for_graph.push_back(atom.node_with_hash.node);
+        }
+        data.graph = std::make_unique<ComparisonGraph<QueryTreeNodePtr>>(constraints_for_graph, context);
+    }
+
+    return data;
+}
+
+const QueryTreeNodes & ConstraintsDescription::QueryTreeData::getConstraints() const
+{
+    return constraints;
+}
+
+const std::vector<std::vector<Analyzer::CNFAtomicFormula>> & ConstraintsDescription::QueryTreeData::getConstraintData() const
+{
+    return cnf_constraints;
+}
+
+const ComparisonGraph<QueryTreeNodePtr> & ConstraintsDescription::QueryTreeData::getGraph() const
+{
+    return *graph;
+}
+
+std::optional<ConstraintsDescription::AtomIds> ConstraintsDescription::QueryTreeData::getAtomIds(const QueryTreeNodePtrWithHash & node_with_hash) const
+{
+    auto it = query_node_to_atom_ids.find(node_with_hash);
+    if (it != query_node_to_atom_ids.end())
+        return it->second;
+    return std::nullopt;
+}
+
+std::vector<Analyzer::CNFAtomicFormula> ConstraintsDescription::QueryTreeData::getAtomsById(const AtomIds & ids) const
+{
+    std::vector<Analyzer::CNFAtomicFormula> result;
     for (const auto & id : ids)
         result.push_back(cnf_constraints[id.group_id][id.atom_id]);
     return result;
@@ -191,10 +365,26 @@ ConstraintsDescription::ConstraintsDescription(const ConstraintsDescription & ot
 
 ConstraintsDescription & ConstraintsDescription::operator=(const ConstraintsDescription & other)
 {
+    if (&other == this)
+        return *this;
     constraints.resize(other.constraints.size());
     for (size_t i = 0; i < constraints.size(); ++i)
         constraints[i] = other.constraints[i]->clone();
     update();
+    return *this;
+}
+
+ConstraintsDescription::ConstraintsDescription(ConstraintsDescription && other) /// NOLINT(hicpp-noexcept-move,performance-noexcept-move-constructor)
+    : constraints(std::move(other.constraints))
+{
+    update();
+}
+
+ConstraintsDescription & ConstraintsDescription::operator=(ConstraintsDescription && other) /// NOLINT(hicpp-noexcept-move,performance-noexcept-move-constructor)
+{
+    constraints = std::move(other.constraints);
+    update();
+
     return *this;
 }
 
@@ -204,7 +394,7 @@ void ConstraintsDescription::update()
     {
         cnf_constraints.clear();
         ast_to_atom_ids.clear();
-        graph = std::make_unique<ComparisonGraph>(std::vector<ASTPtr>());
+        graph = std::make_unique<ComparisonGraph<ASTPtr>>(ASTs());
         return;
     }
 
@@ -212,7 +402,7 @@ void ConstraintsDescription::update()
     ast_to_atom_ids.clear();
     for (size_t i = 0; i < cnf_constraints.size(); ++i)
         for (size_t j = 0; j < cnf_constraints[i].size(); ++j)
-            ast_to_atom_ids[cnf_constraints[i][j].ast->getTreeHash()].push_back({i, j});
+            ast_to_atom_ids[cnf_constraints[i][j].ast->getTreeHash(/*ignore_aliases=*/ true)].push_back({i, j});
 
     graph = buildGraph();
 }

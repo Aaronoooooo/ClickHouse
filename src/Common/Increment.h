@@ -10,7 +10,7 @@ class Increment
 {
 public:
     /// path - the name of the file, including the path
-    Increment(const std::string & path_) : counter(path_) {}
+    explicit Increment(const std::string & path_) : counter(path_) {}
 
     /** Get the next number.
       * If the `create_if_need` parameter is not set to true, then
@@ -48,7 +48,7 @@ public:
       */
     UInt64 getBunch(UInt64 count, bool create_if_need = false)
     {
-        return static_cast<UInt64>(counter.add(static_cast<Int64>(count), create_if_need) - count + 1);
+        return counter.add(static_cast<Int64>(count), create_if_need) - count + 1;
     }
 
     /// Change the path to the file.

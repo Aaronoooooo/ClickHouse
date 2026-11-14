@@ -1,10 +1,12 @@
 #pragma once
 
-#include <base/logger_useful.h>
-#include <Poco/Util/Application.h>
+#include <Common/logger_useful.h>
 #include <IO/Operators.h>
+#include <IO/WriteBufferFromString.h>
 
 #include <Parsers/IAST.h>
+
+#include <unordered_map>
 
 namespace DB
 {
@@ -86,6 +88,85 @@ inline void dumpAST(const IAST & ast, WriteBuffer & ostr, DumpASTNode * parent =
         dumpAST(*child, ostr, &dump);
 }
 
+class DumpASTNodeInDotFormat
+{
+public:
+    /// Sequential node ids, so that a node shared by several parents keeps one id.
+    using NodeIds = std::unordered_map<const IAST *, size_t>;
+
+    DumpASTNodeInDotFormat(const IAST & ast_, WriteBuffer * ostr_, NodeIds & node_ids_, bool root_ = true, const char * label_ = nullptr)
+        : ast(ast_), ostr(ostr_), node_ids(node_ids_), root(root_), label(label_)
+    {
+        if (!ostr)
+            return;
+
+        if (root)
+            (*ostr) << "digraph " << (label ? String(label) : "") << "{\n    rankdir=\"UD\";\n";
+
+        printNode();
+    }
+
+    ~DumpASTNodeInDotFormat()
+    {
+        if (!ostr)
+            return;
+
+        for (const auto & child : ast.children)
+            printEdge(ast, *child);
+
+        if (root)
+            (*ostr) << "}\n";
+    }
+
+private:
+    const IAST & ast;
+    WriteBuffer * ostr;
+    NodeIds & node_ids;
+    bool root;
+    const char * label;
+
+    String getASTId() const { return ast.getID(' '); }
+    String getNodeId(const IAST & a) const { return "n" + std::to_string(node_ids.try_emplace(&a, node_ids.size()).first->second); }
+
+    void printNode() const
+    {
+        (*ostr) << "    " << getNodeId(ast) << "[label=\"";
+        (*ostr) << getASTId();
+
+        String alias = ast.tryGetAlias();
+        if (!alias.empty())
+            (*ostr) << " ("
+                    << "alias"
+                    << " " << alias << ")";
+
+        if (!ast.children.empty())
+            (*ostr) << " (children"
+                    << " " << ast.children.size() << ")";
+        (*ostr) << "\"];\n";
+    }
+
+    void printEdge(const IAST & parent, const IAST & child) const
+    {
+        (*ostr) << "    " << getNodeId(parent) << " -> " << getNodeId(child) << ";\n";
+    }
+};
+
+
+/// Print AST in "dot" format for GraphViz
+/// You can render it with: dot -Tpng ast.dot ast.png
+inline void dumpASTInDotFormat(const IAST & ast, WriteBuffer & ostr, DumpASTNodeInDotFormat::NodeIds & node_ids, bool root)
+{
+    DumpASTNodeInDotFormat dump(ast, &ostr, node_ids, root);
+    for (const auto & child : ast.children)
+        dumpASTInDotFormat(*child, ostr, node_ids, false);
+}
+
+inline void dumpASTInDotFormat(const IAST & ast, WriteBuffer & ostr)
+{
+    DumpASTNodeInDotFormat::NodeIds node_ids;
+    dumpASTInDotFormat(ast, ostr, node_ids, true);
+}
+
 
 /// String stream dumped in dtor
 template <bool _enable>
@@ -96,19 +177,19 @@ public:
         : log(nullptr)
     {
         if constexpr (_enable)
-            log = &Poco::Logger::get("AST");
+            log = getLogger("AST");
     }
 
     ~DebugASTLog()
     {
         if constexpr (_enable)
-            LOG_DEBUG(log, buf.str());
+            LOG_DEBUG(log, fmt::runtime(buf.str()));
     }
 
     WriteBuffer * stream() { return (_enable ? &buf : nullptr); }
 
 private:
-    Poco::Logger * log;
+    LoggerPtr log;
     WriteBufferFromOwnString buf;
 };
 

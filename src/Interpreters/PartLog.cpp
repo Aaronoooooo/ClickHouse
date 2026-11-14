@@ -1,22 +1,66 @@
-#include <Columns/ColumnsNumber.h>
+#include <vector>
+#include <base/getFQDNOrHostName.h>
+#include <Common/config_version.h>
+#include <Common/DateLUTImpl.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypeDate.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeEnum.h>
+#include <DataTypes/DataTypeUUID.h>
+#include <Interpreters/Context.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/PartLog.h>
-#include <Interpreters/Context.h>
+#include <Interpreters/ProfileEventsExt.h>
 
 #include <Common/CurrentThread.h>
 
 namespace DB
 {
 
-NamesAndTypesList PartLogElement::getNamesAndTypes()
+namespace ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+}
+
+PartLogElement::MergeReasonType PartLogElement::getMergeReasonType(MergeType merge_type)
+{
+    switch (merge_type)
+    {
+        case MergeType::Regular:
+            return REGULAR_MERGE;
+        case MergeType::TTLDelete:
+            return TTL_DELETE_MERGE;
+        case MergeType::TTLRecompress:
+            return TTL_RECOMPRESS_MERGE;
+        case MergeType::TTLDrop:
+            return TTL_DROP_MERGE;
+    }
+
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Unknown MergeType {}", static_cast<UInt64>(merge_type));
+}
+
+PartLogElement::PartMergeAlgorithm PartLogElement::getMergeAlgorithm(MergeAlgorithm merge_algorithm_)
+{
+    switch (merge_algorithm_)
+    {
+        case MergeAlgorithm::Undecided:
+            return UNDECIDED;
+        case MergeAlgorithm::Horizontal:
+            return HORIZONTAL;
+        case MergeAlgorithm::Vertical:
+            return VERTICAL;
+    }
+
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Unknown MergeAlgorithm {}", static_cast<UInt64>(merge_algorithm_));
+}
+
+ColumnsDescription PartLogElement::getColumnsDescription()
 {
     auto event_type_datatype = std::make_shared<DataTypeEnum8>(
         DataTypeEnum8::Values
@@ -27,40 +71,107 @@ NamesAndTypesList PartLogElement::getNamesAndTypes()
             {"RemovePart",    static_cast<Int8>(REMOVE_PART)},
             {"MutatePart",    static_cast<Int8>(MUTATE_PART)},
             {"MovePart",      static_cast<Int8>(MOVE_PART)},
+            {"MergePartsStart", static_cast<Int8>(MERGE_PARTS_START)},
+            {"MutatePartStart", static_cast<Int8>(MUTATE_PART_START)},
         }
     );
 
+    auto merge_reason_datatype = std::make_shared<DataTypeEnum8>(
+        DataTypeEnum8::Values
+        {
+            {"NotAMerge",           static_cast<Int8>(NOT_A_MERGE)},
+            {"RegularMerge",        static_cast<Int8>(REGULAR_MERGE)},
+            {"TTLDeleteMerge",      static_cast<Int8>(TTL_DELETE_MERGE)},
+            {"TTLRecompressMerge",  static_cast<Int8>(TTL_RECOMPRESS_MERGE)},
+            {"TTLDropMerge",        static_cast<Int8>(TTL_DROP_MERGE)},
+        }
+    );
+
+    auto merge_algorithm_datatype = std::make_shared<DataTypeEnum8>(
+        DataTypeEnum8::Values
+        {
+            {"Undecided",  static_cast<Int8>(UNDECIDED)},
+            {"Horizontal", static_cast<Int8>(HORIZONTAL)},
+            {"Vertical",   static_cast<Int8>(VERTICAL)},
+        }
+    );
+
+    auto low_cardinality_string = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+
     ColumnsWithTypeAndName columns_with_type_and_name;
 
-    return {
-        {"query_id", std::make_shared<DataTypeString>()},
-        {"event_type", std::move(event_type_datatype)},
-        {"event_date", std::make_shared<DataTypeDate>()},
+    return ColumnsDescription
+    {
+        {"hostname", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "Hostname of the server executing the query."},
+        {"clickhouse_version", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "Version of the ClickHouse server that produced the row."},
+        {"system_processor", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "CPU architecture of the ClickHouse server that produced the row."},
+        {"query_id", std::make_shared<DataTypeString>(), "Identifier of the INSERT query that created this data part."},
+        {"event_type", std::move(event_type_datatype),
+            "Type of the event that occurred with the data part. "
+            "Can have one of the following values: "
+            "NewPart — Inserting of a new data part, "
+            "MergePartsStart — Merging of data parts has started, "
+            "MergeParts — Merging of data parts has finished, "
+            "DownloadPart — Downloading a data part, "
+            "RemovePart — Removing or detaching a data part: after a merge or mutation, by [DETACH PARTITION](/reference/statements/alter/partition#detach-partitionpart), DROP PARTITION or TRUNCATE, or when the table is dropped. "
+            "MutatePartStart — Mutating of a data part has started, "
+            "MutatePart — Mutating of a data part has finished, "
+            "MovePart — Moving the data part from the one disk to another one."},
+        {"merge_reason", std::move(merge_reason_datatype),
+            "The reason for the event with type MERGE_PARTS. Can have one of the following values: "
+            "NotAMerge — The current event has the type other than MERGE_PARTS, "
+            "RegularMerge — Some regular merge, "
+            "TTLDeleteMerge, TTLDropMerge — Cleaning up expired data. "
+            "TTLRecompressMerge — Recompressing data part with the. "},
+        {"merge_algorithm", std::move(merge_algorithm_datatype), "Merge algorithm for the event with type MERGE_PARTS. Can have one of the following values: Undecided, Horizontal, Vertical"},
+        {"event_date", std::make_shared<DataTypeDate>(), "Event date."},
+        {"event_time", std::make_shared<DataTypeDateTime>(), "Event time."},
+        {"event_time_microseconds", std::make_shared<DataTypeDateTime64>(6), "Event time with microseconds precision."},
 
-        {"event_time", std::make_shared<DataTypeDateTime>()},
-        {"event_time_microseconds", std::make_shared<DataTypeDateTime64>(6)},
+        {"duration_ms", std::make_shared<DataTypeUInt64>(), "Duration of this operation."},
 
-        {"duration_ms", std::make_shared<DataTypeUInt64>()},
+        {"database", std::make_shared<DataTypeString>(), "Name of the database the data part is in."},
+        {"table", std::make_shared<DataTypeString>(), "Name of the table the data part is in."},
+        {"table_uuid", std::make_shared<DataTypeUUID>(), "UUID of the table the data part belongs to."},
+        {"part_name", std::make_shared<DataTypeString>(), "Name of the data part."},
+        {"partition_id", std::make_shared<DataTypeString>(), "ID of the partition that the data part was inserted to. The column takes the `all` value if the partitioning is by `tuple()`."},
+        {"partition", std::make_shared<DataTypeString>(), "The partition name."},
+        {"part_type", std::make_shared<DataTypeString>(), "The type of the part. Possible values: Wide and Compact."},
+        {"part_storage_type", std::make_shared<DataTypeString>(), "The type of `DataPartStorage`. Possible values: `Packed` - most part files are stored in a single archive (projections and a few service files such as `txn_version.txt` are written separately), `Full` - each file is stored separately."},
+        {"disk_name", std::make_shared<DataTypeString>(), "The disk name data part lies on."},
+        {"path_on_disk", std::make_shared<DataTypeString>(), "Absolute path to the folder with data part files."},
 
-        {"database", std::make_shared<DataTypeString>()},
-        {"table", std::make_shared<DataTypeString>()},
-        {"part_name", std::make_shared<DataTypeString>()},
-        {"partition_id", std::make_shared<DataTypeString>()},
-        {"path_on_disk", std::make_shared<DataTypeString>()},
-
-        {"rows", std::make_shared<DataTypeUInt64>()},
-        {"size_in_bytes", std::make_shared<DataTypeUInt64>()}, // On disk
+        {"rows", std::make_shared<DataTypeUInt64>(), "The number of rows in the data part."},
+        {"size_in_bytes", std::make_shared<DataTypeUInt64>(), "Size of the data part on disk in bytes."},
 
         /// Merge-specific info
-        {"merged_from", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
-        {"bytes_uncompressed", std::make_shared<DataTypeUInt64>()}, // Result bytes
-        {"read_rows", std::make_shared<DataTypeUInt64>()},
-        {"read_bytes", std::make_shared<DataTypeUInt64>()},
-        {"peak_memory_usage", std::make_shared<DataTypeUInt64>()},
+        {"merged_from", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "An array of the source parts names which the current part was made up from."},
+        {"bytes_uncompressed", std::make_shared<DataTypeUInt64>(), "Uncompressed size of the resulting part in bytes."},
+        {"read_rows", std::make_shared<DataTypeUInt64>(), "The number of rows was read during the merge."},
+        {"read_bytes", std::make_shared<DataTypeUInt64>(), "The number of bytes was read during the merge."},
+        {"peak_memory_usage", std::make_shared<DataTypeUInt64>(), "The maximum amount of used during merge RAM"},
+        {"deduplication_block_ids", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "An array of block IDs used for deduplication when inserting this part."},
 
         /// Is there an error during the execution or commit
-        {"error", std::make_shared<DataTypeUInt16>()},
-        {"exception", std::make_shared<DataTypeString>()},
+        {"error", std::make_shared<DataTypeUInt16>(), "The error code of the occurred exception."},
+        {"exception", std::make_shared<DataTypeString>(), "Text message of the occurred error."},
+
+        /// Mutation IDs
+        {"mutation_ids", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "An array of mutation IDs applied to the source part (merged_from) for the event with type MUTATE_PART_START and MUTATE_PART."},
+
+        {"ProfileEvents", std::make_shared<DataTypeMap>(low_cardinality_string, std::make_shared<DataTypeUInt64>()), "All the profile events captured during this operation."},
+
+        {"projections_duration_ms", std::make_shared<DataTypeMap>(low_cardinality_string, std::make_shared<DataTypeUInt64>()), "Per-projection merge/rebuild duration in milliseconds."},
+    };
+}
+
+NamesAndAliases PartLogElement::getNamesAndAliases()
+{
+    return
+    {
+        {"ProfileEvents.Names", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}, "mapKeys(ProfileEvents)"},
+        {"ProfileEvents.Values", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt64>())}, "mapValues(ProfileEvents)"},
+        {"name", {std::make_shared<DataTypeString>()}, "part_name"},
     };
 }
 
@@ -68,8 +179,13 @@ void PartLogElement::appendToBlock(MutableColumns & columns) const
 {
     size_t i = 0;
 
+    columns[i++]->insert(getFQDNOrHostName());
+    columns[i++]->insert(VERSION_STRING);
+    columns[i++]->insert(SYSTEM_PROCESSOR);
     columns[i++]->insert(query_id);
     columns[i++]->insert(event_type);
+    columns[i++]->insert(merge_reason);
+    columns[i++]->insert(merge_algorithm);
     columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
     columns[i++]->insert(event_time);
     columns[i++]->insert(event_time_microseconds);
@@ -77,8 +193,13 @@ void PartLogElement::appendToBlock(MutableColumns & columns) const
 
     columns[i++]->insert(database_name);
     columns[i++]->insert(table_name);
+    columns[i++]->insert(table_uuid);
     columns[i++]->insert(part_name);
     columns[i++]->insert(partition_id);
+    columns[i++]->insert(partition);
+    columns[i++]->insert(part_format.part_type.toString());
+    columns[i++]->insert(part_format.storage_type.toString());
+    columns[i++]->insert(disk_name);
     columns[i++]->insert(path_on_disk);
 
     columns[i++]->insert(rows);
@@ -96,30 +217,41 @@ void PartLogElement::appendToBlock(MutableColumns & columns) const
     columns[i++]->insert(bytes_read_uncompressed);
     columns[i++]->insert(peak_memory_usage);
 
+    Array deduplication_block_ids_array;
+    deduplication_block_ids_array.reserve(deduplication_block_ids.size());
+    for (const auto & id : deduplication_block_ids)
+        deduplication_block_ids_array.push_back(id);
+    columns[i++]->insert(deduplication_block_ids_array);
+
     columns[i++]->insert(error);
     columns[i++]->insert(exception);
+
+    Array mutation_ids_array;
+    mutation_ids_array.reserve(mutation_ids.size());
+    for (const auto & id : mutation_ids)
+        mutation_ids_array.push_back(id);
+    columns[i++]->insert(mutation_ids_array);
+
+    if (profile_counters)
+    {
+        auto * column = columns[i++].get();
+        ProfileEvents::dumpToMapColumn(*profile_counters, column, true);
+    }
+    else
+    {
+        columns[i++]->insertDefault();
+    }
+
+    {
+        Map map;
+        for (const auto & [name, duration] : projections_duration_ms)
+            map.push_back(Tuple{name, duration});
+        columns[i++]->insert(map);
+    }
 }
 
-
-bool PartLog::addNewPart(
-    ContextPtr current_context, const MutableDataPartPtr & part, UInt64 elapsed_ns, const ExecutionStatus & execution_status)
-{
-    return addNewParts(current_context, {part}, elapsed_ns, execution_status);
-}
-
-inline UInt64 time_in_microseconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::microseconds>(timepoint.time_since_epoch()).count();
-}
-
-
-inline UInt64 time_in_seconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::seconds>(timepoint.time_since_epoch()).count();
-}
-
-bool PartLog::addNewParts(
-    ContextPtr current_context, const PartLog::MutableDataPartsVector & parts, UInt64 elapsed_ns, const ExecutionStatus & execution_status)
+bool PartLog::addNewPartsImpl(
+    ContextPtr current_context, const PartLog::PartLogEntries & parts, std::vector<Strings> deduplication_block_ids, const ExecutionStatus & execution_status)
 {
     if (parts.empty())
         return true;
@@ -128,51 +260,85 @@ bool PartLog::addNewParts(
 
     try
     {
-        auto table_id = parts.front()->storage.getStorageID();
-        part_log = current_context->getPartLog(table_id.database_name); // assume parts belong to the same table
+        auto table_id = parts.front().part->storage.getStorageID();
+        part_log = current_context->getPartLog(); // assume parts belong to the same table
         if (!part_log)
             return false;
 
         auto query_id = CurrentThread::getQueryId();
+        PartitionKeySamples partition_key_samples;
 
-        for (const auto & part : parts)
+        for (size_t i = 0; i < parts.size(); ++i)
         {
-            PartLogElement elem;
+            const auto & part_log_entry = parts[i];
+            const auto & part = part_log_entry.part;
 
-            if (query_id.data && query_id.size)
-                elem.query_id.insert(0, query_id.data, query_id.size);
+            part_log->add([&](PartLogElement & element)
+            {
+                if (!query_id.empty())
+                    element.query_id.insert(0, query_id.data(), query_id.size());
 
-            elem.event_type = PartLogElement::NEW_PART; //-V1048
+                element.event_type = PartLogElement::NEW_PART;
 
-            // construct event_time and event_time_microseconds using the same time point
-            // so that the two times will always be equal up to a precision of a second.
-            const auto time_now = std::chrono::system_clock::now();
-            elem.event_time = time_in_seconds(time_now);
-            elem.event_time_microseconds = time_in_microseconds(time_now);
-            elem.duration_ms = elapsed_ns / 1000000;
+                // construct event_time and event_time_microseconds using the same time point
+                // so that the two times will always be equal up to a precision of a second.
+                const auto time_now = std::chrono::system_clock::now();
+                element.event_time = timeInSeconds(time_now);
+                element.event_time_microseconds = timeInMicroseconds(time_now);
+                element.duration_ms = part_log_entry.elapsed_ns / 1000000;
 
-            elem.database_name = table_id.database_name;
-            elem.table_name = table_id.table_name;
-            elem.partition_id = part->info.partition_id;
-            elem.part_name = part->name;
-            elem.path_on_disk = part->getFullPath();
+                element.database_name = table_id.database_name;
+                element.table_name = table_id.table_name;
+                element.table_uuid = table_id.uuid;
+                element.partition_id = part->info.getPartitionId();
+                element.partition = part->partition.serializeToString(partition_key_samples.get(*part));
+                element.part_name = part->name;
+                element.disk_name = part->getDataPartStorage().getDiskName();
+                element.path_on_disk = part->getDataPartStorage().getFullPath();
+                element.deduplication_block_ids = deduplication_block_ids.empty() ? Strings() : deduplication_block_ids[i];
+                element.part_format = part->getFormat();
 
-            elem.bytes_compressed_on_disk = part->getBytesOnDisk();
-            elem.rows = part->rows_count;
+                element.bytes_compressed_on_disk = part->getBytesOnDisk();
+                element.bytes_uncompressed = part->getBytesUncompressedOnDisk();
+                element.rows = part->rows_count;
 
-            elem.error = static_cast<UInt16>(execution_status.code);
-            elem.exception = execution_status.message;
+                element.error = static_cast<UInt16>(execution_status.code);
+                element.exception = execution_status.message;
 
-            part_log->add(elem);
+                if (part_log_entry.profile_counters)
+                    element.profile_counters = *part_log_entry.profile_counters;
+            });
         }
     }
     catch (...)
     {
-        tryLogCurrentException(part_log ? part_log->log : &Poco::Logger::get("PartLog"), __PRETTY_FUNCTION__);
+        tryLogCurrentException(part_log ? part_log->log : getLogger("PartLog"), __PRETTY_FUNCTION__);
         return false;
     }
 
     return true;
+}
+
+bool PartLog::addNewParts(
+    ContextPtr current_context, const PartLog::PartLogEntries & parts, const ExecutionStatus & execution_status)
+{
+    return addNewPartsImpl(current_context, parts, {}, execution_status);
+}
+
+bool PartLog::addNewPart(ContextPtr context_, const PartLog::PartLogEntry & part, Strings block_ids, const ExecutionStatus & execution_status)
+{
+    return addNewPartsImpl(context_, {part}, {std::move(block_ids)}, execution_status);
+}
+
+PartLog::PartLogEntries PartLog::createPartLogEntries(const MutableDataPartsVector & parts, UInt64 elapsed_ns, ProfileCountersSnapshotPtr profile_counters)
+{
+    PartLogEntries part_log_entries;
+    part_log_entries.reserve(parts.size());
+
+    for (const auto & part : parts)
+        part_log_entries.emplace_back(part, elapsed_ns, profile_counters);
+
+    return part_log_entries;
 }
 
 }

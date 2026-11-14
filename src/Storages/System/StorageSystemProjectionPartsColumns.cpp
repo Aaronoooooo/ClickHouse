@@ -1,4 +1,7 @@
-#include "StorageSystemProjectionPartsColumns.h"
+#include <Storages/System/StorageSystemProjectionPartsColumns.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/ProcessList.h>
+#include <Storages/System/SystemTableSourceRegistry.h>
 
 #include <Common/escapeForFileName.h>
 #include <Columns/ColumnString.h>
@@ -7,9 +10,9 @@
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeUUID.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Databases/IDatabase.h>
-#include <Parsers/queryToString.h>
 
 namespace DB
 {
@@ -17,63 +20,65 @@ namespace DB
 
 StorageSystemProjectionPartsColumns::StorageSystemProjectionPartsColumns(const StorageID & table_id_)
     : StorageSystemPartsBase(table_id_,
-    {
-        {"partition",                                  std::make_shared<DataTypeString>()},
-        {"name",                                       std::make_shared<DataTypeString>()},
-        {"part_type",                                  std::make_shared<DataTypeString>()},
-        {"parent_name",                                std::make_shared<DataTypeString>()},
-        {"parent_uuid",                                std::make_shared<DataTypeUUID>()},
-        {"parent_part_type",                           std::make_shared<DataTypeString>()},
-        {"active",                                     std::make_shared<DataTypeUInt8>()},
-        {"marks",                                      std::make_shared<DataTypeUInt64>()},
-        {"rows",                                       std::make_shared<DataTypeUInt64>()},
-        {"bytes_on_disk",                              std::make_shared<DataTypeUInt64>()},
-        {"data_compressed_bytes",                      std::make_shared<DataTypeUInt64>()},
-        {"data_uncompressed_bytes",                    std::make_shared<DataTypeUInt64>()},
-        {"marks_bytes",                                std::make_shared<DataTypeUInt64>()},
-        {"parent_marks",                               std::make_shared<DataTypeUInt64>()},
-        {"parent_rows",                                std::make_shared<DataTypeUInt64>()},
-        {"parent_bytes_on_disk",                       std::make_shared<DataTypeUInt64>()},
-        {"parent_data_compressed_bytes",               std::make_shared<DataTypeUInt64>()},
-        {"parent_data_uncompressed_bytes",             std::make_shared<DataTypeUInt64>()},
-        {"parent_marks_bytes",                         std::make_shared<DataTypeUInt64>()},
-        {"modification_time",                          std::make_shared<DataTypeDateTime>()},
-        {"remove_time",                                std::make_shared<DataTypeDateTime>()},
-        {"refcount",                                   std::make_shared<DataTypeUInt32>()},
-        {"min_date",                                   std::make_shared<DataTypeDate>()},
-        {"max_date",                                   std::make_shared<DataTypeDate>()},
-        {"min_time",                                   std::make_shared<DataTypeDateTime>()},
-        {"max_time",                                   std::make_shared<DataTypeDateTime>()},
-        {"partition_id",                               std::make_shared<DataTypeString>()},
-        {"min_block_number",                           std::make_shared<DataTypeInt64>()},
-        {"max_block_number",                           std::make_shared<DataTypeInt64>()},
-        {"level",                                      std::make_shared<DataTypeUInt32>()},
-        {"data_version",                               std::make_shared<DataTypeUInt64>()},
-        {"primary_key_bytes_in_memory",                std::make_shared<DataTypeUInt64>()},
-        {"primary_key_bytes_in_memory_allocated",      std::make_shared<DataTypeUInt64>()},
+    ColumnsDescription{
+        {"partition",                                  std::make_shared<DataTypeString>(), "The partition name. "},
+        {"name",                                       std::make_shared<DataTypeString>(), "Name of the data part."},
+        {"part_type",                                  std::make_shared<DataTypeString>(), "The data part storing format."},
+        {"parent_name",                                std::make_shared<DataTypeString>(), "The name of the source (parent) data part."},
+        {"parent_uuid",                                std::make_shared<DataTypeUUID>(),   "The UUID of the source (parent) data part."},
+        {"parent_part_type",                           std::make_shared<DataTypeString>(), "The source (parent) data part storing format."},
+        {"active",                                     std::make_shared<DataTypeUInt8>(),  "Flag that indicates whether the data part is active"},
+        {"marks",                                      std::make_shared<DataTypeUInt64>(), "The number of marks."},
+        {"rows",                                       std::make_shared<DataTypeUInt64>(), "The number of rows."},
+        {"bytes_on_disk",                              std::make_shared<DataTypeUInt64>(), "Total size of all the data part files in bytes."},
+        {"data_compressed_bytes",                      std::make_shared<DataTypeUInt64>(), "Total size of compressed data in the data part. All the auxiliary files (for example, files with marks) are not included."},
+        {"data_uncompressed_bytes",                    std::make_shared<DataTypeUInt64>(), "Total size of uncompressed data in the data part. All the auxiliary files (for example, files with marks) are not included."},
+        {"marks_bytes",                                std::make_shared<DataTypeUInt64>(), "The size of the file with marks."},
+        {"parent_marks",                               std::make_shared<DataTypeUInt64>(), "The number of marks in the source (parent) part."},
+        {"parent_rows",                                std::make_shared<DataTypeUInt64>(), "The number of rows in the source (parent) part."},
+        {"parent_bytes_on_disk",                       std::make_shared<DataTypeUInt64>(), "Total size of all the source (parent) data part files in bytes."},
+        {"parent_data_compressed_bytes",               std::make_shared<DataTypeUInt64>(), "Total size of compressed data in the source (parent) data part."},
+        {"parent_data_uncompressed_bytes",             std::make_shared<DataTypeUInt64>(), "Total size of uncompressed data in the source (parent) data part."},
+        {"parent_marks_bytes",                         std::make_shared<DataTypeUInt64>(), "The size of the file with marks in the source (parent) data part."},
+        {"modification_time",                          std::make_shared<DataTypeDateTime>(), "The time the directory with the data part was modified. This usually corresponds to the time of data part creation."},
+        {"remove_time",                                std::make_shared<DataTypeDateTime>(), "The time when the data part became inactive."},
+        {"refcount",                                   std::make_shared<DataTypeUInt32>(), "The number of places where the data part is used. A value greater than 2 indicates that the data part is used in queries or merges."},
+        {"min_date",                                   std::make_shared<DataTypeDate>(), "The minimum value for the Date column if that is included in the partition key."},
+        {"max_date",                                   std::make_shared<DataTypeDate>(), "The maximum value for the Date column if that is included in the partition key."},
+        {"min_time",                                   std::make_shared<DataTypeDateTime>(), "The minimum value for the DateTime column if that is included in the partition key."},
+        {"max_time",                                   std::make_shared<DataTypeDateTime>(), "The maximum value for the DateTime column if that is included in the partition key."},
+        {"partition_id",                               std::make_shared<DataTypeString>(), "ID of the partition."},
+        {"min_block_number",                           std::make_shared<DataTypeInt64>(), "The minimum number of data parts that make up the current part after merging."},
+        {"max_block_number",                           std::make_shared<DataTypeInt64>(), "The maximum number of data parts that make up the current part after merging."},
+        {"level",                                      std::make_shared<DataTypeUInt32>(), "Depth of the merge tree. Zero means that the current part was created by insert rather than by merging other parts."},
+        {"data_version",                               std::make_shared<DataTypeUInt64>(), "Number that is used to determine which mutations should be applied to the data part (mutations with a version higher than data_version)."},
+        {"primary_key_bytes_in_memory",                std::make_shared<DataTypeUInt64>(), "The amount of memory (in bytes) used by primary key values."},
+        {"primary_key_bytes_in_memory_allocated",      std::make_shared<DataTypeUInt64>(), "The amount of memory (in bytes) reserved for primary key values."},
 
-        {"database",                                   std::make_shared<DataTypeString>()},
-        {"table",                                      std::make_shared<DataTypeString>()},
-        {"engine",                                     std::make_shared<DataTypeString>()},
-        {"disk_name",                                  std::make_shared<DataTypeString>()},
-        {"path",                                       std::make_shared<DataTypeString>()},
+        {"database",                                   std::make_shared<DataTypeString>(), "Name of the database."},
+        {"table",                                      std::make_shared<DataTypeString>(), "Name of the table."},
+        {"engine",                                     std::make_shared<DataTypeString>(), "Name of the table engine without parameters."},
+        {"disk_name",                                  std::make_shared<DataTypeString>(), "Name of a disk that stores the data part."},
+        {"path",                                       std::make_shared<DataTypeString>(), "Absolute path to the folder with data part files."},
 
-        {"column",                                     std::make_shared<DataTypeString>()},
-        {"type",                                       std::make_shared<DataTypeString>()},
-        {"column_position",                            std::make_shared<DataTypeUInt64>()},
-        {"default_kind",                               std::make_shared<DataTypeString>()},
-        {"default_expression",                         std::make_shared<DataTypeString>()},
-        {"column_bytes_on_disk",                       std::make_shared<DataTypeUInt64>()},
-        {"column_data_compressed_bytes",               std::make_shared<DataTypeUInt64>()},
-        {"column_data_uncompressed_bytes",             std::make_shared<DataTypeUInt64>()},
-        {"column_marks_bytes",                         std::make_shared<DataTypeUInt64>()}
+        {"column",                                     std::make_shared<DataTypeString>(), "Name of the column."},
+        {"type",                                       std::make_shared<DataTypeString>(), "Column type."},
+        {"column_position",                            std::make_shared<DataTypeUInt64>(), "Ordinal position of a column in a table starting with 1."},
+        {"default_kind",                               std::make_shared<DataTypeString>(), "Expression type (DEFAULT, MATERIALIZED, ALIAS) for the default value, or an empty string if it is not defined."},
+        {"default_expression",                         std::make_shared<DataTypeString>(), "Expression for the default value, or an empty string if it is not defined."},
+        {"column_bytes_on_disk",                       std::make_shared<DataTypeUInt64>(), "Total size of the column in bytes."},
+        {"column_data_compressed_bytes",               std::make_shared<DataTypeUInt64>(), "Total size of compressed data in the column, in bytes."},
+        {"column_data_uncompressed_bytes",             std::make_shared<DataTypeUInt64>(), "Total size of the decompressed data in the column, in bytes."},
+        {"column_marks_bytes",                         std::make_shared<DataTypeUInt64>(), "The size of the column with marks, in bytes."},
+        {"column_modification_time",                   std::make_shared<DataTypeNullable>(std::make_shared<DataTypeDateTime>()), "The last time the column was modified."},
+        /// TODO: make adaptive codec selection inside projections observable, e.g. by extending the `mergeTreeCodecBlockCounts` table function.
     }
     )
 {
 }
 
 void StorageSystemProjectionPartsColumns::processNextStorage(
-    MutableColumns & columns, std::vector<UInt8> & columns_mask, const StoragesInfo & info, bool has_state_column)
+    ContextPtr context, MutableColumns & columns, std::vector<UInt8> & columns_mask, const StoragesInfo & info, bool has_state_column)
 {
     /// Prepare information about columns in storage.
     struct ColumnInfo
@@ -82,32 +87,51 @@ void StorageSystemProjectionPartsColumns::processNextStorage(
         String default_expression;
     };
 
-    auto storage_metadata = info.storage->getInMemoryMetadataPtr();
+    QueryStatusPtr query_status = context->getProcessListElement();
+
+    auto storage_metadata = info.storage->getInMemoryMetadataPtr(context, false);
     std::unordered_map<String, std::unordered_map<String, ColumnInfo>> projection_columns_info;
+    size_t metadata_column_number = 0;
     for (const auto & projection : storage_metadata->getProjections())
     {
         auto & columns_info = projection_columns_info[projection.name];
         for (const auto & column : projection.metadata->getColumns())
         {
+            /// The prepass alone can take a long time on a table with many projections or many columns.
+            /// A partially filled `projection_columns_info` would report wrong defaults, so give up the whole storage instead.
+            ++metadata_column_number;
+            slowDownSystemPartsMetadataEnumeration(info.table, metadata_column_number);
+            if (query_status && metadata_column_number % COLUMNS_CANCELLATION_CHECK_PERIOD == 0 && !query_status->checkTimeLimit())
+                return;
+
             ColumnInfo column_info;
             if (column.default_desc.expression)
             {
                 column_info.default_kind = toString(column.default_desc.kind);
-                column_info.default_expression = queryToString(column.default_desc.expression);
+                column_info.default_expression = column.default_desc.expression->formatForLogging();
             }
 
             columns_info[column.name] = column_info;
         }
     }
 
-    /// Go through the list of parts.
+    /// Go through the list of projection parts.
     MergeTreeData::DataPartStateVector all_parts_state;
-    MergeTreeData::DataPartsVector all_parts;
-    all_parts = info.getParts(all_parts_state, has_state_column, true /* require_projection_parts */);
-    for (size_t part_number = 0; part_number < all_parts.size(); ++part_number)
+
+    MergeTreeData::ProjectionPartsVector all_parts = info.getProjectionParts(all_parts_state, has_state_column, query_status);
+    PartitionKeySamples partition_key_samples;
+
+    for (size_t part_number = 0; part_number < all_parts.projection_parts.size(); ++part_number)
     {
-        const auto & part = all_parts[part_number];
+        if (query_status && !query_status->checkTimeLimit())
+            break;
+
+        slowDownSystemPartsEnumeration(info.table);
+
+        const auto & part = all_parts.projection_parts[part_number];
         const auto * parent_part = part->getParentPart();
+        chassert(parent_part);
+
         auto part_state = all_parts_state[part_number];
         auto columns_size = part->getTotalColumnsSize();
         auto parent_columns_size = parent_part->getTotalColumnsSize();
@@ -121,20 +145,30 @@ void StorageSystemProjectionPartsColumns::processNextStorage(
         auto index_size_in_bytes = part->getIndexSizeInBytes();
         auto index_size_in_allocated_bytes = part->getIndexSizeInAllocatedBytes();
 
-        using State = IMergeTreeDataPart::State;
+        using State = MergeTreeDataPartState;
 
+        /// The rendered text is identical for every column of a part.
+        String partition_str;
+        if (columns_mask[0])
+            partition_str = part->partition.serializeToString(partition_key_samples.get(*part));
+
+        bool time_limit_exceeded = false;
         size_t column_position = 0;
         auto & columns_info = projection_columns_info[part->name];
         for (const auto & column : part->getColumns())
         {
             ++column_position;
-            size_t src_index = 0, res_index = 0;
-            if (columns_mask[src_index++])
+            slowDownSystemPartsColumnsEnumeration(info.table, column_position);
+            if (query_status && column_position % COLUMNS_CANCELLATION_CHECK_PERIOD == 0 && !query_status->checkTimeLimit())
             {
-                WriteBufferFromOwnString out;
-                parent_part->partition.serializeText(*info.data, out, format_settings);
-                columns[res_index++]->insert(out.str());
+                time_limit_exceeded = true;
+                break;
             }
+
+            size_t src_index = 0;
+            size_t res_index = 0;
+            if (columns_mask[src_index++])
+                columns[res_index++]->insert(partition_str);
             if (columns_mask[src_index++])
                 columns[res_index++]->insert(part->name);
             if (columns_mask[src_index++])
@@ -146,7 +180,7 @@ void StorageSystemProjectionPartsColumns::processNextStorage(
             if (columns_mask[src_index++])
                 columns[res_index++]->insert(parent_part->getTypeName());
             if (columns_mask[src_index++])
-                columns[res_index++]->insert(part_state == State::Committed);
+                columns[res_index++]->insert(part_state == State::Active);
             if (columns_mask[src_index++])
                 columns[res_index++]->insert(part->getMarksCount());
             if (columns_mask[src_index++])
@@ -189,7 +223,7 @@ void StorageSystemProjectionPartsColumns::processNextStorage(
                 columns[res_index++]->insert(static_cast<UInt32>(min_max_time.second));
 
             if (columns_mask[src_index++])
-                columns[res_index++]->insert(parent_part->info.partition_id);
+                columns[res_index++]->insert(parent_part->info.getPartitionId());
             if (columns_mask[src_index++])
                 columns[res_index++]->insert(parent_part->info.min_block);
             if (columns_mask[src_index++])
@@ -210,9 +244,9 @@ void StorageSystemProjectionPartsColumns::processNextStorage(
             if (columns_mask[src_index++])
                 columns[res_index++]->insert(info.engine);
             if (columns_mask[src_index++])
-                columns[res_index++]->insert(part->volume->getDisk()->getName());
+                columns[res_index++]->insert(part->getDataPartStorage().getDiskName());
             if (columns_mask[src_index++])
-                columns[res_index++]->insert(part->getFullPath());
+                columns[res_index++]->insert(part->getDataPartStorage().getFullPath());
 
             if (columns_mask[src_index++])
                 columns[res_index++]->insert(column.name);
@@ -237,7 +271,7 @@ void StorageSystemProjectionPartsColumns::processNextStorage(
                     columns[res_index++]->insertDefault();
             }
 
-            ColumnSize column_size = part->getColumnSize(column.name, *column.type);
+            ColumnSize column_size = part->getColumnSize(column.name);
             if (columns_mask[src_index++])
                 columns[res_index++]->insert(column_size.data_compressed + column_size.marks);
             if (columns_mask[src_index++])
@@ -246,11 +280,24 @@ void StorageSystemProjectionPartsColumns::processNextStorage(
                 columns[res_index++]->insert(column_size.data_uncompressed);
             if (columns_mask[src_index++])
                 columns[res_index++]->insert(column_size.marks);
+            if (columns_mask[src_index++])
+            {
+                if (auto column_modification_time = part->getColumnModificationTime(column.name))
+                    columns[res_index++]->insert(UInt64(column_modification_time.value()));
+                else
+                    columns[res_index++]->insertDefault();
+            }
 
             if (has_state_column)
                 columns[res_index++]->insert(part->stateString());
         }
+
+        if (time_limit_exceeded)
+            break;
     }
 }
 
 }
+
+/// Register the source file of this system table for `system.documentation`.
+namespace DB { REGISTER_SYSTEM_TABLE_SOURCE(StorageSystemProjectionPartsColumns) }

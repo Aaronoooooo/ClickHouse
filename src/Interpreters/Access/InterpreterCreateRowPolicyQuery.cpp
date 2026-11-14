@@ -1,18 +1,27 @@
+#include <Interpreters/InterpreterFactory.h>
 #include <Interpreters/Access/InterpreterCreateRowPolicyQuery.h>
-#include <Parsers/Access/ASTCreateRowPolicyQuery.h>
-#include <Parsers/Access/ASTRowPolicyName.h>
-#include <Parsers/Access/ASTRolesOrUsersSet.h>
-#include <Parsers/formatAST.h>
+
 #include <Access/AccessControl.h>
 #include <Access/Common/AccessFlags.h>
+#include <Access/Common/AccessRightsElement.h>
 #include <Access/RowPolicy.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/executeDDLQueryOnCluster.h>
+#include <Interpreters/removeOnClusterClauseIfNeeded.h>
+#include <Parsers/Access/ASTCreateRowPolicyQuery.h>
+#include <Parsers/Access/ASTRolesOrUsersSet.h>
+#include <Parsers/Access/ASTRowPolicyName.h>
 #include <boost/range/algorithm/sort.hpp>
 
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int ACCESS_ENTITY_ALREADY_EXISTS;
+}
+
 namespace
 {
     void updateRowPolicyFromQueryImpl(
@@ -32,7 +41,7 @@ namespace
             policy.setRestrictive(*query.is_restrictive);
 
         for (const auto & [filter_type, filter] : query.filters)
-            policy.filters[static_cast<size_t>(filter_type)] = filter ? serializeAST(*filter) : String{};
+            policy.filters[static_cast<size_t>(filter_type)] = filter ? filter->formatWithSecretsOneLine() : String{};
 
         if (override_to_roles)
             policy.to_roles = *override_to_roles;
@@ -44,39 +53,65 @@ namespace
 
 BlockIO InterpreterCreateRowPolicyQuery::execute()
 {
-    auto & query = query_ptr->as<ASTCreateRowPolicyQuery &>();
-    auto & access_control = getContext()->getAccessControl();
-    getContext()->checkAccess(query.alter ? AccessType::ALTER_ROW_POLICY : AccessType::CREATE_ROW_POLICY);
+    const auto updated_query_ptr = removeOnClusterClauseIfNeeded(query_ptr, getContext());
+    auto & query = updated_query_ptr->as<ASTCreateRowPolicyQuery &>();
+    auto required_access = getRequiredAccess();
+
+    /// Reject invalid filters on user-facing CREATE/ALTER only. Deserialization of persisted
+    /// policies (ATTACH/replicated/restored) must not fail here; the query-time guard in
+    /// ContextAccess::getRowPolicyFilter rejects such policies when they are actually used.
+    for (const auto & [filter_type, filter] : query.filters)
+        checkRowPolicyFilterExpression(filter);
+
+    /// Must be done before replication: a DDL worker resolves a bare table name in its own current database.
+    query.replaceEmptyDatabase(getContext()->getCurrentDatabase());
 
     if (!query.cluster.empty())
     {
         query.replaceCurrentUserTag(getContext()->getUserName());
-        return executeDDLQueryOnCluster(query_ptr, getContext());
+        required_access.replaceEmptyDatabase(getContext()->getCurrentDatabase());
+        DDLQueryOnClusterParams params;
+        params.access_to_check = std::move(required_access);
+        return executeDDLQueryOnCluster(updated_query_ptr, getContext(), params);
     }
 
-    assert(query.names->cluster.empty());
+    chassert(query.names->cluster.empty());
+    auto & access_control = getContext()->getAccessControl();
+    getContext()->checkAccess(required_access);
+
     std::optional<RolesOrUsersSet> roles_from_query;
     if (query.roles)
+    {
         roles_from_query = RolesOrUsersSet{*query.roles, access_control, getContext()->getUserID()};
+        if (access_control.doesForbidSQLAccessEntitiesTargetingUsersConfig())
+            roles_from_query->throwIfTargetingUsersFromUsersConfig(access_control);
+    }
 
-    query.replaceEmptyDatabase(getContext()->getCurrentDatabase());
+    IAccessStorage * storage = &access_control;
+    MultipleAccessStorage::StoragePtr storage_ptr;
 
+    if (!query.storage_name.empty())
+    {
+        storage_ptr = access_control.getStorageByName(query.storage_name);
+        storage = storage_ptr.get();
+    }
+
+    Strings names = query.names->toStrings();
     if (query.alter)
     {
-        auto update_func = [&](const AccessEntityPtr & entity) -> AccessEntityPtr
+        auto update_func = [&](const AccessEntityPtr & entity, const UUID &) -> AccessEntityPtr
         {
             auto updated_policy = typeid_cast<std::shared_ptr<RowPolicy>>(entity->clone());
             updateRowPolicyFromQueryImpl(*updated_policy, query, {}, roles_from_query);
             return updated_policy;
         };
-        Strings names = query.names->toStrings();
         if (query.if_exists)
         {
-            auto ids = access_control.find<RowPolicy>(names);
-            access_control.tryUpdate(ids, update_func);
+            auto ids = storage->find<RowPolicy>(names);
+            storage->tryUpdate(ids, update_func);
         }
         else
-            access_control.update(access_control.getIDs<RowPolicy>(names), update_func);
+            storage->update(storage->getIDs<RowPolicy>(names), update_func);
     }
     else
     {
@@ -88,12 +123,21 @@ BlockIO InterpreterCreateRowPolicyQuery::execute()
             new_policies.emplace_back(std::move(new_policy));
         }
 
+        if (!query.storage_name.empty())
+        {
+            for (const auto & name : names)
+            {
+                if (auto another_storage_ptr = access_control.findExcludingStorage(AccessEntityType::ROW_POLICY, name, storage_ptr))
+                    throw Exception(ErrorCodes::ACCESS_ENTITY_ALREADY_EXISTS, "Row policy {} already exists in storage {}", name, another_storage_ptr->getStorageName());
+            }
+        }
+
         if (query.if_not_exists)
-            access_control.tryInsert(new_policies);
+            storage->tryInsert(new_policies);
         else if (query.or_replace)
-            access_control.insertOrReplace(new_policies);
+            storage->insertOrReplace(new_policies);
         else
-            access_control.insert(new_policies);
+            storage->insert(new_policies);
     }
 
     return {};
@@ -103,6 +147,35 @@ BlockIO InterpreterCreateRowPolicyQuery::execute()
 void InterpreterCreateRowPolicyQuery::updateRowPolicyFromQuery(RowPolicy & policy, const ASTCreateRowPolicyQuery & query)
 {
     updateRowPolicyFromQueryImpl(policy, query, {}, {});
+}
+
+
+AccessRightsElements InterpreterCreateRowPolicyQuery::getRequiredAccess() const
+{
+    const auto & query = query_ptr->as<const ASTCreateRowPolicyQuery &>();
+    AccessRightsElements res;
+
+    /// `CREATE ROW POLICY OR REPLACE` throws away an existing policy of the same name - including which
+    /// roles it applies to - so it is a drop followed by a create and requires the privileges of both.
+    /// `DROP ROW POLICY` is required whether or not the policy currently exists, mirroring `REPLACE
+    /// TABLE`, so that the check does not reveal which policies exist either.
+    AccessFlags access_type = query.alter ? AccessType::ALTER_ROW_POLICY : AccessType::CREATE_ROW_POLICY;
+    if (query.or_replace)
+        access_type |= AccessType::DROP_ROW_POLICY;
+
+    for (const auto & row_policy_name : query.names->full_names)
+        res.emplace_back(access_type, row_policy_name.database, row_policy_name.table_name);
+    return res;
+}
+
+void registerInterpreterCreateRowPolicyQuery(InterpreterFactory & factory);
+void registerInterpreterCreateRowPolicyQuery(InterpreterFactory & factory)
+{
+    auto create_fn = [] (const InterpreterFactory::Arguments & args)
+    {
+        return std::make_unique<InterpreterCreateRowPolicyQuery>(args.query, args.context);
+    };
+    factory.registerInterpreter("InterpreterCreateRowPolicyQuery", create_fn);
 }
 
 }

@@ -3,7 +3,6 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/IFunction.h>
-#include <Functions/PerformanceAdaptors.h>
 #include <Functions/FunctionsRandom.h>
 #include <pcg_random.hpp>
 #include <Common/randomSeed.h>
@@ -16,8 +15,6 @@ namespace DB
 {
 namespace ErrorCodes
 {
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int ILLEGAL_COLUMN;
     extern const int DECIMAL_OVERFLOW;
 }
 
@@ -25,11 +22,15 @@ namespace
 {
 
 /* Generate random fixed string with fully random bytes (including zero). */
-template <typename RandImpl>
-class FunctionRandomFixedStringImpl : public IFunction
+class FunctionRandomFixedString : public IFunction
 {
 public:
     static constexpr auto name = "randomFixedString";
+
+    static FunctionPtr create(ContextPtr)
+    {
+        return std::make_shared<FunctionRandomFixedString>();
+    }
 
     String getName() const override { return name; }
 
@@ -39,16 +40,9 @@ public:
 
     size_t getNumberOfArguments() const override { return 1; }
 
-    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
+    String getSignatureString() const override
     {
-        if (!isUnsignedInteger(arguments[0].type))
-            throw Exception("First argument for function " + getName() + " must be unsigned integer", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-        if (!arguments[0].column || !isColumnConst(*arguments[0].column))
-            throw Exception("First argument for function " + getName() + " must be constant", ErrorCodes::ILLEGAL_COLUMN);
-
-        const size_t n = assert_cast<const ColumnConst &>(*arguments[0].column).getValue<UInt64>();
-        return std::make_shared<DataTypeFixedString>(n);
+        return "(const N NativeUInt) -> FixedString(N)";
     }
 
     bool isDeterministic() const override { return false; }
@@ -64,9 +58,9 @@ public:
         if (input_rows_count == 0)
             return col_to;
 
-        size_t total_size;
+        size_t total_size = 0;
         if (common::mulOverflow(input_rows_count, n, total_size))
-            throw Exception("Decimal math overflow", ErrorCodes::DECIMAL_OVERFLOW);
+            throw Exception(ErrorCodes::DECIMAL_OVERFLOW, "Decimal math overflow");
 
         /// Fill random bytes.
         data_to.resize(total_size);
@@ -76,39 +70,31 @@ public:
     }
 };
 
-class FunctionRandomFixedString : public FunctionRandomFixedStringImpl<TargetSpecific::Default::RandImpl>
-{
-public:
-    explicit FunctionRandomFixedString(ContextPtr context) : selector(context)
-    {
-        selector.registerImplementation<TargetArch::Default,
-            FunctionRandomFixedStringImpl<TargetSpecific::Default::RandImpl>>();
-
-    #if USE_MULTITARGET_CODE
-        selector.registerImplementation<TargetArch::AVX2,
-            FunctionRandomFixedStringImpl<TargetSpecific::AVX2::RandImpl>>();
-    #endif
-    }
-
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
-    {
-        return selector.selectAndExecute(arguments, result_type, input_rows_count);
-    }
-
-    static FunctionPtr create(ContextPtr context)
-    {
-        return std::make_shared<FunctionRandomFixedString>(context);
-    }
-
-private:
-    ImplementationSelector<IFunction> selector;
-};
-
 }
 
-void registerFunctionRandomFixedString(FunctionFactory & factory)
+REGISTER_FUNCTION(RandomFixedString)
 {
-    factory.registerFunction<FunctionRandomFixedString>();
+    FunctionDocumentation::Description description = R"(
+Generates a random fixed-size string with the specified number of character.
+The returned characters are not necessarily ASCII characters, i.e. they may not be printable.
+    )";
+    FunctionDocumentation::Syntax syntax = "randomFixedString(length)";
+    FunctionDocumentation::Arguments arguments = {
+        {"length", "Length of the string in bytes.", {"UInt*"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns a string filled with random bytes.", {"FixedString"}};
+    FunctionDocumentation::Examples examples = {
+        {"Usage example", "SELECT randomFixedString(13) AS rnd, toTypeName(rnd)", R"(
+┌─rnd────────┬─toTypeName(randomFixedString(13))─┐
+│ j▒h㋖HɨZ'▒ │ FixedString(13)                   │
+└────────────┴───────────────────────────────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 5};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::RandomNumber;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionRandomFixedString>(documentation);
 }
 
 }

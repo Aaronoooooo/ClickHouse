@@ -7,25 +7,60 @@ namespace DB
 {
 String quoteString(std::string_view x)
 {
-    String res(x.size(), '\0');
+    String res(2 + x.size(), '\0');
     WriteBufferFromString wb(res);
     writeQuotedString(x, wb);
     return res;
 }
 
-
-String doubleQuoteString(const StringRef & x)
+String quoteStringSingleQuoteWithSingleQuote(std::string_view x)
 {
-    String res(x.size, '\0');
+    String res(2 + x.size(), '\0');
+    WriteBufferFromString wb(res);
+    writeQuotedStringPostgreSQL(x, wb);
+    return res;
+}
+
+
+String quoteStringPostgreSQL(std::string_view x)
+{
+    WriteBufferFromOwnString wb;
+    writeQuotedStringPostgreSQLLossless(x, wb);
+    return wb.str();
+}
+
+
+String doubleQuoteString(std::string_view x)
+{
+    String res(2 + x.size(), '\0');
     WriteBufferFromString wb(res);
     writeDoubleQuotedString(x, wb);
     return res;
 }
 
 
-String backQuote(const StringRef & x)
+String doubleQuoteStringPostgreSQL(std::string_view x)
 {
-    String res(x.size, '\0');
+    WriteBufferFromOwnString wb;
+    writeDoubleQuotedStringPostgreSQL(x, wb);
+    return wb.str();
+}
+
+
+String doubleQuoteStringSQLite(std::string_view x)
+{
+    String res(2 + x.size(), '\0');
+    {
+        WriteBufferFromString wb(res);
+        writeDoubleQuotedStringSQLite(x, wb);
+    }
+    return res;
+}
+
+
+String backQuote(std::string_view x)
+{
+    String res(2 + x.size(), '\0');
     {
         WriteBufferFromString wb(res);
         writeBackQuotedString(x, wb);
@@ -34,12 +69,33 @@ String backQuote(const StringRef & x)
 }
 
 
-String backQuoteIfNeed(const StringRef & x)
+String backQuoteIfNeed(std::string_view x)
 {
-    String res(x.size, '\0');
+    String res(2 + x.size(), '\0');
     {
         WriteBufferFromString wb(res);
         writeProbablyBackQuotedString(x, wb);
+    }
+    return res;
+}
+
+
+String backQuoteMySQL(std::string_view x)
+{
+    String res(2 + x.size(), '\0');
+    {
+        WriteBufferFromString wb(res);
+        writeBackQuotedStringMySQL(x, wb);
+    }
+    return res;
+}
+
+String backQuoteSQLite(std::string_view x)
+{
+    String res(2 + x.size(), '\0');
+    {
+        WriteBufferFromString wb(res);
+        writeBackQuotedStringSQLite(x, wb);
     }
     return res;
 }

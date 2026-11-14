@@ -1,6 +1,16 @@
 #pragma once
-#include <QueryPipeline/PipelineResourcesHolder.h>
+
+#include <Core/Block_fwd.h>
+#include <QueryPipeline/QueryPlanResourceHolder.h>
+#include <QueryPipeline/SizeLimits.h>
+#include <QueryPipeline/StreamLocalLimits.h>
+#include <Interpreters/Context_fwd.h>
+#include <Common/VectorWithMemoryTracking.h>
+
 #include <functional>
+
+#include <list>
+#include <memory>
 
 namespace DB
 {
@@ -10,9 +20,12 @@ class OutputPort;
 
 class IProcessor;
 using ProcessorPtr = std::shared_ptr<IProcessor>;
-using Processors = std::vector<ProcessorPtr>;
+using Processors = std::list<ProcessorPtr>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
 
 class QueryStatus;
+class StepProfiler;
+using StepProfilerPtr = std::shared_ptr<StepProfiler>;
+using QueryStatusPtr = std::shared_ptr<QueryStatus>;
 
 struct Progress;
 using ProgressCallback = std::function<void(const Progress & progress)>;
@@ -27,21 +40,32 @@ class IOutputFormat;
 class SinkToStorage;
 class ISource;
 class ISink;
+class ReadProgressCallback;
+
+struct ColumnWithTypeAndName;
+using ColumnsWithTypeAndName = VectorWithMemoryTracking<ColumnWithTypeAndName>;
+
+class QueryResultCacheWriter;
+
+class SourceFromChunks;
 
 class QueryPipeline
 {
 public:
     QueryPipeline();
-    QueryPipeline(QueryPipeline &&);
+    QueryPipeline(QueryPipeline &&) noexcept;
     QueryPipeline(const QueryPipeline &) = delete;
 
-    QueryPipeline & operator=(QueryPipeline &&);
+    /// Not noexcept: move-assignment appends QueryPlanResourceHolder resources, which allocates
+    /// through memory-tracking containers and can throw MEMORY_LIMIT_EXCEEDED.
+    QueryPipeline & operator=(QueryPipeline &&); /// NOLINT(hicpp-noexcept-move,performance-noexcept-move-constructor)
     QueryPipeline & operator=(const QueryPipeline &) = delete;
 
     ~QueryPipeline();
 
-    /// pulling
+    /// pulling or completed
     explicit QueryPipeline(Pipe pipe);
+    /// pulling
     explicit QueryPipeline(std::shared_ptr<ISource> source);
     /// pushing
     explicit QueryPipeline(Chain chain);
@@ -50,30 +74,30 @@ public:
 
     /// completed
     QueryPipeline(
-        PipelineResourcesHolder resources_,
-        Processors processors_);
+        QueryPlanResourceHolder resources_,
+        std::shared_ptr<Processors> processors_);
 
     /// pushing
     QueryPipeline(
-        PipelineResourcesHolder resources_,
-        Processors processors_,
+        QueryPlanResourceHolder resources_,
+        std::shared_ptr<Processors> processors_,
         InputPort * input_);
 
     /// pulling
     QueryPipeline(
-        PipelineResourcesHolder resources_,
-        Processors processors_,
+        QueryPlanResourceHolder resources_,
+        std::shared_ptr<Processors> processors_,
         OutputPort * output_,
         OutputPort * totals_ = nullptr,
         OutputPort * extremes_ = nullptr);
 
-    bool initialized() const { return !processors.empty(); }
+    bool initialized() const { return processors && !processors->empty(); }
     /// When initialized, exactly one of the following is true.
     /// Use PullingPipelineExecutor or PullingAsyncPipelineExecutor.
     bool pulling() const { return output != nullptr; }
     /// Use PushingPipelineExecutor or PushingAsyncPipelineExecutor.
     bool pushing() const { return input != nullptr; }
-    /// Use PipelineExecutor. Call execute() to build one.
+    /// Use CompletedPipelineExecutor.
     bool completed() const { return initialized() && !pulling() && !pushing(); }
 
     /// Only for pushing.
@@ -86,24 +110,80 @@ public:
 
     /// Only for pushing and pulling.
     Block getHeader() const;
+    SharedHeader getSharedHeader() const;
 
     size_t getNumThreads() const { return num_threads; }
     void setNumThreads(size_t num_threads_) { num_threads = num_threads_; }
 
-    void setProcessListElement(QueryStatus * elem);
+    bool getConcurrencyControl() const { return concurrency_control; }
+    void setConcurrencyControl(bool concurrency_control_) { concurrency_control = concurrency_control_; }
+
+    void setProcessListElement(QueryStatusPtr elem);
+    QueryStatusPtr getProcessListElement() const { return process_list_element; }
     void setProgressCallback(const ProgressCallback & callback);
-    void setLimitsAndQuota(const StreamLocalLimits & limits, std::shared_ptr<const EnabledQuota> quota);
+    void setLimitsAndQuota(const StreamLocalLimits & limits, std::shared_ptr<const EnabledQuota> quota_);
     bool tryGetResultRowsAndBytes(UInt64 & result_rows, UInt64 & result_bytes) const;
+
+    void writeResultIntoQueryResultCache(std::shared_ptr<QueryResultCacheWriter> query_result_cache_writer);
+    void finalizeWriteInQueryResultCache();
+    void readFromQueryResultCache(
+        std::unique_ptr<SourceFromChunks> source,
+        std::unique_ptr<SourceFromChunks> source_totals,
+        std::unique_ptr<SourceFromChunks> source_extremes);
+
+    void setQuota(std::shared_ptr<const EnabledQuota> quota_);
+
+    /// Normalized query hash, propagated to the quota accounting callbacks so that
+    /// `NORMALIZED_QUERY_HASH` quotas bucket their resources per query pattern.
+    void setNormalizedQueryHash(UInt64 normalized_query_hash_) { normalized_query_hash = normalized_query_hash_; }
 
     void addStorageHolder(StoragePtr storage);
 
-    const Processors & getProcessors() const { return processors; }
+    /// Existing resources are not released here, see move ctor for QueryPlanResourceHolder.
+    void addResources(QueryPlanResourceHolder holder) { resources = std::move(holder); }
+
+    /// Skip updating profile events.
+    /// For merges in mutations it may need special logic, it's done inside ProgressCallback.
+    void disableProfileEventUpdate() { update_profile_events = false; }
+    /// Do not account rows read by this pipeline in the query progress and read limits.
+    void disableReadProgress() { report_read_progress = false; }
+
+    /// Create progress callback from limits and quotas.
+    std::unique_ptr<ReadProgressCallback> getReadProgressCallback() const;
+
+    /// EXPLAIN ANALYZE: the executor of this pipeline records step timings into it.
+    void setStepProfiler(StepProfilerPtr step_profiler_);
+    StepProfilerPtr getStepProfiler() const { return step_profiler; }
+
+    /// Only for completed. Make a pipe from all processors of the pipeline and `output_processor`,
+    /// whose inputs are connected to the processors of the pipeline, and whose not connected outputs become the outputs of the pipe.
+    /// The resources of the pipeline are moved to `resources_`.
+    static Pipe toPipeWithOutputProcessor(QueryPipeline pipeline, ProcessorPtr output_processor, QueryPlanResourceHolder & resources_);
+
+    /// Add processors and resources from other pipeline. Other pipeline should be completed.
+    void addCompletedPipeline(QueryPipeline && other);
+    void addCompletedPipeline(const QueryPipeline & other);
+
+    const Processors & getProcessors() const { return *processors; }
+
+    /// For pulling pipeline, convert structure to expected.
+    /// Trash, need to remove later.
+    void convertStructureTo(const ColumnsWithTypeAndName & columns, const ContextPtr & context);
 
     void reset();
+    void cancel() noexcept;
 
 private:
-    PipelineResourcesHolder resources;
-    Processors processors;
+    QueryPlanResourceHolder resources;
+
+    ProgressCallback progress_callback;
+    std::shared_ptr<const EnabledQuota> quota;
+    UInt64 normalized_query_hash = 0;
+    bool update_profile_events = true;
+    bool report_read_progress = true;
+    StepProfilerPtr step_profiler;
+
+    std::shared_ptr<Processors> processors;
 
     InputPort * input = nullptr;
 
@@ -111,11 +191,12 @@ private:
     OutputPort * totals = nullptr;
     OutputPort * extremes = nullptr;
 
-    QueryStatus * process_list_element = nullptr;
+    QueryStatusPtr process_list_element;
 
     IOutputFormat * output_format = nullptr;
 
     size_t num_threads = 0;
+    bool concurrency_control = false;
 
     friend class PushingPipelineExecutor;
     friend class PullingPipelineExecutor;

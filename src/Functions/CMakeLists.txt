@@ -1,125 +1,240 @@
-configure_file(config_functions.h.in ${ConfigIncludePath}/config_functions.h)
-
-add_subdirectory(divide)
-
 include("${ClickHouse_SOURCE_DIR}/cmake/dbms_glob_sources.cmake")
 add_headers_and_sources(clickhouse_functions .)
+add_headers_and_sources(clickhouse_functions AI)
+add_headers_and_sources(clickhouse_functions Kusto)
 
-list(REMOVE_ITEM clickhouse_functions_sources IFunction.cpp FunctionFactory.cpp FunctionHelpers.cpp)
-list(REMOVE_ITEM clickhouse_functions_headers IFunction.h FunctionFactory.h FunctionHelpers.h)
+# These files are moved from clickhouse_functions into dbms to make dbms self-contained (not depend on clickhouse_functions)
+# This allows less dependency and linker work (specially important when building many example executables)
+set(DBMS_FUNCTIONS
+    ComparisonOrderDomain.cpp # ComparisonOrderDomain::operator== (Used by LogicalExpressionOptimizerPass.cpp)
+    IFunction.cpp # IFunctionOverloadResolver::getLambdaArgumentTypes, IExecutableFunction::execute... (Many AST visitors, analyzer passes, some storages...)
+    IFunctionAdaptors.cpp # FunctionToFunctionBaseAdaptor (Used by FunctionFactory.cpp)
+    FunctionDynamicAdaptor.cpp # IFunctionOverloadResolver::getLambdaArgumentTypes, IExecutableFunction::execute... (Many AST visitors, analyzer passes, some storages...)
+    FunctionVariantAdaptor.cpp # IFunctionOverloadResolver::build, IExecutableFunction::execute... (For Variant type support)
+    TypeMismatchStrictness.cpp # shouldThrowOnVariantTypeMismatch, shouldThrowOnDynamicTypeMismatch (Used by the Variant/Dynamic adaptors above)
+    FunctionFactory.cpp # FunctionFactory::instance() (Many AST visitors, analyzer passes, some storages...)
+    FunctionHelpers.cpp # convertConstTupleToConstantElements, checkAndGetColumnConstStringOrFixedString, checkAndGetNestedArrayOffset ...)
+    FunctionsLogical.cpp # createInternalFunctionAndOverloadResolve / createInternalFunctionOrOverloadResolver ... (Multiple)
+    if.cpp # createInternalFunctionIfOverloadResolver (Used by MultiIfToIfPass.cpp)
+    multiIf.cpp # createInternalMultiIfOverloadResolver (Used by IfChainToMultiIfPass.cpp)
+    checkHyperscanRegexp.cpp # checkHyperscanRegexp (Used by MultiMatchAnyImpl.h, multiMatchAny.cpp)
+    CastOverloadResolver.cpp # createInternalCast (Used by WindowTransform.cpp, KeyCondition.cpp...)
+    FunctionsConversion.cpp # createFunctionBaseCast (Used by CastOverloadResolver.cpp)
+    FunctionsConversion_impl00.cpp
+    FunctionsConversion_impl01.cpp
+    FunctionsConversion_impl02.cpp
+    FunctionsConversion_impl03.cpp
+    FunctionsConversion_impl04.cpp
+    FunctionsConversion_impl05.cpp
+    FunctionsConversion_impl06.cpp
+    FunctionsConversion_impl07.cpp
+    FunctionsConversion_impl08.cpp
+    FunctionsConversion_impl09.cpp
+    FunctionsConversion_impl10.cpp
+    FunctionsConversion_impl11.cpp
+    FunctionsConversion_impl12.cpp
+    FunctionsConversion_impl13.cpp
+    FunctionsConversion_impl14.cpp
+    FunctionsConversion_impl15.cpp
+    FunctionsConversion_impl16.cpp
+    FunctionsConversion_impl17.cpp
+    FunctionsConversion_impl18.cpp
+    FunctionsConversion_impl19.cpp
+    FunctionsConversion_impl20.cpp
+    FunctionsConversion_impl21.cpp
+    FunctionsConversion_impl22.cpp
+    FunctionsConversion_impl23.cpp
+    FunctionsConversion_impl24.cpp
+    FunctionsConversion_impl25.cpp
+    FunctionsConversion_impl26.cpp
+    FunctionsConversion_impl27.cpp
+    FunctionsConversion_impl28.cpp
+    FunctionsConversion_impl1.cpp
+    FunctionsConversion_impl2.cpp
+    FunctionsConversion_impl3.cpp
+    FunctionTopKFilter.cpp # createInternalFunctionTopKFilterResolver used from optimizeTopK.cpp
+    productQuantization.cpp # createInternalFunctionPQDistanceResolver used from useVectorSearchWithQuantizedCodes.cpp
+    vectorQuantization.cpp # createInternalFunctionQuantizeDistanceResolver used from useVectorSearchWithQuantizedCodes.cpp
+    extractTimeZoneFromFunctionArguments.cpp # extractTimeZoneFromFunctionArguments (DateTimeTransforms.h, FunctionsConversion.cpp)
+    generateSnowflakeID.cpp
+    FunctionGenerateRandomStructure.cpp # FunctionGenerateRandomStructure::generateRandomDataType (Used by StorageGenerateRandom.cpp)
+    extractKeyValuePairs.cpp # KeyValuePairExtractor (Used by HivePartitioningUtils.cpp)
+    indexHint.cpp # FunctionIndexHint::createImplied, FunctionIndexHint::tryGet (Used by LogicalExpressionOptimizerPass.cpp, ActionsDAG.cpp, filterPushDown.cpp...)
+)
+extract_into_parent_list(clickhouse_functions_sources dbms_sources ${DBMS_FUNCTIONS})
+extract_into_parent_list(clickhouse_functions_headers dbms_headers
+    ComparisonOrderDomain.h
+    IFunction.h
+    FunctionFactory.h
+    FunctionHelpers.h
+    extractTimeZoneFromFunctionArguments.h
+    FunctionsLogical.h
+    CastOverloadResolver.h
+    extractKeyValuePairs.h
+)
 
-add_library(clickhouse_functions ${clickhouse_functions_sources})
+add_library(clickhouse_functions_obj OBJECT ${clickhouse_functions_headers} ${clickhouse_functions_sources})
+if (OMIT_HEAVY_DEBUG_SYMBOLS)
+    target_compile_options(clickhouse_functions_obj PRIVATE "-g1")
+endif()
 
-target_link_libraries(clickhouse_functions
-    PUBLIC
-        ${BASE64_LIBRARY}
-        ${CITYHASH_LIBRARIES}
-        ${FARMHASH_LIBRARIES}
-        ${FASTOPS_LIBRARY}
+list (APPEND OBJECT_LIBS $<TARGET_OBJECTS:clickhouse_functions_obj>)
+
+list (APPEND PUBLIC_LIBS
+        ch_contrib::wyhash
+        ch_contrib::cityhash
+        ch_contrib::farmhash
         clickhouse_dictionaries
         clickhouse_dictionaries_embedded
         clickhouse_parsers
-        consistent-hashing
+        ch_contrib::consistent_hashing
+        common
         dbms
-        metrohash
-        murmurhash
-
-    PRIVATE
-        ${ZLIB_LIBRARIES}
-        boost::filesystem
-        divide_impl
+        ch_contrib::metrohash
+        ch_contrib::murmurhash
+        ch_contrib::morton_nd
 )
 
-if (OPENSSL_CRYPTO_LIBRARY)
-    target_link_libraries(clickhouse_functions PUBLIC ${OPENSSL_CRYPTO_LIBRARY})
+list (APPEND PRIVATE_LIBS
+        ch_contrib::zlib
+        boost::filesystem
+        ch_contrib::libdivide
+        ch_contrib::xxHash
+        ch_contrib::stringzilla
+)
+
+if (TARGET OpenSSL::Crypto)
+    list (APPEND PUBLIC_LIBS OpenSSL::Crypto)
 endif()
 
-target_include_directories(clickhouse_functions SYSTEM PRIVATE ${SPARSEHASH_INCLUDE_DIR})
-
-if (CMAKE_BUILD_TYPE_UC STREQUAL "RELEASE"
-    OR CMAKE_BUILD_TYPE_UC STREQUAL "RELWITHDEBINFO"
-    OR CMAKE_BUILD_TYPE_UC STREQUAL "MINSIZEREL")
-    set (STRIP_DSF_DEFAULT ON)
-else()
-    set (STRIP_DSF_DEFAULT OFF)
-endif()
-
-
-#  Provides faster linking and lower binary size.
-#  Tradeoff is the inability to debug some source files with e.g. gdb
-#  (empty stack frames and no local variables)."
-option(STRIP_DEBUG_SYMBOLS_FUNCTIONS "Do not generate debugger info for ClickHouse functions" ${STRIP_DSF_DEFAULT})
-
-if (STRIP_DEBUG_SYMBOLS_FUNCTIONS)
-    message(WARNING "Not generating debugger info for ClickHouse functions")
-    target_compile_options(clickhouse_functions PRIVATE "-g0")
-else()
-    message(STATUS "Generating debugger info for ClickHouse functions")
-endif()
-
-if (USE_ICU)
-    target_link_libraries (clickhouse_functions PRIVATE ${ICU_LIBRARIES})
-    target_include_directories(clickhouse_functions SYSTEM PRIVATE ${ICU_INCLUDE_DIRS})
+if (TARGET ch_contrib::icu)
+    list (APPEND PRIVATE_LIBS ch_contrib::icu)
 endif ()
 
-if (USE_FASTOPS)
-    target_include_directories (clickhouse_functions SYSTEM PRIVATE ${FASTOPS_INCLUDE_DIR})
+if (TARGET ch_contrib::fastops)
+    list (APPEND PRIVATE_LIBS ch_contrib::fastops)
 endif ()
 
-if (ENABLE_EXAMPLES)
-    add_subdirectory(examples)
+if (TARGET ch_contrib::llvm)
+    list (APPEND PRIVATE_LIBS ch_contrib::llvm)
 endif ()
 
-if (USE_EMBEDDED_COMPILER)
-    target_link_libraries(clickhouse_functions PRIVATE ${REQUIRED_LLVM_LIBRARIES})
-    target_include_directories(clickhouse_functions SYSTEM BEFORE PUBLIC ${LLVM_INCLUDE_DIRS})
-endif ()
-
-if(USE_BASE64)
-    target_include_directories(clickhouse_functions SYSTEM PRIVATE ${BASE64_INCLUDE_DIR})
+if (TARGET ch_contrib::bech32)
+    list (APPEND PRIVATE_LIBS ch_contrib::bech32)
 endif()
 
-target_link_libraries(clickhouse_functions PRIVATE lz4)
-
-if (USE_H3)
-    target_link_libraries(clickhouse_functions PRIVATE ${H3_LIBRARY})
-    target_include_directories(clickhouse_functions SYSTEM PRIVATE ${H3_INCLUDE_DIR})
+if (TARGET ch_contrib::simdutf)
+    list (APPEND PRIVATE_LIBS ch_contrib::simdutf)
 endif()
 
-target_link_libraries(clickhouse_functions PRIVATE hyperscan)
-
-if(USE_SIMDJSON)
-    target_link_libraries(clickhouse_functions PRIVATE simdjson)
+if (ENABLE_NLP)
+    list (APPEND PRIVATE_LIBS ch_contrib::cld2)
 endif()
 
-if(USE_RAPIDJSON)
-    target_include_directories(clickhouse_functions SYSTEM PRIVATE ${RAPIDJSON_INCLUDE_DIR})
+if (TARGET ch_contrib::sqids)
+    list (APPEND PRIVATE_LIBS ch_contrib::sqids)
 endif()
 
-# ClickHouse developers may use platform-dependent code under some macro (e.g. `#ifdef ENABLE_MULTITARGET`).
-# If turned ON, this option defines such macro.
-# See `src/Functions/TargetSpecific.h`
-option(ENABLE_MULTITARGET_CODE "Enable platform-dependent code" ON)
+if (TARGET ch_contrib::idna)
+    list (APPEND PRIVATE_LIBS ch_contrib::idna)
+endif()
 
-if (ENABLE_MULTITARGET_CODE)
-    add_definitions(-DENABLE_MULTITARGET_CODE=1)
-else()
-    add_definitions(-DENABLE_MULTITARGET_CODE=0)
+if (TARGET ch_contrib::h3)
+    list (APPEND PRIVATE_LIBS ch_contrib::h3)
+endif()
+
+if (TARGET ch_contrib::wagyu)
+    list (APPEND PRIVATE_LIBS ch_contrib::wagyu)
+endif()
+
+if (TARGET ch_contrib::vectorscan)
+    list (APPEND PRIVATE_LIBS ch_contrib::vectorscan)
+endif()
+
+if (TARGET ch_contrib::simdjson)
+    list (APPEND PRIVATE_LIBS ch_contrib::simdjson)
+endif()
+
+if (TARGET ch_contrib::rapidjson)
+    list (APPEND PRIVATE_LIBS ch_contrib::rapidjson)
+endif()
+
+if (TARGET ch_contrib::pocketfft)
+    list (APPEND PRIVATE_LIBS ch_contrib::pocketfft)
+endif()
+
+if (TARGET ch_contrib::ipcrypt2)
+    list (APPEND PRIVATE_LIBS ch_contrib::ipcrypt2)
+endif()
+
+if (TARGET ch_contrib::crc32-vpmsum)
+    list (APPEND PUBLIC_LIBS ch_contrib::crc32-vpmsum)
 endif()
 
 add_subdirectory(GatherUtils)
-target_link_libraries(clickhouse_functions PRIVATE clickhouse_functions_gatherutils)
+list (APPEND PRIVATE_LIBS clickhouse_functions_gatherutils)
 
 add_subdirectory(URL)
-target_link_libraries(clickhouse_functions PRIVATE clickhouse_functions_url)
+list (APPEND OBJECT_LIBS $<TARGET_OBJECTS:clickhouse_functions_url>)
 
 add_subdirectory(array)
-target_link_libraries(clickhouse_functions PRIVATE clickhouse_functions_array)
+list (APPEND OBJECT_LIBS $<TARGET_OBJECTS:clickhouse_functions_array>)
+
+add_subdirectory(TimeSeries)
+list (APPEND OBJECT_LIBS $<TARGET_OBJECTS:clickhouse_functions_time_series>)
+
+if (TARGET ch_contrib::datasketches)
+    add_subdirectory(UniqTheta)
+    list (APPEND OBJECT_LIBS $<TARGET_OBJECTS:clickhouse_functions_uniqtheta>)
+endif()
 
 add_subdirectory(JSONPath)
+list (APPEND PRIVATE_LIBS clickhouse_functions_jsonpath)
 
 # Signed integer overflow on user-provided data inside boost::geometry - ignore.
 set_source_files_properties("pointInPolygon.cpp" PROPERTIES COMPILE_FLAGS -fno-sanitize=signed-integer-overflow)
 
-# target_link_libraries(clickhouse_functions PRIVATE ${S2_LIBRARY})
-target_include_directories(clickhouse_functions SYSTEM PUBLIC ${S2_GEOMETRY_INCLUDE_DIR})
+# TODO: at v3 these wrapper TUs regress because the SLP vectorizer / SIMD-aware codegen
+# fires inside the per-row dispatch (YMM scratch zero-init in `stringJaccardIndex`,
+# YMM `ColumnString` prologue forcing `vzeroupper` around `randomString`'s `getUInt`,
+# longer BMI2 encodings in `XXH3`'s short-input fast path crossing a 16-byte fetch boundary).
+# Compiling at v2 restores master codegen; the actual AVX2 kernels they call live in other TUs.
+if (ARCH_AMD64 AND X86_ARCH_LEVEL VERSION_GREATER_EQUAL 3)
+    set_source_files_properties(FunctionsStringDistance.cpp PROPERTIES COMPILE_FLAGS "-march=x86-64-v2")
+    set_source_files_properties(randomString.cpp PROPERTIES COMPILE_FLAGS "-march=x86-64-v2")
+    set_source_files_properties(FunctionsHashingMisc.cpp PROPERTIES COMPILE_FLAGS "-march=x86-64-v2")
+endif()
+
+if (USE_GPERF)
+    # Only for regenerating
+    add_custom_target(generate-html-char-ref-gperf ./HTMLCharacterReference.sh
+            SOURCES ./HTMLCharacterReference.sh
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            BYPRODUCTS "${CMAKE_CURRENT_SOURCE_DIR}/HTMLCharacterReference.gperf"
+            )
+    add_custom_target(generate-html-char-ref ${GPERF} -t HTMLCharacterReference.gperf --output-file=HTMLCharacterReference.generated.cpp
+            && clang-format -i HTMLCharacterReference.generated.cpp
+            # for clang-tidy, since string.h is deprecated
+            && sed -i 's/\#include <string.h>/\#include <cstring>/g' HTMLCharacterReference.generated.cpp
+            # the table must be constexpr for the compile-time entity-expansion static_assert in the .gperf
+            && sed -i 's/static const struct NameAndGlyph wordlist/static constexpr struct NameAndGlyph wordlist/g' HTMLCharacterReference.generated.cpp
+            SOURCES HTMLCharacterReference.gperf
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            )
+    add_dependencies(generate-html-char-ref generate-html-char-ref-gperf)
+    if (NOT TARGET generate-source)
+        add_custom_target(generate-source)
+    endif ()
+    add_dependencies(generate-source generate-html-char-ref)
+endif ()
+
+# Update after all the includes
+set(dbms_sources "${dbms_sources}" PARENT_SCOPE)
+set(dbms_headers "${dbms_headers}" PARENT_SCOPE)
+
+target_link_libraries(clickhouse_functions_obj PUBLIC ${PUBLIC_LIBS} PRIVATE ${PRIVATE_LIBS})
+
+# Used to forward the linking information to the final binaries such as clickhouse / unit_tests_dbms,
+# since such information are lost after we convert to OBJECT target
+add_library(clickhouse_functions INTERFACE)
+target_link_libraries(clickhouse_functions INTERFACE ${OBJECT_LIBS} ${PUBLIC_LIBS} ${PRIVATE_LIBS})

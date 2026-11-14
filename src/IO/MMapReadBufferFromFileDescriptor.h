@@ -18,7 +18,7 @@ public:
     off_t seek(off_t off, int whence) override;
 
 protected:
-    MMapReadBufferFromFileDescriptor() {}
+    MMapReadBufferFromFileDescriptor() = default;
     void init();
 
     MMappedFileDescriptor mapped;
@@ -33,9 +33,21 @@ public:
     void finish();
 
     off_t getPosition() override;
+
     std::string getFileName() const override;
+
     int getFD() const;
+
+    std::optional<size_t> tryGetFileSize() override;
+
+    size_t readBigAt(char * to, size_t n, size_t offset, const std::function<bool(size_t)> &) const override;
+    bool supportsReadAt() override { return true; }
+
+    /// mmap has no producer behind `nextImpl` -- `working_buffer` already points at the entire
+    /// mapped region. After `set(dest, size)` the buffer cannot refill into `dest`, so callers
+    /// must use `read(dest, n)` instead, which memcpys from the mapped region into the caller's
+    /// buffer.
+    bool supportsExternalBufferMode() const override { return false; }
 };
 
 }
-

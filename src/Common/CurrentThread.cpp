@@ -1,9 +1,9 @@
 #include <memory>
 
-#include "CurrentThread.h"
-#include <base/logger_useful.h>
+#include <Common/CurrentThread.h>
+#include <Common/logger_useful.h>
+#include <Common/MemoryPressureMonitor.h>
 #include <Common/ThreadStatus.h>
-#include <Common/TaskStatsInfoGetter.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/Context.h>
 #include <base/getThreadId.h>
@@ -12,6 +12,8 @@
 
 namespace DB
 {
+
+constinit FiberLocal<ThreadStatus *, FiberLocalSlot::CURRENT_THREAD> current_thread;
 
 namespace ErrorCodes
 {
@@ -25,6 +27,13 @@ void CurrentThread::updatePerformanceCounters()
     current_thread->updatePerformanceCounters();
 }
 
+void CurrentThread::updatePerformanceCountersIfNeeded()
+{
+    if (unlikely(!current_thread))
+        return;
+    current_thread->updatePerformanceCountersIfNeeded();
+}
+
 bool CurrentThread::isInitialized()
 {
     return current_thread;
@@ -33,19 +42,19 @@ bool CurrentThread::isInitialized()
 ThreadStatus & CurrentThread::get()
 {
     if (unlikely(!current_thread))
-        throw Exception("Thread #" + std::to_string(getThreadId()) + " status was not initialized", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} status was not initialized", std::to_string(getThreadId()));
 
     return *current_thread;
 }
 
 ProfileEvents::Counters & CurrentThread::getProfileEvents()
 {
-    return current_thread ? current_thread->performance_counters : ProfileEvents::global_counters;
+    return current_thread ? *current_thread->current_performance_counters : ProfileEvents::global_counters;
 }
 
 MemoryTracker * CurrentThread::getMemoryTracker()
 {
-    if (unlikely(!current_thread))
+    if (!current_thread) [[unlikely]]
         return nullptr;
     return &current_thread->memory_tracker;
 }
@@ -64,6 +73,23 @@ void CurrentThread::updateProgressOut(const Progress & value)
     current_thread->progress_out.incrementPiecewiseAtomically(value);
 }
 
+std::shared_ptr<InternalTextLogsQueue> CurrentThread::getInternalTextLogsQueue()
+{
+    /// NOTE: this method could be called at early server startup stage
+    if (unlikely(!current_thread))
+        return nullptr;
+
+    return current_thread->getInternalTextLogsQueue();
+}
+
+InternalProfileEventsQueuePtr CurrentThread::getInternalProfileEventsQueue()
+{
+    if (unlikely(!current_thread))
+        return nullptr;
+
+    return current_thread->getInternalProfileEventsQueue();
+}
+
 void CurrentThread::attachInternalTextLogsQueue(const std::shared_ptr<InternalTextLogsQueue> & logs_queue,
                                                 LogsLevel client_logs_level)
 {
@@ -72,49 +98,178 @@ void CurrentThread::attachInternalTextLogsQueue(const std::shared_ptr<InternalTe
     current_thread->attachInternalTextLogsQueue(logs_queue, client_logs_level);
 }
 
-void CurrentThread::setFatalErrorCallback(std::function<void()> callback)
+CurrentThread::HideLogsFromClientScope::HideLogsFromClientScope()
 {
     if (unlikely(!current_thread))
         return;
-    current_thread->setFatalErrorCallback(callback);
-}
-
-std::shared_ptr<InternalTextLogsQueue> CurrentThread::getInternalTextLogsQueue()
-{
-    /// NOTE: this method could be called at early server startup stage
-    if (unlikely(!current_thread))
-        return nullptr;
-
-    if (current_thread->getCurrentState() == ThreadStatus::ThreadState::Died)
-        return nullptr;
-
-    return current_thread->getInternalTextLogsQueue();
-}
-
-void CurrentThread::attachInternalProfileEventsQueue(const InternalProfileEventsQueuePtr & queue)
-{
-    if (unlikely(!current_thread))
+    logs_queue_to_restore = current_thread->getInternalTextLogsQueue();
+    if (!logs_queue_to_restore)
         return;
-    current_thread->attachInternalProfileEventsQueue(queue);
+    client_logs_level_to_restore = current_thread->getClientLogsLevel();
+    current_thread->attachInternalTextLogsQueue(nullptr, LogsLevel::none);
+    restore = true;
 }
 
-InternalProfileEventsQueuePtr CurrentThread::getInternalProfileEventsQueue()
+CurrentThread::HideLogsFromClientScope::~HideLogsFromClientScope()
 {
-    if (unlikely(!current_thread))
-        return nullptr;
-
-    if (current_thread->getCurrentState() == ThreadStatus::ThreadState::Died)
-        return nullptr;
-
-    return current_thread->getInternalProfileEventsQueue();
+    if (restore)
+        CurrentThread::attachInternalTextLogsQueue(logs_queue_to_restore, client_logs_level_to_restore);
 }
 
-ThreadGroupStatusPtr CurrentThread::getGroup()
+
+ThreadGroupPtr CurrentThread::getGroup()
 {
     if (unlikely(!current_thread))
         return nullptr;
 
     return current_thread->getThreadGroup();
+}
+
+bool CurrentThread::hasGroup()
+{
+    if (unlikely(!current_thread))
+        return false;
+
+    return current_thread->hasThreadGroup();
+}
+
+ContextPtr CurrentThread::tryGetQueryContext()
+{
+    if (unlikely(!current_thread))
+        return {};
+
+    return current_thread->tryGetQueryContext();
+}
+
+MemoryPressureMonitor & CurrentThread::getMemoryPressureMonitor()
+{
+    if (auto group = getGroup())
+        return group->memory_pressure_monitor;
+    return getGlobalMemoryPressureMonitor();
+}
+
+void CurrentThread::checkIfNotCancelled()
+{
+    if (unlikely(!current_thread))
+        return;
+
+    current_thread->throwIfQueryCanceled();
+}
+
+std::string_view CurrentThread::getQueryId()
+{
+    if (unlikely(!current_thread))
+        return {};
+
+    return current_thread->getQueryId();
+}
+
+void CurrentThread::attachReadResource(ResourceLink link)
+{
+    if (unlikely(!current_thread))
+        return;
+    if (current_thread->read_resource_link)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has been already attached to read resource", std::to_string(getThreadId()));
+    current_thread->read_resource_link = link;
+}
+
+void CurrentThread::detachReadResource()
+{
+    if (unlikely(!current_thread))
+        return;
+    if (!current_thread->read_resource_link)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has not been attached to read resource", std::to_string(getThreadId()));
+    current_thread->read_resource_link.reset();
+}
+
+ResourceLink CurrentThread::getReadResourceLink()
+{
+    if (unlikely(!current_thread))
+        return {};
+    return current_thread->read_resource_link;
+}
+
+void CurrentThread::attachWriteResource(ResourceLink link)
+{
+    if (unlikely(!current_thread))
+        return;
+    if (current_thread->write_resource_link)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has been already attached to write resource", std::to_string(getThreadId()));
+    current_thread->write_resource_link = link;
+}
+
+void CurrentThread::detachWriteResource()
+{
+    if (unlikely(!current_thread))
+        return;
+    if (!current_thread->write_resource_link)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has not been attached to write resource", std::to_string(getThreadId()));
+    current_thread->write_resource_link.reset();
+}
+
+ResourceLink CurrentThread::getWriteResourceLink()
+{
+    if (unlikely(!current_thread))
+        return {};
+    return current_thread->write_resource_link;
+}
+
+void CurrentThread::attachReadThrottler(const ThrottlerPtr & throttler)
+{
+    if (unlikely(!current_thread))
+        return;
+    if (current_thread->read_throttler)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has been already attached to read throttler", std::to_string(getThreadId()));
+    current_thread->read_throttler = throttler;
+}
+
+void CurrentThread::detachReadThrottler()
+{
+    if (unlikely(!current_thread))
+        return;
+    if (!current_thread->read_throttler)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has not been attached to read throttler", std::to_string(getThreadId()));
+    current_thread->read_throttler.reset();
+}
+
+ThrottlerPtr CurrentThread::getReadThrottler()
+{
+    if (unlikely(!current_thread))
+        return {};
+    return current_thread->read_throttler;
+}
+
+void CurrentThread::attachWriteThrottler(const ThrottlerPtr & throttler)
+{
+    if (unlikely(!current_thread))
+        return;
+    if (current_thread->write_throttler)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has been already attached to write throttler", std::to_string(getThreadId()));
+    current_thread->write_throttler = throttler;
+}
+
+void CurrentThread::detachWriteThrottler()
+{
+    if (unlikely(!current_thread))
+        return;
+    if (!current_thread->write_throttler)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has not been attached to write throttler", std::to_string(getThreadId()));
+    current_thread->write_throttler.reset();
+}
+
+ThrottlerPtr CurrentThread::getWriteThrottler()
+{
+    if (unlikely(!current_thread))
+        return {};
+    return current_thread->write_throttler;
+}
+
+
+void CurrentThread::flushUntrackedMemory()
+{
+    if (unlikely(!current_thread))
+        return;
+    current_thread->flushUntrackedMemory();
 }
 
 }

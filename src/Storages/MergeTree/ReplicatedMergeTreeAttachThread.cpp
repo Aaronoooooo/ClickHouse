@@ -1,0 +1,260 @@
+#include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/ReplicatedMergeTreeAttachThread.h>
+#include <Storages/MergeTree/ReplicatedMergeTreeQueue.h>
+#include <Storages/StorageReplicatedMergeTree.h>
+#include <Common/ZooKeeper/IKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
+#include <Interpreters/Context.h>
+#include <Core/BackgroundSchedulePool.h>
+
+namespace CurrentMetrics
+{
+    extern const Metric ReadonlyReplica;
+}
+
+namespace DB
+{
+
+namespace MergeTreeSetting
+{
+    extern const MergeTreeSettingsSeconds initialization_retry_period;
+}
+
+namespace ErrorCodes
+{
+    extern const int SUPPORT_IS_DISABLED;
+    extern const int REPLICA_STATUS_CHANGED;
+}
+
+ReplicatedMergeTreeAttachThread::ReplicatedMergeTreeAttachThread(StorageReplicatedMergeTree & storage_)
+    : storage(storage_)
+    , log_name(storage.getStorageID().getFullTableName() + " (ReplicatedMergeTreeAttachThread)")
+    , log(getLogger(log_name))
+{
+    task = storage.getContext()->getSchedulePool()->createTask(storage.getStorageID(), log_name, [this] { run(); });
+    const auto storage_settings = storage.getSettings();
+    retry_period = (*storage_settings)[MergeTreeSetting::initialization_retry_period].totalSeconds();
+}
+
+ReplicatedMergeTreeAttachThread::~ReplicatedMergeTreeAttachThread()
+{
+    shutdown();
+}
+
+void ReplicatedMergeTreeAttachThread::start()
+{
+    /// A `startup()` racing with a `DETACH` can get here after `shutdown()` has already run;
+    /// don't re-arm the task in that case (it would pointlessly re-run the initialization).
+    /// If `shutdown()` runs between this check and `activateAndSchedule`, the repeated
+    /// `shutdown()` call from `StorageReplicatedMergeTree::shutdown` deactivates the task again.
+    if (shutdown_called)
+    {
+        /// There will be no first try — unblock `waitFirstTry`.
+        if (!first_try_done.exchange(true))
+            first_try_done.notify_one();
+        return;
+    }
+
+    task->activateAndSchedule();
+
+    /// Close the check-then-act race with `shutdown()`: if `shutdown()` ran entirely between the
+    /// `shutdown_called` check above and `activateAndSchedule()`, its `task->deactivate()` observed the
+    /// task still inactive and was a no-op, so the task we just re-armed would run its first try after
+    /// shutdown. Re-check and deactivate here. `shutdown()` deactivates unconditionally, so whichever
+    /// ordering wins, the task ends up deactivated:
+    ///   - `shutdown()` observed before this re-check: we deactivate the task we armed;
+    ///   - `shutdown()` observed after this re-check: its own `deactivate()` cancels the armed task.
+    /// `deactivate()` is idempotent, so a concurrent deactivate from both sides is safe. Unblock
+    /// `waitFirstTry` here too, so the waiter always wakes even if it observes our deactivation.
+    if (shutdown_called)
+    {
+        task->deactivate();
+        if (!first_try_done.exchange(true))
+            first_try_done.notify_one();
+    }
+}
+
+void ReplicatedMergeTreeAttachThread::shutdown()
+{
+    if (!shutdown_called.exchange(true))
+        LOG_INFO(log, "Attach thread finished");
+
+    /// Deactivate unconditionally, not only on the first call: a racing `start()` can re-activate
+    /// the task after the first `shutdown()` already deactivated it. Deactivation is idempotent.
+    task->deactivate();
+
+    /// After `deactivate()` returns, the task is guaranteed to be neither running nor scheduled, so the
+    /// first try will never run again. If `start()` had scheduled the first attempt but a racing
+    /// `shutdown()` cancelled it before the pool ever executed `run()`, `first_try_done` would still be
+    /// `false` and `StorageReplicatedMergeTree::startup`'s `waitFirstTry()` would block forever, turning
+    /// the `DETACH`-vs-startup race this class handles into a hang. Publish and notify `first_try_done`
+    /// here so the waiter always wakes on shutdown (this is a no-op if `run()` already set it).
+    if (!first_try_done.exchange(true))
+        first_try_done.notify_one();
+}
+
+void ReplicatedMergeTreeAttachThread::run()
+{
+    bool needs_retry{false};
+    auto component_guard = Coordination::setCurrentComponent("ReplicatedMergeTreeAttachThread");
+    try
+    {
+        // we delay the first reconnect if the storage failed to connect to ZK initially
+        if (!first_try_done && !storage.current_zookeeper)
+        {
+            needs_retry = true;
+        }
+        else
+        {
+            runImpl();
+            finalizeInitialization();
+        }
+    }
+    catch (const Exception & e)
+    {
+        if (const auto * coordination_exception = dynamic_cast<const Coordination::Exception *>(&e))
+            needs_retry = Coordination::isHardwareError(coordination_exception->code);
+        else if (e.code() == ErrorCodes::REPLICA_STATUS_CHANGED)
+            needs_retry = true;
+
+        if (needs_retry)
+        {
+            LOG_ERROR(log, "Initialization failed. Error: {}", getCurrentExceptionMessage(/* with_stacktrace */ true));
+        }
+        else
+        {
+            LOG_ERROR(log, "Initialization failed, table will remain readonly. Error: {}", getCurrentExceptionMessage(/* with_stacktrace */ true));
+            storage.initialization_done = true;
+        }
+
+        if (!std::exchange(storage.is_readonly_metric_set, true))
+            CurrentMetrics::add(CurrentMetrics::ReadonlyReplica);
+    }
+
+    if (!first_try_done.exchange(true))
+        first_try_done.notify_one();
+
+    /// Also stop retrying once the storage itself is being shut down: there is nothing to start up anymore.
+    if (shutdown_called || storage.shutdown_prepared_called || storage.shutdown_called)
+    {
+        if (std::exchange(storage.is_readonly_metric_set, false))
+        {
+            CurrentMetrics::sub(CurrentMetrics::ReadonlyReplica);
+            chassert(CurrentMetrics::get(CurrentMetrics::ReadonlyReplica) >= 0);
+        }
+
+        LOG_WARNING(log, "Shutdown called, cancelling initialization");
+        return;
+    }
+
+    if (needs_retry)
+    {
+        LOG_INFO(log, "Will retry initialization in {}s", retry_period);
+        task->scheduleAfter(retry_period * 1000);
+    }
+}
+
+void ReplicatedMergeTreeAttachThread::checkHasReplicaMetadataInZooKeeper(const zkutil::ZooKeeperPtr & zookeeper, const String & replica_path)
+{
+    /// Since 20.4 and until 22.9 "/metadata" node was created on replica startup and "/metadata_version" was created on ALTER.
+    /// Since 21.12 we could use "/metadata" to check if replica is dropped (see StorageReplicatedMergeTree::dropReplica),
+    /// but it did not work correctly, because "/metadata" node was re-created on server startup.
+    /// Since 22.9 we do not recreate these nodes and use "/host" to check if replica is dropped.
+
+    String replica_metadata;
+    const bool replica_metadata_exists = zookeeper->tryGet(replica_path + "/metadata", replica_metadata);
+    if (!replica_metadata_exists || replica_metadata.empty())
+    {
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Upgrade from 20.3 and older to 22.9 and newer "
+                        "should be done through an intermediate version (failed to get metadata or metadata_version for {}, "
+                        "assuming it's because of upgrading)", replica_path);
+    }
+}
+
+void ReplicatedMergeTreeAttachThread::runImpl()
+{
+    storage.setZooKeeper();
+
+    auto zookeeper = storage.getZooKeeper();
+    const auto & zookeeper_path = storage.zookeeper_path;
+    bool metadata_exists = zookeeper->exists(zookeeper_path + "/metadata");
+    if (!metadata_exists && skip_sanity_checks)
+    {
+        LOG_INFO(log, "Missing metadata in keeper. Force restoring it");
+        try
+        {
+            storage.restoreMetadataInZooKeeper({}, true);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log);
+            return;
+        }
+        metadata_exists = zookeeper->exists(zookeeper_path + "/metadata");
+    }
+
+    if (!metadata_exists)
+    {
+        LOG_WARNING(log, "No metadata in ZooKeeper for {}: table will stay in readonly mode.", zookeeper_path);
+        storage.has_metadata_in_zookeeper = false;
+        return;
+    }
+
+    auto metadata_snapshot = storage.getInMemoryMetadataPtr(storage.getContext(), false);
+
+    const auto & replica_path = storage.replica_path;
+    /// May it be ZK lost not the whole root, so the upper check passed, but only the /replicas/replica
+    /// folder.
+    bool replica_path_exists = zookeeper->exists(replica_path);
+    if (!replica_path_exists)
+    {
+        LOG_WARNING(log, "No metadata in ZooKeeper for {}: table will stay in readonly mode", replica_path);
+        storage.has_metadata_in_zookeeper = false;
+        return;
+    }
+
+    bool host_node_exists = zookeeper->exists(replica_path + "/host");
+    if (!host_node_exists)
+    {
+        LOG_WARNING(log, "Replica {} is dropped (but metadata is not completely removed from ZooKeeper), "
+                         "table will stay in readonly mode", replica_path);
+        storage.has_metadata_in_zookeeper = false;
+        return;
+    }
+
+    storage.has_metadata_in_zookeeper = true;
+
+    checkHasReplicaMetadataInZooKeeper(zookeeper, replica_path);
+
+    /// Just in case it was not removed earlier due to connection loss
+    zookeeper->tryRemove(replica_path + "/flags/force_restore_data");
+
+    /// Here `zookeeper_retries_info = {}` because the attach thread has its own retries (see ReplicatedMergeTreeAttachThread::run()).
+    storage.checkTableStructure(replica_path, metadata_snapshot, /* metadata_version = */ nullptr, /* strict_check = */ true, /* zookeeper_retries_info = */ {});
+    storage.checkParts(skip_sanity_checks);
+
+    /// Temporary directories contain uninitialized results of Merges or Fetches (after forced restart),
+    /// don't allow to reinitialize them, delete each of them immediately.
+    storage.clearOldTemporaryDirectories(0, MergeTreeData::ROOT_TEMPORARY_DIRECTORY_PREFIXES_FOR_RECOVERY);
+
+    storage.createNewZooKeeperNodes(/* zookeeper_retries_info = */ {});
+    storage.syncPinnedPartUUIDs(/* zookeeper_retries_info = */ {});
+
+    std::lock_guard lock(storage.table_shared_id_mutex);
+    storage.createTableSharedID(/* zookeeper_retries_info = */ {});
+};
+
+void ReplicatedMergeTreeAttachThread::finalizeInitialization() TSA_NO_THREAD_SAFETY_ANALYSIS
+{
+    storage.startupImpl(/* from_attach_thread */ true, /* zookeeper_retries_info = */ {});
+    storage.initialization_done = true;
+    LOG_INFO(log, "Table is initialized");
+}
+
+void ReplicatedMergeTreeAttachThread::setSkipSanityChecks(bool skip_sanity_checks_)
+{
+    skip_sanity_checks = skip_sanity_checks_;
+}
+
+}

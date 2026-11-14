@@ -1,9 +1,10 @@
-#include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypesDecimal.h>
-#include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnDecimal.h>
-#include "FunctionArrayMapped.h"
+#include <Columns/ColumnsNumber.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionFactory.h>
+
+#include <Functions/array/FunctionArrayMapped.h>
 
 
 namespace DB
@@ -20,6 +21,14 @@ namespace ErrorCodes
   */
 struct ArrayDifferenceImpl
 {
+    /// Authoritative — array of consecutive differences. The result element type widens to fit a
+    /// signed difference (e.g. `Array(UInt8)` → `Array(Int16)`, `Array(UInt32)` → `Array(Int64)`);
+    /// `Decimal` keeps its type and `DateTime64` widens to a signed `Decimal64` of the same scale.
+    /// See the `arrayDifferenceResult` type function. `Date`/`DateTime` inputs are accepted too.
+    static constexpr auto signature =
+        "(Function((Any, ...), T : Number | DateOrDateTime), Array, ...) -> Array(arrayDifferenceResult(T))"
+        " OR (Array(T : Number | DateOrDateTime)) -> Array(arrayDifferenceResult(T))";
+
     static bool needBoolean() { return false; }
     static bool needExpression() { return false; }
     static bool needOneArray() { return false; }
@@ -31,11 +40,17 @@ struct ArrayDifferenceImpl
         if (which.isUInt8() || which.isInt8())
             return std::make_shared<DataTypeArray>(std::make_shared<DataTypeInt16>());
 
-        if (which.isUInt16() || which.isInt16())
+        if (which.isUInt16() || which.isInt16() || which.isDate())
             return std::make_shared<DataTypeArray>(std::make_shared<DataTypeInt32>());
 
-        if (which.isUInt32() || which.isUInt64() || which.isInt32() || which.isInt64())
+        if (which.isUInt32() || which.isUInt64() || which.isInt32() || which.isInt64() || which.isDate32() || which.isDateTime())
             return std::make_shared<DataTypeArray>(std::make_shared<DataTypeInt64>());
+
+        if (which.isUInt128() || which.isInt128())
+            return std::make_shared<DataTypeArray>(std::make_shared<DataTypeInt128>());
+
+        if (which.isUInt256() || which.isInt256())
+            return std::make_shared<DataTypeArray>(std::make_shared<DataTypeInt256>());
 
         if (which.isFloat32() || which.isFloat64())
             return std::make_shared<DataTypeArray>(std::make_shared<DataTypeFloat64>());
@@ -43,7 +58,16 @@ struct ArrayDifferenceImpl
         if (which.isDecimal())
             return std::make_shared<DataTypeArray>(expression_return);
 
-        throw Exception("arrayDifference cannot process values of type " + expression_return->getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        if (which.isDateTime64())
+        {
+            UInt32 scale = getDecimalScale(*expression_return);
+            UInt32 precision = getDecimalPrecision(*expression_return);
+
+            return std::make_shared<DataTypeArray>(std::make_shared<DataTypeDecimal<Decimal64>>(precision, scale));
+        }
+
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "arrayDifference cannot process values of type {}", expression_return->getName());
     }
 
 
@@ -70,9 +94,7 @@ struct ArrayDifferenceImpl
 
                     ResultNativeType result_value;
                     bool overflow = common::subOverflow(
-                        static_cast<ResultNativeType>(curr.value),
-                        static_cast<ResultNativeType>(prev.value),
-                        result_value);
+                        static_cast<ResultNativeType>(curr.value), static_cast<ResultNativeType>(prev.value), result_value);
                     if (overflow)
                         throw Exception(ErrorCodes::DECIMAL_OVERFLOW, "Decimal math overflow");
 
@@ -80,7 +102,7 @@ struct ArrayDifferenceImpl
                 }
                 else
                 {
-                    dst[pos] = curr - prev;
+                    dst[pos] = static_cast<Result>(curr) - static_cast<Result>(prev);
                 }
 
                 prev = curr;
@@ -105,7 +127,7 @@ struct ArrayDifferenceImpl
 
         typename ColVecResult::MutablePtr res_nested;
         if constexpr (is_decimal<Element>)
-            res_nested = ColVecResult::create(0, data.getScale());
+            res_nested = ColVecResult::create(0, column->getScale());
         else
             res_nested = ColVecResult::create();
 
@@ -129,32 +151,52 @@ struct ArrayDifferenceImpl
         ColumnPtr res;
 
         mapped = mapped->convertToFullColumnIfConst();
-        if (executeType< UInt8 ,  Int16>(mapped, array, res) ||
-            executeType< UInt16,  Int32>(mapped, array, res) ||
-            executeType< UInt32,  Int64>(mapped, array, res) ||
-            executeType< UInt64,  Int64>(mapped, array, res) ||
-            executeType<  Int8 ,  Int16>(mapped, array, res) ||
-            executeType<  Int16,  Int32>(mapped, array, res) ||
-            executeType<  Int32,  Int64>(mapped, array, res) ||
-            executeType<  Int64,  Int64>(mapped, array, res) ||
-            executeType<Float32,Float64>(mapped, array, res) ||
-            executeType<Float64,Float64>(mapped, array, res) ||
-            executeType<Decimal32, Decimal32>(mapped, array, res) ||
-            executeType<Decimal64, Decimal64>(mapped, array, res) ||
-            executeType<Decimal128, Decimal128>(mapped, array, res))
+        if (executeType<UInt8, Int16>(mapped, array, res) || executeType<UInt16, Int32>(mapped, array, res)
+            || executeType<UInt32, Int64>(mapped, array, res) || executeType<UInt64, Int64>(mapped, array, res)
+            || executeType<Int8, Int16>(mapped, array, res) || executeType<Int16, Int32>(mapped, array, res)
+            || executeType<Int32, Int64>(mapped, array, res) || executeType<Int64, Int64>(mapped, array, res)
+            || executeType<UInt128, Int128>(mapped, array, res) || executeType<Int128, Int128>(mapped, array, res)
+            || executeType<UInt256, Int256>(mapped, array, res) || executeType<Int256, Int256>(mapped, array, res)
+            || executeType<Float32, Float64>(mapped, array, res) || executeType<Float64, Float64>(mapped, array, res)
+            || executeType<Decimal32, Decimal32>(mapped, array, res) || executeType<Decimal64, Decimal64>(mapped, array, res)
+            || executeType<Decimal128, Decimal128>(mapped, array, res) || executeType<Decimal256, Decimal256>(mapped, array, res)
+            || executeType<DateTime64, Decimal64>(mapped, array, res))
             return res;
-        else
-            throw Exception("Unexpected column for arrayDifference: " + mapped->getName(), ErrorCodes::ILLEGAL_COLUMN);
+        throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Unexpected column for arrayDifference: {}", mapped->getName());
     }
 };
 
-struct NameArrayDifference { static constexpr auto name = "arrayDifference"; };
+struct NameArrayDifference
+{
+    static constexpr auto name = "arrayDifference";
+};
 using FunctionArrayDifference = FunctionArrayMapped<ArrayDifferenceImpl, NameArrayDifference>;
 
-void registerFunctionArrayDifference(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayDifference)
 {
-    factory.registerFunction<FunctionArrayDifference>();
+    FunctionDocumentation::Description description = R"(
+Calculates an array of differences between adjacent array elements.
+The first element of the result array will be 0, the second `arr[1] - arr[0]`, the third `arr[2] - arr[1]`, etc.
+The type of elements in the result array are determined by the type inference rules for subtraction (e.g. `UInt8` - `UInt8` = `Int16`).
+    )";
+    FunctionDocumentation::Syntax syntax = "arrayDifference(arr)";
+    FunctionDocumentation::Arguments argument = {
+        {"arr", "Array for which to calculate differences between adjacent elements.", {"Array(T)"}},
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns an array of differences between adjacent array elements", {"UInt*"}};
+    FunctionDocumentation::Examples examples = {
+        {"Usage example", "SELECT arrayDifference([1, 2, 3, 4]);", "[0,1,1,1]"},
+        {"Example of overflow due to result type Int64", "SELECT arrayDifference([0, 10000000000000000000]);", R"(
+┌─arrayDifference([0, 10000000000000000000])─┐
+│ [0,-8446744073709551616]                   │
+└────────────────────────────────────────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Array;
+    FunctionDocumentation documentation = {description, syntax, argument, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionArrayDifference>(documentation);
 }
 
 }
-

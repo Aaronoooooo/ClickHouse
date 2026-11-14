@@ -1,87 +1,81 @@
 #include <Common/typeid_cast.h>
 #include <Interpreters/JoinSwitcher.h>
-#include <Interpreters/HashJoin.h>
+#include <Interpreters/HashJoin/HashJoin.h>
 #include <Interpreters/MergeJoin.h>
-#include <Interpreters/join_common.h>
+#include <Interpreters/JoinUtils.h>
+#include <Interpreters/QueryExecutionCounters.h>
 
 namespace DB
 {
 
-static ColumnWithTypeAndName correctNullability(ColumnWithTypeAndName && column, bool nullable)
-{
-    if (nullable)
-        JoinCommon::convertColumnToNullable(column);
-    else
-        JoinCommon::removeColumnNullability(column);
-
-    return std::move(column);
-}
-
-JoinSwitcher::JoinSwitcher(std::shared_ptr<TableJoin> table_join_, const Block & right_sample_block_)
+JoinSwitcher::JoinSwitcher(
+    std::shared_ptr<TableJoin> table_join_,
+    SharedHeader right_sample_block_,
+    const bool any_take_last_row_,
+    const HashJoinStatsCollectingParams & stats_collecting_params_)
     : limits(table_join_->sizeLimits())
     , switched(false)
     , table_join(table_join_)
-    , right_sample_block(right_sample_block_.cloneEmpty())
+    , right_sample_block(right_sample_block_->cloneEmpty())
 {
-    join = std::make_shared<HashJoin>(table_join, right_sample_block);
+    join = HashJoin::create(
+        table_join, right_sample_block_, HashJoinBuildLayout::oneBucket(1), any_take_last_row_, stats_collecting_params_);
+    /// Until the build phase ends this join may have to hand its right blocks to `MergeJoin`.
+    assert_cast<HashJoin *>(join.get())->keepRightBlocksForAnotherAlgorithm();
 
     if (!limits.hasLimits())
         limits.max_bytes = table_join->defaultMaxBytes();
 }
 
-bool JoinSwitcher::addJoinedBlock(const Block & block, bool)
+bool JoinSwitcher::addBlockToJoin(const Block & block, size_t num_rows, JoinBuildContext context)
 {
     std::lock_guard lock(switch_mutex);
 
+    /// `MergeJoin` checks no limits of its own, so it does not matter whether `context` asks for them.
     if (switched)
-        return join->addJoinedBlock(block);
+        return join->addBlockToJoin(block, num_rows, context);
 
     /// HashJoin with external limits check
 
-    join->addJoinedBlock(block, false);
+    join->addBlockToJoin(block, num_rows, context.callerChecksLimits());
     size_t rows = join->getTotalRowCount();
     size_t bytes = join->getTotalByteCount();
 
     if (!limits.softCheck(rows, bytes))
-        switchJoin();
+        return switchJoin(context);
 
     return true;
 }
 
-void JoinSwitcher::switchJoin()
+void JoinSwitcher::onBuildPhaseFinish()
 {
-    std::shared_ptr<HashJoin::RightTableData> joined_data = static_cast<const HashJoin &>(*join).getJoinedData();
-    BlocksList right_blocks = std::move(joined_data->blocks);
+    join->onBuildPhaseFinish();
 
-    /// Destroy old join & create new one. Early destroy for memory saving.
-    join = std::make_shared<MergeJoin>(table_join, right_sample_block);
+    /// The switch to `MergeJoin` only happens while blocks are being added, and that is over: if it
+    /// did not happen, nothing will take the right blocks now, so a join that stores only the keys
+    /// can drop them.
+    std::lock_guard lock(switch_mutex);
+    if (!switched)
+        assert_cast<HashJoin *>(join.get())->dropRightBlocksKeptForAnotherAlgorithm();
+}
 
-    /// names to positions optimization
-    std::vector<size_t> positions;
-    std::vector<bool> is_nullable;
-    if (!right_blocks.empty())
-    {
-        positions.reserve(right_sample_block.columns());
-        const Block & tmp_block = *right_blocks.begin();
-        for (const auto & sample_column : right_sample_block)
-        {
-            positions.emplace_back(tmp_block.getPositionByName(sample_column.name));
-            is_nullable.emplace_back(sample_column.type->isNullable());
-        }
-    }
+bool JoinSwitcher::switchJoin(JoinBuildContext context)
+{
+    HashJoin * hash_join = assert_cast<HashJoin *>(join.get());
+    BlocksList right_blocks = hash_join->releaseJoinedBlocks(true);
 
-    for (Block & saved_block : right_blocks)
-    {
-        Block restored_block;
-        for (size_t i = 0; i < positions.size(); ++i)
-        {
-            auto & column = saved_block.getByPosition(positions[i]);
-            restored_block.insert(correctNullability(std::move(column), is_nullable[i]));
-        }
-        join->addJoinedBlock(restored_block);
-    }
+    /// Destroy old join & create new one.
+    join = std::make_shared<MergeJoin>(table_join, std::make_shared<const Block>(right_sample_block));
+
+    bool success = true;
+    for (const Block & saved_block : right_blocks)
+        success = success && join->addBlockToJoin(saved_block, saved_block.rows(), context);
 
     switched = true;
+
+    QueryExecutionCounters::addUsedJoinAlgorithm(JoinAlgorithm::PARTIAL_MERGE);
+
+    return success;
 }
 
 }

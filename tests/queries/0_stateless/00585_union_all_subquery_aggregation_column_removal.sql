@@ -4,8 +4,8 @@ DROP TABLE IF EXISTS transactions;
 CREATE TABLE clicks (domain String) ENGINE = Memory;
 CREATE TABLE transactions (domain String) ENGINE = Memory;
 
-INSERT INTO clicks VALUES ('facebook.com'), ('yandex.ru'), ('google.com');
-INSERT INTO transactions VALUES ('facebook.com'), ('yandex.ru'), ('baidu.com');
+INSERT INTO clicks VALUES ('facebook.com'), ('meta.ua'), ('google.com');
+INSERT INTO transactions VALUES ('facebook.com'), ('meta.ua'), ('baidu.com');
 
 
 SELECT
@@ -107,7 +107,8 @@ UNION ALL
 GROUP BY domain
 ORDER BY domain
 LIMIT 10
-);
+)
+ORDER BY domain;
 
 
 SELECT DISTINCT total, domain FROM

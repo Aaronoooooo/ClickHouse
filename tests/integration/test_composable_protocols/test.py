@@ -1,0 +1,363 @@
+import os
+import socket
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+import warnings
+
+import pytest
+
+from helpers.client import Client
+from helpers.cluster import ClickHouseCluster
+from helpers.proxy1 import Proxy1
+from helpers.test_tools import assert_eq_with_retry
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+ALLOWED_TLS13_SUITE = "TLS_AES_256_GCM_SHA384"
+EXCLUDED_TLS13_SUITE = "TLS_CHACHA20_POLY1305_SHA256"
+
+cluster = ClickHouseCluster(__file__)
+server = cluster.add_instance(
+    "server",
+    base_config_dir="configs",
+    main_configs=["configs/server.crt", "configs/server.key"],
+)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def setup_nodes():
+    try:
+        cluster.start()
+        yield cluster
+    finally:
+        cluster.shutdown()
+
+
+def execute_query_https(host, port, query, version=None):
+    url = f"https://{host}:{port}/?query={urllib.parse.quote(query)}"
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    if version:
+        ctx.minimum_version = version
+        ctx.maximum_version = version
+
+    request = urllib.request.Request(url)
+    response = urllib.request.urlopen(request, context=ctx).read()
+    return response.decode("utf-8")
+
+
+def execute_query_https_unsupported(host, port, query, version=None):
+    try:
+        execute_query_https(host, port, query, version)
+    except Exception as e:
+        e_text = str(e)
+        if "NO_PROTOCOLS_AVAILABLE" in e_text:
+            return True
+        if "TLSV1_ALERT_PROTOCOL_VERSION" in e_text:
+            return True
+        raise
+    return False
+
+
+def execute_query_http(host, port, query, headers=None):
+    url = f"http://{host}:{port}/?query={urllib.parse.quote(query)}"
+
+    request = urllib.request.Request(url, headers=headers or {})
+    response = urllib.request.urlopen(request).read()
+    return response.decode("utf-8")
+
+
+def netcat(hostname, port, content):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((hostname, port))
+    s.sendall(content)
+    s.shutdown(socket.SHUT_WR)
+    data = []
+    while 1:
+        d = s.recv(1024)
+        if len(d) == 0:
+            break
+        data.append(d)
+    s.close()
+    return b"".join(data)
+
+
+def offer_single_tls13_suite(port, suite):
+    """Hand one endpoint exactly one TLS 1.3 cipher suite and report whether it was accepted.
+
+    Reads the negotiated suite rather than the exit status, because s_client also reports a
+    verification failure for the self-signed server certificate.
+    """
+    result = server.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"openssl s_client -connect 127.0.0.1:{port} -tls1_3 "
+            f"-ciphersuites {suite} -brief </dev/null 2>&1 || true",
+        ]
+    )
+    return f"Ciphersuite: {suite}" in result
+
+
+def test_connections():
+    client = Client(server.ip_address, 9000, command=cluster.client_bin_path)
+    assert client.query("SELECT 1") == "1\n"
+
+    client = Client(
+        server.ip_address,
+        9440,
+        command=cluster.client_bin_path,
+        secure=True,
+        config=f"{SCRIPT_DIR}/configs/client.xml",
+    )
+    assert client.query("SELECT 1") == "1\n"
+
+    client = Client(server.ip_address, 9001, command=cluster.client_bin_path)
+    assert client.query("SELECT 1") == "1\n"
+
+    assert execute_query_http(server.ip_address, 8123, "SELECT 1") == "1\n"
+
+    assert execute_query_https(server.ip_address, 8443, "SELECT 1") == "1\n"
+
+    assert execute_query_https(server.ip_address, 8444, "SELECT 1") == "1\n"
+
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+    assert execute_query_https_unsupported(
+        server.ip_address, 8445, "SELECT 1", version=ssl.TLSVersion.SSLv3
+    )
+    assert execute_query_https_unsupported(
+        server.ip_address, 8445, "SELECT 1", version=ssl.TLSVersion.TLSv1
+    )
+    assert execute_query_https_unsupported(
+        server.ip_address, 8445, "SELECT 1", version=ssl.TLSVersion.TLSv1_1
+    )
+    assert (
+        execute_query_https(
+            server.ip_address, 8445, "SELECT 1", version=ssl.TLSVersion.TLSv1_2
+        )
+        == "1\n"
+    )
+    assert (
+        execute_query_https(
+            server.ip_address, 8445, "SELECT 1", version=ssl.TLSVersion.TLSv1_3
+        )
+        == "1\n"
+    )
+
+    assert execute_query_https_unsupported(
+        server.ip_address, 8446, "SELECT 1", version=ssl.TLSVersion.SSLv3
+    )
+    assert execute_query_https_unsupported(
+        server.ip_address, 8446, "SELECT 1", version=ssl.TLSVersion.TLSv1
+    )
+    assert execute_query_https_unsupported(
+        server.ip_address, 8446, "SELECT 1", version=ssl.TLSVersion.TLSv1_1
+    )
+    assert execute_query_https_unsupported(
+        server.ip_address, 8446, "SELECT 1", version=ssl.TLSVersion.TLSv1_2
+    )
+    assert (
+        execute_query_https(
+            server.ip_address, 8446, "SELECT 1", version=ssl.TLSVersion.TLSv1_3
+        )
+        == "1\n"
+    )
+
+    assert (
+        execute_query_https(
+            server.ip_address, 8447, "SELECT 1", version=ssl.TLSVersion.TLSv1_2
+        )
+        == "1\n"
+    )
+    assert execute_query_https_unsupported(
+        server.ip_address, 8447, "SELECT 1", version=ssl.TLSVersion.TLSv1_3
+    )
+
+    assert (
+        execute_query_https(
+            server.ip_address, 8443, "SELECT 1", version=ssl.TLSVersion.TLSv1_2
+        )
+        == "1\n"
+    )
+    assert execute_query_https_unsupported(
+        server.ip_address, 8443, "SELECT 1", version=ssl.TLSVersion.TLSv1_3
+    )
+
+
+def test_tls13_cipher_suites_per_endpoint():
+    # 8445 keeps no cipherSuites, so it shows the excluded suite is available in this image;
+    # without that the refusal on 8446 would not be attributable to the setting.
+    assert offer_single_tls13_suite(8445, EXCLUDED_TLS13_SUITE)
+    assert offer_single_tls13_suite(8446, ALLOWED_TLS13_SUITE)
+    assert not offer_single_tls13_suite(8446, EXCLUDED_TLS13_SUITE)
+
+
+# tests when using PROXYv1 with enabled auth_use_forwarded_address that forwarded address is used for authentication and query's source address
+def test_proxy_1():
+
+    # default user
+    proxy = Proxy1("TCP4 123.231.132.213 255.255.255.255 12345 65535")
+    proxy_client = Client(
+        "localhost",
+        proxy.start((server.ip_address, 9100)),
+        command=cluster.client_bin_path,
+    )
+    query_id = proxy_client.query("SELECT currentQueryID()")[:-1]
+    cluster.instances["server"].query("SYSTEM FLUSH LOGS")
+    client = Client(server.ip_address, 9000, command=cluster.client_bin_path)
+    source_addr = proxy.get_source_addr()
+    assert (
+        client.query(
+            f"SELECT forwarded_for, address, port, initial_address, initial_port, connection_address, connection_port FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryStart'"
+        )
+        == f"123.231.132.213:12345\t::ffff:123.231.132.213\t12345\t::ffff:123.231.132.213\t12345\t::ffff:{source_addr[0]}\t{source_addr[1]}\n"
+    )
+
+    # user123 only allowed from 123.123.123.123
+    proxy = Proxy1("TCP4 123.123.123.123 255.255.255.255 12345 65535")
+    proxy_client = Client(
+        "localhost",
+        proxy.start((server.ip_address, 9100)),
+        command=cluster.client_bin_path,
+    )
+    query_id = proxy_client.query("SELECT currentQueryID()", user="user123")[:-1]
+    cluster.instances["server"].query("SYSTEM FLUSH LOGS")
+    client = Client(server.ip_address, 9000, command=cluster.client_bin_path)
+    source_addr = proxy.get_source_addr()
+    assert (
+        client.query(
+            f"SELECT forwarded_for, address, port, initial_address, initial_port, connection_address, connection_port FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryStart'"
+        )
+        == f"123.123.123.123:12345\t::ffff:123.123.123.123\t12345\t::ffff:123.123.123.123\t12345\t::ffff:{source_addr[0]}\t{source_addr[1]}\n"
+    )
+
+    # user123 is not allowed from other than 123.123.123.123
+    proxy = Proxy1("TCP4 127.0.0.1 255.255.255.255 12345 65535")
+    proxy_client = Client(
+        "localhost",
+        proxy.start((server.ip_address, 9100)),
+        command=cluster.client_bin_path,
+    )
+    try:
+        proxy_client.query("SELECT currentQueryID()", user="user123")
+    except Exception as e:
+        assert str(e).find("Exception: user123: Authentication failed") >= 0
+    else:
+        assert False, "Expected 'Exception: user123: Authentication failed'"
+
+
+def test_proxy_1_rejects_invalid_forwarded_address():
+    proxy = Proxy1("TCP4 attacker.example 255.255.255.255 12345 65535")
+    proxy_client = Client(
+        "localhost",
+        proxy.start((server.ip_address, 9100)),
+        command=cluster.client_bin_path,
+    )
+
+    with pytest.raises(Exception, match="Invalid forwarded client address"):
+        proxy_client.query("SELECT 1")
+
+    proxy.wait()
+
+
+# tests PROXYv1 over HTTP
+def test_http_proxy_1():
+    proxy = Proxy1()
+    port = proxy.start((server.ip_address, 8223))
+
+    assert execute_query_http("localhost", port, "SELECT 1") == "1\n"
+
+
+def test_http_forwarded_address_validation():
+    assert (
+        execute_query_http(
+            server.ip_address,
+            8123,
+            "SELECT 1",
+            headers={"X-Forwarded-For": "203.0.113.1"},
+        )
+        == "1\n"
+    )
+
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        execute_query_http(
+            server.ip_address,
+            8123,
+            "SELECT 1",
+            headers={"X-Forwarded-For": "attacker.example:9000"},
+        )
+
+    assert exc_info.value.code == 400
+    assert (
+        "Invalid address in `X-Forwarded-For` HTTP header"
+        in exc_info.value.read().decode("utf-8")
+    )
+
+
+def test_protocol_metrics():
+    """Servers declared under `<protocols>` must report the same asynchronous metrics as the
+    equivalent built-in ports. See https://github.com/ClickHouse/ClickHouse/issues/80759
+    """
+    expected = [
+        "HTTPSecureThreads",  # <https>: tls over http
+        "HTTPThreads",  # <http>
+        "TCPSecureThreads",  # <tcp_secure>: tls over tcp
+        "TCPThreads",  # <tcp>
+        "TCPWithProxyThreads",  # <tcp_proxy>: proxy1 over tcp
+    ]
+
+    # Asynchronous metrics are refreshed on a timer, so the first update may not have
+    # happened yet when the test starts.
+    assert_eq_with_retry(
+        server,
+        "SELECT metric FROM system.asynchronous_metrics "
+        "WHERE metric LIKE '%Threads' AND metric NOT LIKE 'Keeper%' ORDER BY metric",
+        "\n".join(expected) + "\n",
+        retry_count=30,
+        sleep_time=1,
+    )
+
+    # Rejected-connection counters are emitted alongside the thread counters.
+    assert_eq_with_retry(
+        server,
+        "SELECT count() FROM system.asynchronous_metrics WHERE metric IN "
+        "('TCPRejectedConnections', 'TCPSecureRejectedConnections', "
+        "'TCPWithProxyRejectedConnections', 'HTTPRejectedConnections', "
+        "'HTTPSecureRejectedConnections')",
+        "5\n",
+        retry_count=30,
+        sleep_time=1,
+    )
+
+
+def test_protocol_metrics_sum_listeners_of_one_protocol():
+    """Listeners of the same protocol are summed rather than the last one overwriting the
+    others: the `tcp` (9000) and `tcp_endpoint` (9001) listeners both report into `TCPThreads`.
+    """
+    # Each running query holds one handler thread on its listener for its whole duration.
+    long_query = "SELECT sleepEachRow(1) FROM numbers(30) SETTINGS max_block_size = 1"
+    requests = [
+        Client(
+            server.ip_address, port, command=cluster.client_bin_path
+        ).get_query_request(long_query)
+        for port in (9000, 9000, 9001, 9001)
+    ]
+    try:
+        # If one listener overwrote the other, the metric would show at most one listener's
+        # two queries plus the checking query itself. Summing both listeners gives at least four.
+        assert_eq_with_retry(
+            server,
+            "SELECT value >= 4 FROM system.asynchronous_metrics WHERE metric = 'TCPThreads'",
+            "1\n",
+            retry_count=25,
+            sleep_time=1,
+        )
+    finally:
+        server.query("KILL QUERY WHERE query LIKE 'SELECT sleepEachRow(1)%' SYNC")
+        for request in requests:
+            request.get_answer_and_error()

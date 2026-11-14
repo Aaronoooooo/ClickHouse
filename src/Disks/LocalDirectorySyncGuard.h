@@ -17,13 +17,15 @@ class LocalDirectorySyncGuard final : public ISyncGuard
 public:
     /// NOTE: If you have already opened descriptor, it's preferred to use
     /// this constructor instead of constructor with path.
-    LocalDirectorySyncGuard(int fd_) : fd(fd_) {}
-    LocalDirectorySyncGuard(const String & full_path);
+    explicit LocalDirectorySyncGuard(int fd_) : fd(fd_) {}
+    explicit LocalDirectorySyncGuard(const String & full_path);
     ~LocalDirectorySyncGuard() override;
+
+    /// Synchronize and close the descriptor. Propagates errors; subsequent calls are no-ops.
+    void sync() override;
 
 private:
     int fd = -1;
 };
 
 }
-

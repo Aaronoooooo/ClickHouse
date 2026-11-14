@@ -8,14 +8,9 @@
 namespace DB
 {
 
-namespace ErrorCodes
-{
-    extern const int BAD_ARGUMENTS;
-}
-
 /** errorCodeToName() - returns the variable name for the error code.
   */
-class FunctionErrorCodeToName : public IFunction
+class FunctionErrorCodeToName final : public IFunction
 {
 public:
     static constexpr auto name = "errorCodeToName";
@@ -29,12 +24,9 @@ public:
     bool useDefaultImplementationForConstants() const override { return true; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & types) const override
+    String getSignatureString() const override
     {
-        if (!isNumber(types.at(0)))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The argument of function {} must have simple numeric type, possibly Nullable", name);
-
-        return std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+        return "(Number) -> LowCardinality(String)";
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & res_type, size_t input_rows_count) const override
@@ -45,7 +37,8 @@ public:
         for (size_t i = 0; i < input_rows_count; ++i)
         {
             const Int64 error_code = input_column.getInt(i);
-            std::string_view error_name = ErrorCodes::getName(error_code);
+            std::string_view error_name =
+                ErrorCodes::getName(static_cast<ErrorCodes::ErrorCode>(error_code));
             col_res->insertData(error_name.data(), error_name.size());
         }
 
@@ -54,9 +47,35 @@ public:
 };
 
 
-void registerFunctionErrorCodeToName(FunctionFactory & factory)
+REGISTER_FUNCTION(ErrorCodeToName)
 {
-    factory.registerFunction<FunctionErrorCodeToName>();
+    FunctionDocumentation::Description description = R"(
+Returns the textual name of a numeric ClickHouse error code.
+The mapping from numeric error codes to error names is available [here](https://github.com/ClickHouse/ClickHouse/blob/master/src/Common/ErrorCodes.cpp).
+)";
+    FunctionDocumentation::Syntax syntax = "errorCodeToName(error_code)";
+    FunctionDocumentation::Arguments arguments = {
+        {"error_code", "ClickHouse error code.", {"(U)Int*", "Float*", "Decimal"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the textual name of `error_code`.", {"String"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        R"(
+SELECT errorCodeToName(252);
+        )",
+        R"(
+┌─errorCodeToName(252)─┐
+│ TOO_MANY_PARTS       │
+└──────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 12};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionErrorCodeToName>(documentation);
 }
 
 }

@@ -13,25 +13,29 @@
   * (~ 700 MB/sec, 15 million strings per second)
   */
 
-#include <base/types.h>
-#include <base/unaligned.h>
-#include <string>
-#include <type_traits>
 #include <Core/Defines.h>
 #include <base/extended_types.h>
+#include <base/types.h>
+#include <base/unaligned.h>
+#include <Common/Hex.h>
 
+#include <array>
+#include <bit>
+#include <string>
 
-#define ROTL(x, b) static_cast<UInt64>(((x) << (b)) | ((x) >> (64 - (b))))
+#include <city.h>
+
+#include <Common/transformEndianness.h>
+#include <type_traits>
 
 #define SIPROUND                                                  \
     do                                                            \
     {                                                             \
-        v0 += v1; v1 = ROTL(v1, 13); v1 ^= v0; v0 = ROTL(v0, 32); \
-        v2 += v3; v3 = ROTL(v3, 16); v3 ^= v2;                    \
-        v0 += v3; v3 = ROTL(v3, 21); v3 ^= v0;                    \
-        v2 += v1; v1 = ROTL(v1, 17); v1 ^= v2; v2 = ROTL(v2, 32); \
+        v0 += v1; v1 = std::rotl(v1, 13); v1 ^= v0; v0 = std::rotl(v0, 32); \
+        v2 += v3; v3 = std::rotl(v3, 16); v3 ^= v2;                    \
+        v0 += v3; v3 = std::rotl(v3, 21); v3 ^= v0;                    \
+        v2 += v1; v1 = std::rotl(v1, 17); v1 ^= v2; v2 = std::rotl(v2, 32); \
     } while(0)
-
 
 class SipHash
 {
@@ -45,24 +49,41 @@ private:
     /// How many bytes have been processed.
     UInt64 cnt;
 
-    /// The current 8 bytes of input data.
-    union
+    /// Whether it should use the reference algo for 128-bit or CH's version
+    bool is_reference_128;
+
+    /// Bytes of the current incomplete 8-byte word, little-endian. The bytes not received yet are zero.
+    UInt64 current_word;
+
+    /// Little-endian value of `size` < 8 bytes, built in a register to avoid a store-forwarding stall.
+    static ALWAYS_INLINE UInt64 loadTail(const char * data, size_t size)
     {
-        UInt64 current_word;
-        UInt8 current_bytes[8];
-    };
+        if (size >= 4)
+            return unalignedLoadLittleEndian<UInt32>(data)
+                | (static_cast<UInt64>(unalignedLoadLittleEndian<UInt32>(data + size - 4)) << (8 * (size - 4)));
+        switch (size)
+        {
+            case 3: return unalignedLoadLittleEndian<UInt16>(data) | (static_cast<UInt64>(static_cast<UInt8>(data[2])) << 16);
+            case 2: return unalignedLoadLittleEndian<UInt16>(data);
+            case 1: return static_cast<UInt8>(data[0]);
+            default: return 0;
+        }
+    }
 
     ALWAYS_INLINE void finalize()
     {
         /// In the last free byte, we write the remainder of the division by 256.
-        current_bytes[7] = cnt;
+        const UInt64 last_word = current_word | (static_cast<UInt64>(static_cast<UInt8>(cnt)) << 56);
 
-        v3 ^= current_word;
+        v3 ^= last_word;
         SIPROUND;
         SIPROUND;
-        v0 ^= current_word;
+        v0 ^= last_word;
 
-        v2 ^= 0xff;
+        if (is_reference_128)
+            v2 ^= 0xee;
+        else
+            v2 ^= 0xff;
         SIPROUND;
         SIPROUND;
         SIPROUND;
@@ -71,31 +92,33 @@ private:
 
 public:
     /// Arguments - seed.
-    SipHash(UInt64 k0 = 0, UInt64 k1 = 0)
+    SipHash(UInt64 key0 = 0, UInt64 key1 = 0, bool is_reference_128_ = false) /// NOLINT
     {
         /// Initialize the state with some random bytes and seed.
-        v0 = 0x736f6d6570736575ULL ^ k0;
-        v1 = 0x646f72616e646f6dULL ^ k1;
-        v2 = 0x6c7967656e657261ULL ^ k0;
-        v3 = 0x7465646279746573ULL ^ k1;
+        v0 = 0x736f6d6570736575ULL ^ key0;
+        v1 = 0x646f72616e646f6dULL ^ key1;
+        v2 = 0x6c7967656e657261ULL ^ key0;
+        v3 = 0x7465646279746573ULL ^ key1;
+        is_reference_128 = is_reference_128_;
+
+        if (is_reference_128)
+            v1 ^= 0xee;
 
         cnt = 0;
         current_word = 0;
     }
 
-    void update(const char * data, UInt64 size)
+    ALWAYS_INLINE void update(const char * data, UInt64 size)
     {
         const char * end = data + size;
 
         /// We'll finish to process the remainder of the previous update, if any.
-        if (cnt & 7)
+        if (const UInt64 filled = cnt & 7)
         {
-            while (cnt & 7 && data < end)
-            {
-                current_bytes[cnt & 7] = *data;
-                ++data;
-                ++cnt;
-            }
+            const UInt64 take = size < 8 - filled ? size : 8 - filled;
+            current_word |= loadTail(data, take) << (8 * filled);
+            data += take;
+            cnt += take;
 
             /// If we still do not have enough bytes to an 8-byte word.
             if (cnt & 7)
@@ -109,107 +132,201 @@ public:
 
         cnt += end - data;
 
-        while (data + 8 <= end)
+        /// Use pointer subtraction, not `data + 8 <= end`: forming `data + 8` when fewer than
+        /// 8 bytes remain points past `end`, which is undefined behavior ([expr.add]/4).
+        while (end - data >= 8)
         {
-            current_word = unalignedLoad<UInt64>(data);
+            const UInt64 word = unalignedLoadLittleEndian<UInt64>(data);
 
-            v3 ^= current_word;
+            v3 ^= word;
             SIPROUND;
             SIPROUND;
-            v0 ^= current_word;
+            v0 ^= word;
 
             data += 8;
         }
 
-        /// Pad the remainder, which is missing up to an 8-byte word.
-        current_word = 0;
-        switch (end - data)
+        /// Keep the remainder, which is missing up to an 8-byte word.
+        current_word = loadTail(data, end - data);
+    }
+
+    template <typename Transform = void, typename T>
+    ALWAYS_INLINE void update(const T & x)
+    {
+        if constexpr (std::endian::native == std::endian::big)
         {
-            case 7: current_bytes[6] = data[6]; [[fallthrough]];
-            case 6: current_bytes[5] = data[5]; [[fallthrough]];
-            case 5: current_bytes[4] = data[4]; [[fallthrough]];
-            case 4: current_bytes[3] = data[3]; [[fallthrough]];
-            case 3: current_bytes[2] = data[2]; [[fallthrough]];
-            case 2: current_bytes[1] = data[1]; [[fallthrough]];
-            case 1: current_bytes[0] = data[0]; [[fallthrough]];
-            case 0: break;
+            auto transformed_x = x;
+            if constexpr (!std::is_same_v<Transform, void>)
+                transformed_x = Transform()(x);
+            else
+                DB::transformEndianness<std::endian::little>(transformed_x);
+
+            update(reinterpret_cast<const char *>(&transformed_x), sizeof(transformed_x)); /// NOLINT
+        }
+        else
+        {
+            update(reinterpret_cast<const char *>(&x), sizeof(x)); /// NOLINT
         }
     }
 
-    template <typename T>
-    void update(const T & x)
-    {
-        update(reinterpret_cast<const char *>(&x), sizeof(x));
-    }
+    ALWAYS_INLINE void update(const std::string & x) { update(x.data(), x.length()); }
+    ALWAYS_INLINE void update(const std::string_view x) { update(x.data(), x.size()); }
+    ALWAYS_INLINE void update(const char * s) { update(std::string_view(s)); }
 
-    void update(const std::string & x)
-    {
-        update(x.data(), x.length());
-    }
-
-    /// Get the result in some form. This can only be done once!
-
-    void get128(char * out)
+    ALWAYS_INLINE UInt64 get64()
     {
         finalize();
-        unalignedStore<UInt64>(out, v0 ^ v1);
-        unalignedStore<UInt64>(out + 8, v2 ^ v3);
+        return v0 ^ v1 ^ v2 ^ v3;
     }
 
     template <typename T>
+    requires (sizeof(T) == 8)
     ALWAYS_INLINE void get128(T & lo, T & hi)
     {
-        static_assert(sizeof(T) == 8);
         finalize();
         lo = v0 ^ v1;
         hi = v2 ^ v3;
     }
 
-    template <typename T>
-    ALWAYS_INLINE void get128(T & dst)
+    /// ATTENTION: This is not constant method, if you call it several times, it will return different results, because of the finalization step.
+    ALWAYS_INLINE UInt128 get128()
     {
-        static_assert(sizeof(T) == 16);
-        get128(reinterpret_cast<char *>(&dst));
+        UInt128 res;
+        get128(res.items[UInt128::_impl::little(0)], res.items[UInt128::_impl::little(1)]);
+        return res;
     }
 
-    UInt64 get64()
-    {
-        finalize();
-        return v0 ^ v1 ^ v2 ^ v3;
-    }
+    UInt128 get128Reference();
 };
 
 
 #undef ROTL
-#undef SIPROUND
 
-#include <cstddef>
-
-inline void sipHash128(const char * data, const size_t size, char * out)
+inline std::array<char, 16> getSipHash128AsArray(SipHash & sip_hash)
 {
-    SipHash hash;
+    std::array<char, 16> arr{};
+    *reinterpret_cast<UInt128*>(arr.data()) = sip_hash.get128();
+    return arr;
+}
+
+inline CityHash_v1_0_2::uint128 getSipHash128AsPair(SipHash & sip_hash)
+{
+    CityHash_v1_0_2::uint128 result;
+    sip_hash.get128(result.low64, result.high64);
+    return result;
+}
+
+inline String getSipHash128AsHexString(const UInt128 & hash)
+{
+    String result;
+
+    const auto * hash_data = reinterpret_cast<const UInt8 *>(&hash);
+    const auto hash_size = sizeof(hash);
+    result.resize(hash_size * 2);
+    for (size_t i = 0; i < hash_size; ++i)
+    {
+        if constexpr (std::endian::native == std::endian::big)
+            writeHexByteLowercase(hash_data[hash_size - 1 - i], &result[2 * i]);
+        else
+            writeHexByteLowercase(hash_data[i], &result[2 * i]);
+    }
+    return result;
+}
+
+inline String getSipHash128AsHexString(SipHash & sip_hash)
+{
+    return getSipHash128AsHexString(sip_hash.get128());
+}
+
+inline UInt128 sipHash128Keyed(UInt64 key0, UInt64 key1, const char * data, const size_t size)
+{
+    SipHash hash(key0, key1);
     hash.update(data, size);
-    hash.get128(out);
+    return hash.get128();
 }
 
 inline UInt128 sipHash128(const char * data, const size_t size)
 {
-    SipHash hash;
-    hash.update(data, size);
+    return sipHash128Keyed(0, 0, data, size);
+}
+
+/// The same as `sipHash128`, for data that is followed by at least 7 readable bytes, such as a value of a padded column
+/// (`PaddedPODArray`). The last partial word is read with one load and a mask, instead of a jump on its length to a
+/// load of every byte, which is mispredicted when the lengths of the strings vary.
+inline UInt128 sipHash128Padded(const char * data, const size_t size)
+{
+    UInt64 v0 = 0x736f6d6570736575ULL;
+    UInt64 v1 = 0x646f72616e646f6dULL;
+    UInt64 v2 = 0x6c7967656e657261ULL;
+    UInt64 v3 = 0x7465646279746573ULL;
+
+    const char * end = data + size;
+    for (; end - data >= 8; data += 8)
+    {
+        const UInt64 word = unalignedLoadLittleEndian<UInt64>(data);
+        v3 ^= word;
+        SIPROUND;
+        SIPROUND;
+        v0 ^= word;
+    }
+
+    /// The remaining bytes in the low bytes, and the size modulo 256 in the high byte, as in `SipHash::finalize`.
+    const size_t remaining = end - data;
+    UInt64 last = remaining ? unalignedLoadLittleEndian<UInt64>(data) & ((1ULL << (remaining * 8)) - 1) : 0;
+    last |= static_cast<UInt64>(static_cast<UInt8>(size)) << 56;
+    v3 ^= last;
+    SIPROUND;
+    SIPROUND;
+    v0 ^= last;
+
+    v2 ^= 0xff;
+    SIPROUND;
+    SIPROUND;
+    SIPROUND;
+    SIPROUND;
+
     UInt128 res;
-    hash.get128(res);
+    res.items[UInt128::_impl::little(0)] = v0 ^ v1;
+    res.items[UInt128::_impl::little(1)] = v2 ^ v3;
     return res;
 }
 
-inline UInt64 sipHash64(const char * data, const size_t size)
+inline String sipHash128String(const char * data, const size_t size)
 {
-    SipHash hash;
+    return getHexUIntLowercase(sipHash128(data, size));
+}
+
+inline String sipHash128String(const String & str)
+{
+    return sipHash128String(str.data(), str.size());
+}
+
+inline UInt128 sipHash128ReferenceKeyed(UInt64 key0, UInt64 key1, const char * data, const size_t size)
+{
+    SipHash hash(key0, key1, true);
+    hash.update(data, size);
+    return hash.get128Reference();
+}
+
+inline UInt128 sipHash128Reference(const char * data, const size_t size)
+{
+    return sipHash128ReferenceKeyed(0, 0, data, size);
+}
+
+inline UInt64 sipHash64Keyed(UInt64 key0, UInt64 key1, const char * data, const size_t size)
+{
+    SipHash hash(key0, key1);
     hash.update(data, size);
     return hash.get64();
 }
 
+inline UInt64 sipHash64(const char * data, const size_t size)
+{
+    return sipHash64Keyed(0, 0, data, size);
+}
+
 template <typename T>
-UInt64 sipHash64(const T & x)
+inline UInt64 sipHash64(const T & x)
 {
     SipHash hash;
     hash.update(x);

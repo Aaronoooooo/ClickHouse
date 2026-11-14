@@ -2,10 +2,12 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypesDecimal.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnDecimal.h>
-
+#include <Core/callOnTypeIndex.h>
+#include <base/extended_types.h>
+#include <base/itoa.h>
+#include <Common/digits10.h>
 
 namespace DB
 {
@@ -23,7 +25,7 @@ namespace
 /// For Decimal values takes in account their scales: calculates result over underlying int type which is (value * scale).
 /// countDigits(42) = 2, countDigits(42.000) = 5, countDigits(0.04200) = 4.
 /// I.e. you may check decimal overflow for Decimal64 with 'countDecimal(x) > 18'. It's a slow variant of isDecimalOverflow().
-class FunctionCountDigits : public IFunction
+class FunctionCountDigits final : public IFunction
 {
 public:
     static constexpr auto name = "countDigits";
@@ -38,22 +40,21 @@ public:
     size_t getNumberOfArguments() const override { return 1; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    String getSignatureString() const override
     {
-        WhichDataType which_first(arguments[0]->getTypeId());
+        return "(Integer | Decimal) -> UInt8";
+    }
 
-        if (!which_first.isInt() && !which_first.isUInt() && !which_first.isDecimal())
-            throw Exception("Illegal type " + arguments[0]->getName() + " of argument of function " + getName(),
-                            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-        return std::make_shared<DataTypeUInt8>(); /// Up to 255 decimal digits.
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
+        return std::make_shared<DataTypeUInt8>();
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
         const auto & src_column = arguments[0];
         if (!src_column.column)
-            throw Exception("Illegal column while execute function " + getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal column while execute function {}", getName());
 
         auto result_column = ColumnUInt8::create();
 
@@ -69,13 +70,12 @@ public:
                 return true;
             }
 
-            throw Exception("Illegal column while execute function " + getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal column while execute function {}", getName());
         };
 
         TypeIndex dec_type_idx = src_column.type->getTypeId();
         if (!callOnBasicType<void, true, false, true, false>(dec_type_idx, call))
-            throw Exception("Wrong call for " + getName() + " with " + src_column.type->getName(),
-                            ErrorCodes::ILLEGAL_COLUMN);
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Wrong call for {} with {}", getName(), src_column.type->getName());
 
         return result_column;
     }
@@ -84,7 +84,7 @@ private:
     template <typename T, typename ColVecType>
     static void execute(const ColVecType & col, ColumnUInt8 & result_column, size_t rows_count)
     {
-        using NativeT = NativeType<T>;
+        using NativeT = make_unsigned_t<NativeType<T>>;
 
         const auto & src_data = col.getData();
         auto & dst_data = result_column.getData();
@@ -93,58 +93,77 @@ private:
         for (size_t i = 0; i < rows_count; ++i)
         {
             if constexpr (is_decimal<T>)
-                dst_data[i] = digits<NativeT>(src_data[i].value);
-            else
-                dst_data[i] = digits<NativeT>(src_data[i]);
-        }
-    }
-
-    template <typename T>
-    static UInt32 digits(T value)
-    {
-        static_assert(!is_decimal<T>);
-        using DivT = std::conditional_t<is_signed_v<T>, Int32, UInt32>;
-
-        UInt32 res = 0;
-        T tmp;
-
-        if constexpr (sizeof(T) > sizeof(Int32))
-        {
-            static constexpr const DivT e9 = 1000000000;
-
-            tmp = value / e9;
-            while (tmp != 0)
             {
-                value = tmp;
-                tmp /= e9;
-                res += 9;
+                auto value = src_data[i].value;
+                if (value < 0) [[unlikely]]
+                    /// Cast to unsigned before negation: `-INT_MIN` on a signed integer type is
+                    /// undefined behavior. Unary minus on the unsigned representation is
+                    /// well-defined modular arithmetic and preserves the correct magnitude.
+                    /// The outer cast back to `NativeT` is needed because integer promotion
+                    /// widens narrower unsigned types to `int` before applying unary minus.
+                    dst_data[i] = static_cast<UInt8>(common::digits10<NativeT>(static_cast<NativeT>(-static_cast<NativeT>(value))));
+                else
+                    dst_data[i] = static_cast<UInt8>(common::digits10<NativeT>(value));
+            }
+            else
+            {
+                auto value = src_data[i];
+                if (value < 0) [[unlikely]]
+                    /// See note above.
+                    dst_data[i] = static_cast<UInt8>(common::digits10<NativeT>(static_cast<NativeT>(-static_cast<NativeT>(value))));
+                else
+                    dst_data[i] = static_cast<UInt8>(common::digits10<NativeT>(value));
             }
         }
-
-        static constexpr const DivT e3 = 1000;
-
-        tmp = value / e3;
-        while (tmp != 0)
-        {
-            value = tmp;
-            tmp /= e3;
-            res += 3;
-        }
-
-        while (value != 0)
-        {
-            value /= 10;
-            ++res;
-        }
-        return res;
     }
 };
 
 }
 
-void registerFunctionCountDigits(FunctionFactory & factory)
+REGISTER_FUNCTION(CountDigits)
 {
-    factory.registerFunction<FunctionCountDigits>();
+    FunctionDocumentation::Description description = R"(
+Returns the number of decimal digits needed to represent a value.
+
+<Note>
+This function takes into account the scales of decimal values i.e., it calculates the result over the underlying integer type which is `(value * scale)`.
+
+For example:
+- `countDigits(42) = 2`
+- `countDigits(42.000) = 5`
+- `countDigits(0.04200) = 4`
+</Note>
+
+<Tip>
+You can check decimal overflow for `Decimal64` with `countDigits(x) > 18`,
+although it is slower than [`isDecimalOverflow`](#isDecimalOverflow).
+</Tip>
+)";
+    FunctionDocumentation::Syntax syntax = "countDigits(x)";
+    FunctionDocumentation::Arguments arguments = {
+        {"x", "An integer or decimal value.", {"(U)Int*", "Decimal"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the number of digits needed to represent `x`.", {"UInt8"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        R"(
+SELECT countDigits(toDecimal32(1, 9)), countDigits(toDecimal32(-1, 9)),
+       countDigits(toDecimal64(1, 18)), countDigits(toDecimal64(-1, 18)),
+       countDigits(toDecimal128(1, 38)), countDigits(toDecimal128(-1, 38));
+        )",
+        R"(
+┌─countDigits(toDecimal32(1, 9))─┬─countDigits(toDecimal32(-1, 9))─┬─countDigits(toDecimal64(1, 18))─┬─countDigits(toDecimal64(-1, 18))─┬─countDigits(toDecimal128(1, 38))─┬─countDigits(toDecimal128(-1, 38))─┐
+│                             10 │                              10 │                              19 │                               19 │                               39 │                                39 │
+└────────────────────────────────┴─────────────────────────────────┴─────────────────────────────────┴──────────────────────────────────┴──────────────────────────────────┴───────────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 8};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionCountDigits>(documentation);
 }
 
 }

@@ -1,0 +1,35 @@
+#pragma once
+
+#include <Analyzer/IQueryTreePass.h>
+
+namespace DB
+{
+
+class QueryNode;
+
+/** Convert `if` with constant condition or `multiIf` with single constant condition into true condition argument value
+  * or false condition argument value.
+  * Not done when the other argument contains an aggregate function or `arrayJoin`.
+  *
+  * Example: SELECT if(1, true_value, false_value);
+  * Result: SELECT true_value;
+  *
+  * Example: SELECT if(0, true_value, false_value);
+  * Result: SELECT false_value;
+  */
+class IfConstantConditionPass final : public IQueryTreePass
+{
+public:
+    String getName() override { return "IfConstantCondition"; }
+
+    String getDescription() override { return "Optimize if, multiIf for constant condition."; }
+
+    void run(QueryTreeNodePtr & query_tree_node, ContextPtr context) override;
+
+};
+
+/// Whether `IfConstantConditionPass` leaves the expressions of `query_node` unfolded, because folding them would merge
+/// ROLLUP, CUBE or GROUPING SETS keys of different grouping sets.
+bool ifConstantConditionFoldingMergesGroupingKeys(const QueryNode & query_node, const ContextPtr & context);
+
+}

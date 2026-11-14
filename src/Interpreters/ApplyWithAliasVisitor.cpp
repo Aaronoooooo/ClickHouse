@@ -1,12 +1,26 @@
 #include <Interpreters/ApplyWithAliasVisitor.h>
+#include <Interpreters/ExpandedASTBudget.h>
 #include <Interpreters/misc.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Common/checkStackSize.h>
+
 
 namespace DB
 {
+
+void ApplyWithAliasVisitor::visit(ASTPtr & ast, size_t max_expanded_ast_elements)
+{
+    ExpandedASTBudget budget(max_expanded_ast_elements, *ast);
+    Data data;
+    data.budget = &budget;
+    visit(ast, data);
+}
+
 void ApplyWithAliasVisitor::visit(ASTPtr & ast, const Data & data)
 {
+    checkStackSize();
+
     if (auto * node_select = ast->as<ASTSelectQuery>())
     {
         std::optional<Data> new_data;
@@ -26,15 +40,16 @@ void ApplyWithAliasVisitor::visit(ASTPtr & ast, const Data & data)
             }
             for (const auto & with_alias : data.exprs)
             {
-                if (!current_names.count(with_alias.first))
-                    with->children.push_back(with_alias.second->clone());
+                if (!current_names.contains(with_alias.first))
+                    with->children.push_back(data.budget->clone(with_alias.second));
             }
         }
         else if (!data.exprs.empty())
         {
-            auto with_expression_list = std::make_shared<ASTExpressionList>();
+            data.budget->addNode();
+            auto with_expression_list = make_intrusive<ASTExpressionList>();
             for (const auto & with_alias : data.exprs)
-                with_expression_list->children.push_back(with_alias.second->clone());
+                with_expression_list->children.push_back(data.budget->clone(with_alias.second));
             node_select->setExpression(ASTSelectQuery::Expression::WITH, std::move(with_expression_list));
         }
         for (auto & child : node_select->children)

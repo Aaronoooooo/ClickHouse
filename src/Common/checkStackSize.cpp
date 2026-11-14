@@ -1,11 +1,24 @@
-#include <Common/checkStackSize.h>
-#include <Common/Exception.h>
-#include <base/scope_guard.h>
+#include <base/getThreadId.h>
 #include <base/defines.h> /// THREAD_SANITIZER
+#include <base/scope_guard.h>
+#include <Common/checkStackSize.h>
+#include <Common/CoroutineStack.h>
+#include <Common/Exception.h>
+#include <Common/ErrnoException.h>
+#include <Common/Silk/FiberScheduler.h>
+#include <Common/StackfulCoroutine.h>
+#include <sys/resource.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <cstdint>
 
-#if defined(__FreeBSD__)
+#include "config.h"
+
+#if USE_SILK
+#include <silk/fibers/fiber.h>
+#endif
+
+#if defined(OS_FREEBSD)
 #   include <pthread_np.h>
 #endif
 
@@ -20,19 +33,35 @@ namespace DB
     }
 }
 
-static thread_local void * stack_address = nullptr;
-static thread_local size_t max_stack_size = 0;
+namespace
+{
+/// The stack address and size are detected once per thread and cached here. Both fields live
+/// in one thread_local object so a single TLS access serves both (one base computation instead
+/// of two; this is essentially free on x86 but matters on platforms where each thread_local
+/// symbol needs its own TLS-resolution sequence). constinit guarantees constant initialization,
+/// so there is no thread-safe-initialization guard on access.
+struct StackBounds
+{
+    void * address = nullptr;
+    size_t max_size = 0;
+};
+
+constinit thread_local StackBounds stack_bounds;
+
+/// Thread stacks use `STACK_SIZE_FREE_RATIO`, which leaves too little room on a 320 KiB coroutine stack.
+constexpr size_t COROUTINE_STACK_RESERVE = 64 * 1024;
+}
 
 /**
  * @param out_address - if not nullptr, here the address of the stack will be written.
  * @return stack size
  */
-size_t getStackSize(void ** out_address)
+static NO_INLINE size_t getStackSize(void ** out_address)
 {
     using namespace DB;
 
-    size_t size;
-    void * address;
+    size_t size = 0;
+    void * address = nullptr;
 
 #if defined(OS_DARWIN)
     // pthread_get_stacksize_np() returns a value too low for the main thread on
@@ -48,20 +77,50 @@ size_t getStackSize(void ** out_address)
     address = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(thread)) - size);
 #else
     pthread_attr_t attr;
-#   if defined(__FreeBSD__) || defined(OS_SUNOS)
+#   if defined(OS_FREEBSD) || defined(OS_SUNOS)
     pthread_attr_init(&attr);
     if (0 != pthread_attr_get_np(pthread_self(), &attr))
-        throwFromErrno("Cannot pthread_attr_get_np", ErrorCodes::CANNOT_PTHREAD_ATTR);
+        throw ErrnoException(ErrorCodes::CANNOT_PTHREAD_ATTR, "Cannot pthread_attr_get_np");
 #   else
     if (0 != pthread_getattr_np(pthread_self(), &attr))
-        throwFromErrno("Cannot pthread_getattr_np", ErrorCodes::CANNOT_PTHREAD_ATTR);
+    {
+        if (errno == ENOENT)
+        {
+            /// Most likely procfs is not mounted.
+            return 0;
+        }
+        throw ErrnoException(ErrorCodes::CANNOT_PTHREAD_ATTR, "Cannot pthread_getattr_np");
+    }
 #   endif
 
     SCOPE_EXIT({ pthread_attr_destroy(&attr); });
 
     if (0 != pthread_attr_getstack(&attr, &address, &size))
-        throwFromErrno("Cannot pthread_getattr_np", ErrorCodes::CANNOT_PTHREAD_ATTR);
-#endif // OS_DARWIN
+        throw ErrnoException(ErrorCodes::CANNOT_PTHREAD_ATTR, "Cannot pthread_attr_getstack");
+
+#ifdef USE_MUSL
+    /// Adjust stack size for the main thread under musl.
+    /// musl returns not the maximum available stack, but current stack.
+    ///
+    /// TL;DR;
+    ///
+    /// musl uses mremap() and calls it until it returns ENOMEM, but after the
+    /// available stack there will be a guard page (that is handled by the
+    /// kernel to expand the stack), and when you will try to mremap() on it
+    /// you will get EFAULT.
+    if (static_cast<pid_t>(getThreadId()) == getpid())
+    {
+        ::rlimit rlimit{};
+        if (::getrlimit(RLIMIT_STACK, &rlimit))
+            return 0;
+
+        address = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(address) + size);
+        size = rlimit.rlim_cur;
+        address = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(address) - size);
+    }
+#endif
+
+#endif
 
     if (out_address)
         *out_address = address;
@@ -69,45 +128,78 @@ size_t getStackSize(void ** out_address)
     return size;
 }
 
-/** It works fine when interpreters are instantiated by ClickHouse code in properly prepared threads,
-  *  but there are cases when ClickHouse runs as a library inside another application.
-  * If application is using user-space lightweight threads with manually allocated stacks,
-  *  current implementation is not reasonable, as it has no way to properly check the remaining
-  *  stack size without knowing the details of how stacks are allocated.
-  * We mark this function as weak symbol to be able to replace it in another ClickHouse-based products.
-  */
-__attribute__((__weak__)) void checkStackSize()
+/// Kept out of line so the rare error paths do not bloat checkStackSize (which is inlined into many callers).
+[[noreturn]] [[gnu::cold]] NO_INLINE static void throwFrameAddressError()
 {
-    using namespace DB;
+    throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Frame address is greater than stack begin address");
+}
 
-    if (!stack_address)
-        max_stack_size = getStackSize(&stack_address);
+/// The message is sent to the client, so it does not contain the addresses of the stack and the frame,
+/// to not disclose the layout of the address space of the server.
+[[noreturn]] [[gnu::cold]] NO_INLINE static void throwTooDeepRecursion(size_t used_stack_size, size_t total_stack_size)
+{
+    throw DB::Exception(DB::ErrorCodes::TOO_DEEP_RECURSION,
+                        "Stack size too large. Stack size: {}, maximum stack size: {}",
+                        used_stack_size, total_stack_size);
+}
 
+void checkStackSize()
+{
     const void * frame_address = __builtin_frame_address(0);
+
+    if (const StackfulCoroutine * coroutine = StackfulCoroutine::getCurrentCoroutine())
+    {
+        const CoroutineStack::Bounds bounds = coroutine->getStackBounds();
+
+        if (bounds.size <= COROUTINE_STACK_RESERVE)
+            return;
+
+        uintptr_t frame = reinterpret_cast<uintptr_t>(frame_address);
+        uintptr_t lowest = reinterpret_cast<uintptr_t>(bounds.lowest);
+
+        /// `resume` marks the coroutine current before switching stacks, so the frame may be on the parent stack.
+        if (frame < lowest || frame - lowest >= bounds.size)
+            return;
+
+        if (unlikely(frame - lowest < COROUTINE_STACK_RESERVE))
+            throwTooDeepRecursion(lowest + bounds.size - frame, bounds.size);
+
+        return;
+    }
+
+#if USE_SILK
+    /// Not implemented for Silk fibers: they expose no stack bounds.
+    if (Silk::isInsideFiber())
+        return;
+#endif
+
+    if (unlikely(!stack_bounds.address))
+        stack_bounds.max_size = getStackSize(&stack_bounds.address);
+
+    /// The check is impossible.
+    if (unlikely(!stack_bounds.max_size))
+        return;
+
     uintptr_t int_frame_address = reinterpret_cast<uintptr_t>(frame_address);
-    uintptr_t int_stack_address = reinterpret_cast<uintptr_t>(stack_address);
+    uintptr_t int_stack_address = reinterpret_cast<uintptr_t>(stack_bounds.address);
 
 #if !defined(THREAD_SANITIZER)
     /// It's overkill to use more then half of stack.
-    static constexpr double STACK_SIZE_FREE_RATIO = 0.5;
+    static constexpr size_t STACK_SIZE_FREE_RATIO = 2;
 #else
     /// Under TSan recursion eats too much RAM, so half of stack is too much.
     /// So under TSan only 5% of a stack is allowed (this is ~400K)
-    static constexpr double STACK_SIZE_FREE_RATIO = 0.05;
+    static constexpr size_t STACK_SIZE_FREE_RATIO = 20;
 #endif
 
-    /// We assume that stack grows towards lower addresses. And that it starts to grow from the end of a chunk of memory of max_stack_size.
-    if (int_frame_address > int_stack_address + max_stack_size)
-        throw Exception("Logical error: frame address is greater than stack begin address", ErrorCodes::LOGICAL_ERROR);
+    /// We assume that stack grows towards lower addresses. And that it starts to grow from the end of a chunk of memory of max_size.
+    if (unlikely(int_frame_address > int_stack_address + stack_bounds.max_size))
+        throwFrameAddressError();
 
-    size_t stack_size = int_stack_address + max_stack_size - int_frame_address;
-    size_t max_stack_size_allowed = max_stack_size * STACK_SIZE_FREE_RATIO;
+    size_t stack_size = int_stack_address + stack_bounds.max_size - int_frame_address;
+    size_t max_stack_size_allowed = stack_bounds.max_size / STACK_SIZE_FREE_RATIO;
 
     /// Just check if we have eat more than a STACK_SIZE_FREE_RATIO of stack size already.
-    if (stack_size > max_stack_size_allowed)
-    {
-        throw Exception(ErrorCodes::TOO_DEEP_RECURSION,
-                        "Stack size too large. Stack address: {}, frame address: {}, stack size: {}, maximum stack size: {}",
-                        stack_address, frame_address, stack_size, max_stack_size);
-    }
+    if (unlikely(stack_size > max_stack_size_allowed))
+        throwTooDeepRecursion(stack_size, stack_bounds.max_size);
 }

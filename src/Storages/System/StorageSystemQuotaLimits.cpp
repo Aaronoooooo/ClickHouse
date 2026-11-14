@@ -1,7 +1,10 @@
 #include <Storages/System/StorageSystemQuotaLimits.h>
+#include <Storages/System/SystemTableSourceRegistry.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <Columns/ColumnMap.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnNullable.h>
@@ -22,7 +25,9 @@ namespace
     {
         out_column_null_map.push_back(false);
         if (type_info.output_as_float)
-            static_cast<ColumnFloat64 &>(out_column).getData().push_back(double(value) / type_info.output_denominator);
+            static_cast<ColumnFloat64 &>(out_column)
+                .getData()
+                .push_back(static_cast<double>(value) / static_cast<double>(type_info.output_denominator));
         else
             static_cast<ColumnUInt64 &>(out_column).getData().push_back(value / type_info.output_denominator);
     }
@@ -40,12 +45,23 @@ namespace
 }
 
 
-NamesAndTypesList StorageSystemQuotaLimits::getNamesAndTypes()
+ColumnsDescription StorageSystemQuotaLimits::getColumnsDescription()
 {
-    NamesAndTypesList names_and_types{
-        {"quota_name", std::make_shared<DataTypeString>()},
-        {"duration", std::make_shared<DataTypeUInt32>()},
-        {"is_randomized_interval", std::make_shared<DataTypeUInt8>()},
+    ColumnsDescription result
+    {
+        {"quota_name", std::make_shared<DataTypeString>(), "Quota name."},
+        {"duration", std::make_shared<DataTypeUInt32>(), "Length of the time interval for calculating resource consumption, in seconds."},
+        {"is_randomized_interval", std::make_shared<DataTypeUInt8>(),
+            "Boolean value. It shows whether the interval is randomized. "
+            "Interval always starts at the same time if it is not randomized. "
+            "For example, an interval of 1 minute always starts at an integer number of minutes "
+            "(i.e. it can start at 11:20:00, but it never starts at 11:20:01), "
+            "an interval of one day always starts at midnight UTC. "
+            "If interval is randomized, the very first interval starts at random time, "
+            "and subsequent intervals starts one by one. Values: "
+            "0 — Interval is not randomized, "
+            "1 — Interval is randomized."
+        },
     };
 
     for (auto quota_type : collections::range(QuotaType::MAX))
@@ -57,17 +73,24 @@ NamesAndTypesList StorageSystemQuotaLimits::getNamesAndTypes()
             data_type = std::make_shared<DataTypeFloat64>();
         else
             data_type = std::make_shared<DataTypeUInt64>();
-        names_and_types.push_back({column_name, std::make_shared<DataTypeNullable>(data_type)});
+
+        result.add({column_name, std::make_shared<DataTypeNullable>(data_type), type_info.max_allowed_usage_description});
     }
 
-    return names_and_types;
+    result.add({"max_profile_events", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>()),
+        "Maximum allowed consumption of each profile event the quota defines a limit over. A value of 0 means the event is only tracked, without a limit."});
+
+    return result;
 }
 
 
-void StorageSystemQuotaLimits::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo &) const
+void StorageSystemQuotaLimits::fillData(MutableColumns & res_columns, ContextPtr context, const ActionsDAG::Node *, std::vector<UInt8>) const
 {
-    context->checkAccess(AccessType::SHOW_QUOTAS);
+    /// If "select_from_system_db_requires_grant" is enabled the access rights were already checked in InterpreterSelectQuery.
     const auto & access_control = context->getAccessControl();
+    if (!access_control.doesSelectFromSystemDatabaseRequireGrant())
+        context->checkAccess(AccessType::SHOW_QUOTAS);
+
     std::vector<UUID> ids = access_control.findAll<Quota>();
 
     size_t column_index = 0;
@@ -84,10 +107,12 @@ void StorageSystemQuotaLimits::fillData(MutableColumns & res_columns, ContextPtr
         column_max_null_map[quota_type_i] = &assert_cast<ColumnNullable &>(*res_columns[column_index++]).getNullMapData();
     }
 
+    auto & column_max_profile_events = assert_cast<ColumnMap &>(*res_columns[column_index++]);
+
     auto add_row = [&](const String & quota_name, const Quota::Limits & limits)
     {
         column_quota_name.insertData(quota_name.data(), quota_name.length());
-        column_duration.push_back(limits.duration.count());
+        column_duration.push_back(static_cast<UInt32>(limits.duration.count()));
         column_is_randomized_interval.push_back(limits.randomize_interval);
 
         for (auto quota_type : collections::range(QuotaType::MAX))
@@ -96,6 +121,12 @@ void StorageSystemQuotaLimits::fillData(MutableColumns & res_columns, ContextPtr
             const auto & type_info = QuotaTypeInfo::get(quota_type);
             addValue(*column_max[quota_type_i], *column_max_null_map[quota_type_i], limits.max[quota_type_i], type_info);
         }
+
+        Map max_profile_events_map;
+        max_profile_events_map.reserve(limits.profile_events_max.size());
+        for (const auto & [event_name, event_max] : limits.profile_events_max)
+            max_profile_events_map.push_back(Tuple{event_name, event_max});
+        column_max_profile_events.insert(max_profile_events_map);
     };
 
     auto add_rows = [&](const String & quota_name, const std::vector<Quota::Limits> & all_limits)
@@ -114,3 +145,6 @@ void StorageSystemQuotaLimits::fillData(MutableColumns & res_columns, ContextPtr
     }
 }
 }
+
+/// Register the source file of this system table for `system.documentation`.
+namespace DB { REGISTER_SYSTEM_TABLE_SOURCE(StorageSystemQuotaLimits) }

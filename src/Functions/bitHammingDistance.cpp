@@ -1,162 +1,86 @@
-#include <Columns/ColumnVector.h>
-#include <DataTypes/DataTypesNumber.h>
+#include <Functions/FunctionBinaryArithmetic.h>
 #include <Functions/FunctionFactory.h>
-#include <Functions/FunctionHelpers.h>
-#include <Functions/IFunction.h>
-#include <Functions/castTypeToEither.h>
+#include <bit>
+
 
 namespace DB
 {
+
 namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
 }
-
 
 template <typename A, typename B>
 struct BitHammingDistanceImpl
 {
-    using ResultType = UInt8;
+    using ResultType = std::conditional_t<(sizeof(A) * 8 >= 256), UInt16, UInt8>;
+    static constexpr bool allow_fixed_string = true;
+    static constexpr bool allow_string_integer = false;
 
-    static void NO_INLINE vectorVector(const PaddedPODArray<A> & a, const PaddedPODArray<B> & b, PaddedPODArray<ResultType> & c)
+    /// Documentation-only — result is `UInt16` for 256-bit inputs, otherwise
+    /// `UInt8`; this isn't expressible compactly in the DSL.
+    static constexpr auto signature_documentation = "(Number, Number) -> UInt";
+
+    template <typename Result = ResultType>
+    static NO_SANITIZE_UNDEFINED Result apply(A a, B b)
     {
-        size_t size = a.size();
-        for (size_t i = 0; i < size; ++i)
-            c[i] = apply(a[i], b[i]);
-    }
+        /// Note: it's unspecified if signed integers should be promoted with sign-extension or with zero-fill.
+        /// This behavior can change in the future.
 
-    static void NO_INLINE vectorConstant(const PaddedPODArray<A> & a, B b, PaddedPODArray<ResultType> & c)
-    {
-        size_t size = a.size();
-        for (size_t i = 0; i < size; ++i)
-            c[i] = apply(a[i], b);
-    }
-
-    static void NO_INLINE constantVector(A a, const PaddedPODArray<B> & b, PaddedPODArray<ResultType> & c)
-    {
-        size_t size = b.size();
-        for (size_t i = 0; i < size; ++i)
-            c[i] = apply(a, b[i]);
-    }
-
-private:
-    static inline UInt8 apply(UInt64 a, UInt64 b)
-    {
-        UInt64 res = a ^ b;
-        return __builtin_popcountll(res);
-    }
-};
-
-template <typename F>
-bool castType(const IDataType * type, F && f)
-{
-    return castTypeToEither<
-        DataTypeInt8,
-        DataTypeInt16,
-        DataTypeInt32,
-        DataTypeInt64,
-        DataTypeUInt8,
-        DataTypeUInt16,
-        DataTypeUInt32,
-        DataTypeUInt64>(type, std::forward<F>(f));
-}
-
-template <typename F>
-static bool castBothTypes(const IDataType * left, const IDataType * right, F && f)
-{
-    return castType(left, [&](const auto & left_) { return castType(right, [&](const auto & right_) { return f(left_, right_); }); });
-}
-
-// bitHammingDistance function: (Integer, Integer) -> UInt8
-class FunctionBitHammingDistance : public IFunction
-{
-public:
-    static constexpr auto name = "bitHammingDistance";
-    using ResultType = UInt8;
-    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionBitHammingDistance>(); }
-
-    String getName() const override { return name; }
-
-    size_t getNumberOfArguments() const override { return 2; }
-
-    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
-
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
-    {
-        if (!isInteger(arguments[0]))
-            throw Exception(
-                "Illegal type " + arguments[0]->getName() + " of argument of function " + getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-        if (!isInteger(arguments[1]))
-            throw Exception(
-                "Illegal type " + arguments[1]->getName() + " of argument of function " + getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-        return std::make_shared<DataTypeUInt8>();
-    }
-
-    bool useDefaultImplementationForConstants() const override { return true; }
-
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
-    {
-        const auto * left_generic = arguments[0].type.get();
-        const auto * right_generic = arguments[1].type.get();
-        ColumnPtr result_column;
-        bool valid = castBothTypes(left_generic, right_generic, [&](const auto & left, const auto & right)
+        if constexpr (sizeof(A) <= sizeof(UInt64) && sizeof(B) <= sizeof(UInt64))
         {
-            using LeftDataType = std::decay_t<decltype(left)>;
-            using RightDataType = std::decay_t<decltype(right)>;
-            using T0 = typename LeftDataType::FieldType;
-            using T1 = typename RightDataType::FieldType;
-            using ColVecT0 = ColumnVector<T0>;
-            using ColVecT1 = ColumnVector<T1>;
-            using ColVecResult = ColumnVector<ResultType>;
+            UInt64 res = static_cast<UInt64>(a) ^ static_cast<UInt64>(b);
+            return static_cast<ResultType>(std::popcount(res));
+        }
+        else if constexpr (is_big_int_v<A> && is_big_int_v<B>)
+        {
+            auto xored = a ^ b;
 
-            using OpImpl = BitHammingDistanceImpl<T0, T1>;
-
-            const auto * const col_left_raw = arguments[0].column.get();
-            const auto * const col_right_raw = arguments[1].column.get();
-
-            typename ColVecResult::MutablePtr col_res = nullptr;
-            col_res = ColVecResult::create();
-
-            auto & vec_res = col_res->getData();
-            vec_res.resize(input_rows_count);
-
-            if (auto col_left_const = checkAndGetColumnConst<ColVecT0>(col_left_raw))
-            {
-                if (auto col_right = checkAndGetColumn<ColVecT1>(col_right_raw))
-                {
-                    // constant integer - non-constant integer
-                    OpImpl::constantVector(col_left_const->template getValue<T0>(), col_right->getData(), vec_res);
-                }
-                else
-                    return false;
-            }
-            else if (auto col_left = checkAndGetColumn<ColVecT0>(col_left_raw))
-            {
-                if (auto col_right = checkAndGetColumn<ColVecT1>(col_right_raw))
-                    // non-constant integer - non-constant integer
-                    OpImpl::vectorVector(col_left->getData(), col_right->getData(), vec_res);
-                else if (auto col_right_const = checkAndGetColumnConst<ColVecT1>(col_right_raw))
-                    // non-constant integer - constant integer
-                    OpImpl::vectorConstant(col_left->getData(), col_right_const->template getValue<T1>(), vec_res);
-                else
-                    return false;
-            }
-            else
-                return false;
-
-            result_column = std::move(col_res);
-            return true;
-        });
-        if (!valid)
-            throw Exception(getName() + "'s arguments do not match the expected data types", ErrorCodes::ILLEGAL_COLUMN);
-
-        return result_column;
+            ResultType res = 0;
+            for (auto item : xored.items)
+                res += std::popcount(item);
+            return res;
+        }
+        else
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Unsupported data type combination in function 'bitHammingDistance'");
     }
+
+#if USE_EMBEDDED_COMPILER
+    static constexpr bool compilable = false; /// special type handling, some other time
+#endif
 };
 
-void registerFunctionBitHammingDistance(FunctionFactory & factory)
+struct NameBitHammingDistance
 {
-    factory.registerFunction<FunctionBitHammingDistance>();
+    static constexpr auto name = "bitHammingDistance";
+};
+using FunctionBitHammingDistance = BinaryArithmeticOverloadResolver<BitHammingDistanceImpl, NameBitHammingDistance>;
+
+REGISTER_FUNCTION(BitHammingDistance)
+{
+    FunctionDocumentation::Description description = R"(
+Returns the [Hamming Distance](https://en.wikipedia.org/wiki/Hamming_distance) between the bit representations of two numbers.
+Can be used with [`SimHash`](/reference/functions/regular-functions/hash-functions#ngramSimHash) functions for detection of semi-duplicate strings.
+The smaller the distance, the more similar the strings are.
+)";
+    FunctionDocumentation::Syntax syntax = "bitHammingDistance(x, y)";
+    FunctionDocumentation::Arguments arguments = {
+        {"x", "First number for Hamming distance calculation.", {"(U)Int*", "Float*"}},
+        {"y", "Second number for Hamming distance calculation.", {"(U)Int*", "Float*"}},
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the hamming distance between `x` and `y`", {"UInt8"}};
+    FunctionDocumentation::Examples examples = {{"Usage example", "SELECT bitHammingDistance(111, 121);",
+        R"(
+┌─bitHammingDistance(111, 121)─┐
+│                            3 │
+└──────────────────────────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {21, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Bit;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionBitHammingDistance>(documentation);
 }
 }

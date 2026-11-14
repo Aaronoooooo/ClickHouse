@@ -1,16 +1,13 @@
 #include <Processors/Transforms/SortingTransform.h>
+#include <Common/VectorWithMemoryTracking.h>
 
+#include <algorithm>
+#include <type_traits>
+
+#include <Columns/ColumnReplicated.h>
 #include <Core/SortDescription.h>
 #include <Core/SortCursor.h>
-
-#include <Common/formatReadable.h>
-#include <Common/ProfileEvents.h>
-
-#include <IO/WriteBufferFromFile.h>
-#include <Compression/CompressedWriteBuffer.h>
-
-#include <Formats/NativeReader.h>
-#include <Formats/NativeWriter.h>
+#include <Common/Exception.h>
 
 
 namespace DB
@@ -22,127 +19,239 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-MergeSorter::MergeSorter(Chunks chunks_, SortDescription & description_, size_t max_merged_block_size_, UInt64 limit_)
-    : chunks(std::move(chunks_)), description(description_), max_merged_block_size(max_merged_block_size_), limit(limit_)
+MergeSorter::MergeSorter(
+    SharedHeader header, Chunks chunks_, const SortDescription & description,
+    size_t max_merged_block_size_, UInt64 limit_, Mode mode_, size_t preferred_block_bytes)
+    : chunks(std::move(chunks_))
+    , max_merged_block_size(max_merged_block_size_)
+    , limit(limit_)
+    , mode(mode_)
+    , queue_variants(*header, description)
 {
     Chunks nonempty_chunks;
-    for (auto & chunk : chunks)
+    size_t chunks_size = chunks.size();
+
+    for (size_t chunk_index = 0; chunk_index < chunks_size; ++chunk_index)
     {
+        auto & chunk = chunks[chunk_index];
         if (chunk.getNumRows() == 0)
             continue;
 
-        cursors.emplace_back(chunk.getColumns(), description);
-        has_collation |= cursors.back().has_collation;
+        /// Materialize sparse columns to avoid searching their offsets during comparisons.
+        convertToFullIfSparse(chunk);
+
+        /// Merge cursors expect full columns.
+        convertToFullIfConst(chunk);
+
+        size_t num_rows = chunk.getNumRows();
+        auto columns = chunk.detachColumns();
+        /// Sort cursors compare materialized keys; replicated payloads retain their representation.
+        for (const auto & column_desc : description)
+        {
+            size_t column_number = header->getPositionByName(column_desc.column_name);
+            columns[column_number] = columns[column_number]->convertToFullColumnIfReplicated();
+        }
+        chunk.setColumns(std::move(columns), num_rows);
+
+        cursors.emplace_back(*header, chunk.getColumns(), chunk.getNumRows(), description, chunk_index);
 
         nonempty_chunks.emplace_back(std::move(chunk));
     }
 
     chunks.swap(nonempty_chunks);
 
-    if (has_collation)
-        queue_with_collation = SortingHeap<SortCursorWithCollation>(cursors);
-    else if (description.size() > 1)
-        queue_without_collation = SortingHeap<SortCursor>(cursors);
-    else
-        queue_simple = SortingHeap<SimpleSortCursor>(cursors);
+    if (preferred_block_bytes && !chunks.empty())
+    {
+        size_t total_rows = 0;
+        size_t total_bytes = 0;
+        for (const auto & chunk : chunks)
+        {
+            total_rows += chunk.getNumRows();
+            total_bytes += chunk.allocatedBytes();
+        }
+
+        max_merged_block_size = calculateMaxMergedBlockSize(max_merged_block_size, preferred_block_bytes, total_rows, total_bytes);
+    }
+
+    queue_variants.callOnBatchVariant([&](auto & queue)
+    {
+        using QueueType = std::decay_t<decltype(queue)>;
+        queue = QueueType(cursors);
+    });
 }
 
+
+size_t MergeSorter::calculateMaxMergedBlockSize(
+    size_t max_block_rows, size_t preferred_block_bytes, size_t input_rows, size_t input_bytes)
+{
+    chassert(input_rows);
+    if (!preferred_block_bytes)
+        return max_block_rows;
+
+    /// Smaller spill blocks reduce the decoded memory held by each merge input. Average row size
+    /// gives a byte target rather than a strict bound for uneven rows. The minimum of 128 rows
+    /// avoids excessive per-block overhead, while the explicit row limit still takes precedence.
+    /// Compact column representations can use less than one allocated byte per row.
+    const size_t average_row_bytes = std::max<size_t>(1, input_bytes / input_rows);
+    return std::min(max_block_rows, std::max<size_t>(128, preferred_block_bytes / average_row_bytes));
+}
 
 Chunk MergeSorter::read()
 {
     if (chunks.empty())
         return Chunk();
 
-    if (chunks.size() == 1)
+    if (chunks.size() == 1 && chunks.front().getNumRows() <= max_merged_block_size
+        && (!limit || chunks.front().getNumRows() <= limit))
     {
         auto res = std::move(chunks[0]);
         chunks.clear();
         return res;
     }
 
-    if (has_collation)
-        return mergeImpl(queue_with_collation);
-    else if (description.size() > 1)
-        return mergeImpl(queue_without_collation);
-    else
-        return mergeImpl(queue_simple);
+    Chunk result = queue_variants.callOnBatchVariant([&](auto & queue)
+    {
+        if (mode == Mode::MergeUniqueChunks)
+            return mergeBatchImpl<Mode::MergeUniqueChunks>(queue);
+        return mergeBatchImpl<Mode::PreserveRows>(queue);
+    });
+
+    return result;
 }
 
 
-template <typename TSortingHeap>
-Chunk MergeSorter::mergeImpl(TSortingHeap & queue)
+template <MergeSorter::Mode merge_mode, typename TSortingQueue>
+Chunk MergeSorter::mergeBatchImpl(TSortingQueue & queue)
 {
     size_t num_columns = chunks[0].getNumColumns();
-    MutableColumns merged_columns = chunks[0].cloneEmptyColumns();
+    MutableColumns merged_columns = createMergedColumns();
 
-    /// Reserve
-    if (queue.isValid())
-    {
-        /// The expected size of output block is the same as input block
-        size_t size_to_reserve = chunks[0].getNumRows();
-        for (auto & column : merged_columns)
-            column->reserve(size_to_reserve);
-    }
+    /// Reserve at most one output block because reserved capacity counts toward tracked memory.
+    size_t size_to_reserve = std::min(static_cast<size_t>(chunks[0].getNumRows()), max_merged_block_size);
+    for (auto & column : merged_columns)
+        column->reserve(size_to_reserve);
 
-    /// TODO: Optimization when a single block left.
-
-    /// Take rows from queue in right order and push to 'merged'.
+    size_t consumed_rows = 0;
     size_t merged_rows = 0;
+    bool limit_reached = false;
     while (queue.isValid())
     {
-        auto current = queue.current();
+        auto [current_ptr, batch_size] = queue.current();
+        auto & current = *current_ptr;
+        const size_t first_row = current->getRow();
+        batch_size = std::min(batch_size, max_merged_block_size - consumed_rows);
 
-        /// Append a row from queue.
-        for (size_t i = 0; i < num_columns; ++i)
-            merged_columns[i]->insertFrom(*current->all_columns[i], current->getRow());
-
-        ++total_merged_rows;
-        ++merged_rows;
-
-        /// We don't need more rows because of limit has reached.
-        if (limit && total_merged_rows == limit)
+        size_t skipped_rows = 0;
+        if constexpr (merge_mode == Mode::MergeUniqueChunks)
         {
-            chunks.clear();
-            break;
+            /// Only a different input chunk can repeat the last emitted key.
+            if (last_emitted_cursor && last_emitted_cursor != current.impl)
+            {
+                using Cursor = std::decay_t<decltype(current)>;
+                const Cursor previous(last_emitted_cursor);
+                /// Keys are nondecreasing, so a key that is not greater is equal. Source order chooses
+                /// the first payload but does not participate in key equality.
+                skipped_rows = !current.template greaterAt<false>(previous, first_row, last_emitted_row);
+            }
         }
 
-        queue.next();
+        size_t rows_to_insert = batch_size - skipped_rows;
+        if (limit && rows_to_insert >= limit - total_merged_rows)
+        {
+            rows_to_insert = limit - total_merged_rows;
+            batch_size = rows_to_insert + skipped_rows;
+            limit_reached = true;
+        }
 
-        /// It's enough for current output block but we will continue.
-        if (merged_rows == max_merged_block_size)
+        if (rows_to_insert)
+        {
+            /// Each input batch is internally unique in `MergeUniqueChunks` mode. Only its first row
+            /// can repeat the last emitted key, so the remaining rows form one contiguous range.
+            for (size_t i = 0; i < num_columns; ++i)
+            {
+                if (rows_to_insert == 1)
+                    merged_columns[i]->insertFrom(*current->all_columns[i], first_row + skipped_rows);
+                else
+                    merged_columns[i]->insertRangeFrom(*current->all_columns[i], first_row + skipped_rows, rows_to_insert);
+            }
+
+            if constexpr (merge_mode == Mode::MergeUniqueChunks)
+            {
+                last_emitted_cursor = current.impl;
+                last_emitted_row = first_row + batch_size - 1;
+            }
+        }
+
+        total_merged_rows += rows_to_insert;
+        merged_rows += rows_to_insert;
+        consumed_rows += batch_size;
+
+        if (limit_reached)
+            break;
+
+        queue.next(batch_size);
+
+        /// Bound work by consumed rows so duplicate-only batches return control to the caller.
+        if (consumed_rows == max_merged_block_size)
             break;
     }
 
-    if (!queue.isValid())
+    if (limit_reached || !queue.isValid())
+    {
+        last_emitted_cursor = nullptr;
         chunks.clear();
+    }
 
-    if (merged_rows == 0)
+    if (merged_rows == 0 && chunks.empty())
         return {};
+
+    for (auto & column : merged_columns)
+        finishMergedReplicatedColumn(column);
 
     return Chunk(std::move(merged_columns), merged_rows);
 }
 
+MutableColumns MergeSorter::createMergedColumns() const
+{
+    size_t num_columns = chunks[0].getNumColumns();
+    VectorWithMemoryTracking<bool> is_replicated(num_columns, false);
+    for (const auto & chunk : chunks)
+    {
+        for (size_t i = 0; i != chunk.getNumColumns(); ++i)
+            is_replicated[i] = is_replicated[i] || chunk.getColumns()[i]->isReplicated();
+    }
+    MutableColumns merged_columns = chunks[0].cloneEmptyColumns();
+    for (size_t i = 0; i != num_columns; ++i)
+    {
+        if (is_replicated[i] && !merged_columns[i]->isReplicated())
+            merged_columns[i] = ColumnReplicated::create(std::move(merged_columns[i]));
+    }
+
+    return merged_columns;
+}
+
+
+void MergeSorterSource::cancel(CancelReason reason) noexcept
+{
+    /// A partial result must finish processing data already read into the in-memory tail.
+    if (reason == CancelReason::PartialResult)
+        return;
+
+    ISource::cancel(reason);
+}
 
 SortingTransform::SortingTransform(
-    const Block & header,
+    SharedHeader header,
     const SortDescription & description_,
-    size_t max_merged_block_size_, UInt64 limit_)
+    size_t max_merged_block_size_,
+    UInt64 limit_,
+    bool increase_sort_description_compile_attempts)
     : IProcessor({header}, {header})
     , description(description_)
     , max_merged_block_size(max_merged_block_size_)
     , limit(limit_)
 {
     const auto & sample = inputs.front().getHeader();
-
-    /// Replace column names to column position in sort_description.
-    for (auto & column_description : description)
-    {
-        if (!column_description.column_name.empty())
-        {
-            column_description.column_number = sample.getPositionByName(column_description.column_name);
-            column_description.column_name.clear();
-        }
-    }
 
     /// Remove constants from header and map old indexes to new.
     size_t num_columns = sample.columns();
@@ -159,21 +268,28 @@ SortingTransform::SortingTransform(
         }
     }
 
+    DataTypes sort_description_types;
+    sort_description_types.reserve(description.size());
+
     /// Remove constants from column_description and remap positions.
     SortDescription description_without_constants;
     description_without_constants.reserve(description.size());
     for (const auto & column_description : description)
     {
-        auto old_pos = column_description.column_number;
+        auto old_pos = header->getPositionByName(column_description.column_name);
         auto new_pos = map[old_pos];
+
         if (new_pos < num_columns)
         {
+            sort_description_types.emplace_back(sample.safeGetByPosition(old_pos).type);
             description_without_constants.push_back(column_description);
-            description_without_constants.back().column_number = new_pos;
         }
     }
 
     description.swap(description_without_constants);
+
+    if (SortQueueVariants(sort_description_types, description).variantSupportJITCompilation())
+        compileSortDescriptionIfNeeded(description, sort_description_types, increase_sort_description_compile_attempts /*increase_compile_attempts*/);
 }
 
 SortingTransform::~SortingTransform() = default;
@@ -183,7 +299,7 @@ IProcessor::Status SortingTransform::prepare()
     if (stage == Stage::Serialize)
     {
         if (!processors.empty())
-            return Status::ExpandPipeline;
+            return Status::UpdatePipeline;
 
         auto status = prepareSerialize();
         if (status != Status::Finished)
@@ -207,7 +323,7 @@ IProcessor::Status SortingTransform::prepare()
         return Status::Ready;
 
     if (!processors.empty())
-        return Status::ExpandPipeline;
+        return Status::UpdatePipeline;
 
     return prepareGenerate();
 }
@@ -296,29 +412,27 @@ IProcessor::Status SortingTransform::prepareGenerate()
         output.push(std::move(generated_chunk));
         return Status::PortFull;
     }
-    else
+
+    auto & input = inputs.back();
+
+    if (generated_chunk)
+        output.push(std::move(generated_chunk));
+
+    if (input.isFinished())
     {
-        auto & input = inputs.back();
-
-        if (generated_chunk)
-            output.push(std::move(generated_chunk));
-
-        if (input.isFinished())
-        {
-            output.finish();
-            return Status::Finished;
-        }
-
-        input.setNeeded();
-
-        if (!input.hasData())
-            return Status::NeedData;
-
-        auto chunk = input.pull();
-        enrichChunkWithConstants(chunk);
-        output.push(std::move(chunk));
-        return Status::PortFull;
+        output.finish();
+        return Status::Finished;
     }
+
+    input.setNeeded();
+
+    if (!input.hasData())
+        return Status::NeedData;
+
+    auto chunk = input.pull();
+    enrichChunkWithConstants(chunk);
+    output.push(std::move(chunk));
+    return Status::PortFull;
 }
 
 void SortingTransform::work()
@@ -339,8 +453,8 @@ void SortingTransform::removeConstColumns(Chunk & chunk)
     size_t num_rows = chunk.getNumRows();
 
     if (num_columns != const_columns_to_remove.size())
-        throw Exception("Block has different number of columns with header: " + toString(num_columns)
-                        + " vs " + toString(const_columns_to_remove.size()), ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Block has different number of columns with header: {} vs {}",
+                        num_columns, const_columns_to_remove.size());
 
     auto columns = chunk.detachColumns();
     Columns column_without_constants;
@@ -374,8 +488,7 @@ void SortingTransform::enrichChunkWithConstants(Chunk & chunk)
         else
         {
             if (next_non_const_column >= columns.size())
-                throw Exception("Can't enrich chunk with constants because run out of non-constant columns.",
-                        ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't enrich chunk with constants because run out of non-constant columns.");
 
             column_with_constants.emplace_back(std::move(columns[next_non_const_column]));
             ++next_non_const_column;
@@ -387,7 +500,7 @@ void SortingTransform::enrichChunkWithConstants(Chunk & chunk)
 
 void SortingTransform::serialize()
 {
-    throw Exception("Method 'serialize' is not implemented for " + getName() + " processor", ErrorCodes::NOT_IMPLEMENTED);
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method 'serialize' is not implemented for {} processor", getName());
 }
 
 }

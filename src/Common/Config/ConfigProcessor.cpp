@@ -1,8 +1,7 @@
-#include <Common/config.h>
-#include "ConfigProcessor.h"
-#include "YAMLParser.h"
+#include "config.h"
+#include <Common/Config/ConfigProcessor.h>
+#include <Common/Config/YAMLParser.h>
 
-#include <sys/utsname.h>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -13,15 +12,30 @@
 #include <Poco/DOM/Text.h>
 #include <Poco/DOM/Attr.h>
 #include <Poco/DOM/Comment.h>
+#include <Poco/XML/XMLWriter.h>
 #include <Poco/Util/XMLConfiguration.h>
+#include <Poco/NumberParser.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ZooKeeper/ZooKeeperNodeCache.h>
 #include <Common/ZooKeeper/KeeperException.h>
-#include <Common/StringUtils/StringUtils.h>
+#include <Common/StringUtils.h>
 #include <Common/Exception.h>
-#include <base/getResource.h>
+#include <Common/XMLUtils.h>
+#include <Common/logger_useful.h>
 #include <base/errnoToString.h>
+#include <base/sort.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <IO/Operators.h>
+
+#include <fstream>
+
+#if USE_SSL
+#include <IO/BufferWithOwnMemory.h>
+#include <Compression/ICompressionCodec.h>
+#include <Compression/CompressionCodecEncrypted.h>
+#include <boost/algorithm/hex.hpp>
+#endif
 
 #define PREPROCESSED_SUFFIX "-preprocessed"
 
@@ -36,29 +50,60 @@ namespace ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int CANNOT_LOAD_CONFIG;
+#if USE_SSL
+    extern const int BAD_ARGUMENTS;
+#endif
+}
+
+/// Escape special XML characters in a string so it can be safely embedded as text content in an XML document.
+///
+/// Uses the text/attribute-value escaping, which also escapes '>'. Escaping '>' is not optional here:
+/// the XML grammar (the `CharData` production) forbids the literal sequence `]]>` in character data,
+/// so a value such as `]]>` would otherwise produce `<from_env>]]></from_env>`, which the parser
+/// rejects as not well-formed before the substitution is read. Escaping '>' turns `]]>` into `]]&gt;`,
+/// which parses and decodes back to the exact original bytes. The extra escaping of `"` and `'` is
+/// harmless for text content — they round-trip to the same characters.
+///
+/// A carriage return is additionally emitted as the numeric character reference `&#13;`. XML end-of-line
+/// handling (XML 1.0, section 2.11) rewrites a literal `\r` or the sequence `\r\n` to a single `\n` when
+/// the synthetic `<from_env>`/`<from_zk>` document is reparsed. That would silently corrupt a literal
+/// substitution — for example a multi-line secret or a setting copied with Windows line endings. A
+/// character reference is resolved after end-of-line normalization, so `&#13;` round-trips to the exact
+/// original `\r` byte.
+///
+/// Limitation: the escaped value must still be valid XML 1.0 text. Control characters that XML 1.0
+/// cannot represent at all — `0x00`–`0x08`, `0x0B`, `0x0C`, `0x0E`–`0x1F` (XML 1.0, section 2.2; they
+/// are forbidden even as numeric character references, section 4.1) — are passed through verbatim and
+/// rejected by the parser when the synthetic document is reparsed. No escaping scheme can carry them
+/// through XML, so the documented contract is "exact bytes for any XML-1.0-legal text", not "any bytes".
+static std::string escapeForXMLText(const std::string & s)
+{
+    WriteBufferFromOwnString buf;
+    writeXMLStringForTextElementOrAttributeValue(s, buf);
+    std::string escaped = buf.str();
+
+    /// `writeXMLStringForTextElementOrAttributeValue` does not escape '\r', so do it here to keep the
+    /// exact original bytes across the reparse. Any '\r' remaining in `escaped` is a genuine carriage
+    /// return from the input: the escaping above only emits the entities `&lt; &amp; &gt; &quot; &apos;`
+    /// and copies every other byte verbatim.
+    if (!escaped.contains('\r'))
+        return escaped;
+
+    std::string result;
+    result.reserve(escaped.size() + 4);
+    for (char c : escaped)
+    {
+        if (c == '\r')
+            result += "&#13;";
+        else
+            result += c;
+    }
+    return result;
 }
 
 /// For cutting preprocessed path to this base
 static std::string main_config_path;
 
-/// Extracts from a string the first encountered number consisting of at least two digits.
-static std::string numberFromHost(const std::string & s)
-{
-    for (size_t i = 0; i < s.size(); ++i)
-    {
-        std::string res;
-        size_t j = i;
-        while (j < s.size() && isNumericASCII(s[j]))
-            res += s[j++];
-        if (res.size() >= 2)
-        {
-            while (res[0] == '0')
-                res.erase(res.begin());
-            return res;
-        }
-    }
-    return "";
-}
 
 bool ConfigProcessor::isPreprocessedFile(const std::string & path)
 {
@@ -70,9 +115,11 @@ ConfigProcessor::ConfigProcessor(
     const std::string & path_,
     bool throw_on_bad_incl_,
     bool log_to_console,
-    const Substitutions & substitutions_)
+    const Substitutions & substitutions_,
+    bool throw_on_bad_include_from_)
     : path(path_)
     , throw_on_bad_incl(throw_on_bad_incl_)
+    , throw_on_bad_include_from(throw_on_bad_include_from_)
     , substitutions(substitutions_)
     /// We need larger name pool to allow to support vast amount of users in users.xml files for ClickHouse.
     /// Size is prime because Poco::XML::NamePool uses bad (inefficient, low quality)
@@ -80,26 +127,27 @@ ConfigProcessor::ConfigProcessor(
     , name_pool(new Poco::XML::NamePool(65521))
     , dom_parser(name_pool)
 {
-    if (log_to_console && !Poco::Logger::has("ConfigProcessor"))
+    if (log_to_console && !hasLogger("ConfigProcessor"))
     {
         channel_ptr = new Poco::ConsoleChannel;
-        log = &Poco::Logger::create("ConfigProcessor", channel_ptr.get(), Poco::Message::PRIO_TRACE);
+        log = createLogger("ConfigProcessor", channel_ptr.get(), Poco::Message::PRIO_TRACE);
     }
     else
     {
-        log = &Poco::Logger::get("ConfigProcessor");
+        log = getLogger("ConfigProcessor");
     }
 }
 
-ConfigProcessor::~ConfigProcessor()
+static std::unordered_map<std::string, std::string_view> embedded_configs;
+
+void ConfigProcessor::registerEmbeddedConfig(std::string name, std::string_view content)
 {
-    if (channel_ptr) /// This means we have created a new console logger in the constructor.
-        Poco::Logger::destroy("ConfigProcessor");
+    embedded_configs[name] = content;
 }
 
 
 /// Vector containing the name of the element and a sorted list of attribute names and values
-/// (except "remove" and "replace" attributes).
+/// (except substitution and substitution-format attributes, and "remove" and "replace" attributes).
 /// Serves as a unique identifier of the element contents for comparison.
 using ElementIdentifier = std::vector<std::string>;
 
@@ -112,18 +160,17 @@ static ElementIdentifier getElementIdentifier(Node * element)
 {
     const NamedNodeMapPtr attrs = element->attributes();
     std::vector<std::pair<std::string, std::string>> attrs_kv;
-    for (size_t i = 0, size = attrs->length(); i < size; ++i)
+    for (const Node * node = attrs->item(0); node; node = node->nextSibling())
     {
-        const Node * node = attrs->item(i);
         std::string name = node->nodeName();
         const auto * subst_name_pos = std::find(ConfigProcessor::SUBSTITUTION_ATTRS.begin(), ConfigProcessor::SUBSTITUTION_ATTRS.end(), name);
-        if (name == "replace" || name == "remove" ||
+        if (name == "replace" || name == "remove" || name == "yaml" ||
             subst_name_pos != ConfigProcessor::SUBSTITUTION_ATTRS.end())
             continue;
         std::string value = node->nodeValue();
         attrs_kv.push_back(std::make_pair(name, value));
     }
-    std::sort(attrs_kv.begin(), attrs_kv.end());
+    ::sort(attrs_kv.begin(), attrs_kv.end());
 
     ElementIdentifier res;
     res.push_back(element->nodeName());
@@ -138,23 +185,182 @@ static ElementIdentifier getElementIdentifier(Node * element)
 
 static Node * getRootNode(Document * document)
 {
-    const NodeListPtr children = document->childNodes();
-    for (size_t i = 0, size = children->length(); i < size; ++i)
-    {
-        Node * child = children->item(i);
-        /// Besides the root element there can be comment nodes on the top level.
-        /// Skip them.
-        if (child->nodeType() == Node::ELEMENT_NODE)
-            return child;
-    }
+    return XMLUtils::getRootNode(document);
+}
 
-    throw Poco::Exception("No root node in document");
+static size_t firstNonWhitespacePos(const std::string & s)
+{
+    return s.find_first_not_of(" \t\n\r");
 }
 
 static bool allWhitespace(const std::string & s)
 {
-    return s.find_first_not_of(" \t\n\r") == std::string::npos;
+    return firstNonWhitespacePos(s) == std::string::npos;
 }
+
+static void deleteAttributesRecursive(Node * root)
+{
+    const NodeListPtr children = root->childNodes();
+    std::vector<Node *> children_to_delete;
+
+    for (Node * child = children->item(0); child; child = child->nextSibling())
+    {
+        if (child->nodeType() == Node::ELEMENT_NODE)
+        {
+            Element & child_element = dynamic_cast<Element &>(*child);
+
+            if (child_element.hasAttribute("replace"))
+                child_element.removeAttribute("replace");
+
+            if (child_element.hasAttribute("remove"))
+                children_to_delete.push_back(child);
+            else
+                deleteAttributesRecursive(child);
+        }
+    }
+
+    for (auto * child : children_to_delete)
+    {
+        root->removeChild(child);
+    }
+}
+
+static void mergeAttributes(Element & config_element, Element & with_element)
+{
+    auto * with_element_attributes = with_element.attributes();
+
+    for (size_t i = 0; i < with_element_attributes->length(); ++i)
+    {
+        auto * attr = with_element_attributes->item(i);
+        config_element.setAttribute(attr->nodeName(), attr->getNodeValue());
+    }
+
+    with_element_attributes->release();
+}
+
+#if USE_SSL
+
+std::string ConfigProcessor::encryptValue(const std::string & codec_name, const std::string & value)
+{
+    EncryptionMethod encryption_method = toEncryptionMethod(codec_name);
+    CompressionCodecEncrypted codec(encryption_method);
+
+    Memory<> memory;
+    memory.resize(codec.getCompressedReserveSize(static_cast<UInt32>(value.size())));
+    auto bytes_written = codec.compress(value.data(), static_cast<UInt32>(value.size()), memory.data());
+    std::string encrypted_value(memory.data(), bytes_written);
+    std::string hex_value;
+    /// NOLINTNEXTLINE(clang-analyzer-core.StackAddressEscape)
+    boost::algorithm::hex(encrypted_value.begin(), encrypted_value.end(), std::back_inserter(hex_value));
+    return hex_value;
+}
+
+std::string ConfigProcessor::decryptValue(const std::string & codec_name, const std::string & value)
+{
+    EncryptionMethod encryption_method = toEncryptionMethod(codec_name);
+    CompressionCodecEncrypted codec(encryption_method);
+
+    Memory<> memory;
+    std::string encrypted_value;
+
+    try
+    {
+        boost::algorithm::unhex(value, std::back_inserter(encrypted_value));
+    }
+    catch (const std::exception &)
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot read encrypted text, check for valid characters [0-9a-fA-F] and length");
+    }
+
+    memory.resize(codec.readDecompressedBlockSize(encrypted_value.data()));
+    codec.decompress(encrypted_value.data(), static_cast<UInt32>(encrypted_value.size()), memory.data());
+    std::string decrypted_value(memory.data(), memory.size());
+    return decrypted_value;
+}
+
+void ConfigProcessor::decryptRecursive(Poco::XML::Node * config_root)
+{
+    for (Node * node = config_root->firstChild(); node; node = node->nextSibling())
+    {
+        if (node->nodeType() == Node::ELEMENT_NODE)
+        {
+            Element & element = dynamic_cast<Element &>(*node);
+            if (element.hasAttribute("encrypted_by"))
+            {
+                const NodeListPtr children = element.childNodes();
+                if (children->length() != 1)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Encrypted node {} cannot contain nested elements", node->nodeName());
+
+                Node * text_node = node->firstChild();
+                if (text_node->nodeType() != Node::TEXT_NODE)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Encrypted node {} should have text node", node->nodeName());
+
+                auto encrypted_by = element.getAttribute("encrypted_by");
+                text_node->setNodeValue(decryptValue(encrypted_by, text_node->getNodeValue()));
+            }
+            decryptRecursive(node);
+        }
+    }
+}
+
+void ConfigProcessor::decryptEncryptedElements(LoadedConfig & loaded_config)
+{
+    Node * config_root = getRootNode(loaded_config.preprocessed_xml.get());
+    decryptRecursive(config_root);
+    loaded_config.configuration = new Poco::Util::XMLConfiguration(loaded_config.preprocessed_xml);
+}
+
+bool ConfigProcessor::hasNodeWithAttribute(Poco::XML::Node * config_root, const std::string & attribute_name)
+{
+    for (Node * node = config_root->firstChild(); node != nullptr; node = node->nextSibling())
+    {
+        if (node->nodeType() != Node::ELEMENT_NODE)
+            continue;
+
+        if (dynamic_cast<Element &>(*node).hasAttribute(attribute_name) || hasNodeWithAttribute(node, attribute_name))
+            return true;
+    }
+    return false;
+}
+
+bool ConfigProcessor::hasNodeWithNameAndChildNodeWithAttribute(Poco::XML::Node * config_root, const std::string & node_name, const std::string & attribute_name)
+{
+    for (Node * node = config_root->firstChild(); node != nullptr; node = node->nextSibling())
+    {
+        if (node->nodeType() != Node::ELEMENT_NODE)
+            continue;
+
+        if ((node_name == node->nodeName() && hasNodeWithAttribute(node, attribute_name)) || hasNodeWithNameAndChildNodeWithAttribute(node, node_name, attribute_name))
+            return true;
+    }
+    return false;
+}
+
+bool ConfigProcessor::hasNodeWithNameAndChildNodeWithAttribute(LoadedConfig & loaded_config, const std::string & node_name, const std::string & attribute_name)
+{
+    return hasNodeWithNameAndChildNodeWithAttribute(loaded_config.preprocessed_xml.get(), node_name, attribute_name);
+}
+
+#endif
+
+void ConfigProcessor::hideRecursive(Poco::XML::Node * config_root)
+{
+    for (Node * node = config_root->firstChild(); node;)
+    {
+        Node * next_node = node->nextSibling();
+        if (node->nodeType() == Node::ELEMENT_NODE)
+        {
+            Element & element = dynamic_cast<Element &>(*node);
+            if (element.hasAttribute("hide_in_preprocessed") && Poco::NumberParser::parseBool(element.getAttribute("hide_in_preprocessed")))
+            {
+                config_root->removeChild(node);
+            } else
+                hideRecursive(node);
+        }
+        node = next_node;
+    }
+}
+
 
 void ConfigProcessor::mergeRecursive(XMLDocumentPtr config, Node * config_root, const Node * with_root)
 {
@@ -176,10 +382,10 @@ void ConfigProcessor::mergeRecursive(XMLDocumentPtr config, Node * config_root, 
         node = next_node;
     }
 
-    for (size_t i = 0, size = with_nodes->length(); i < size; ++i)
+    Node * next_with_node = nullptr;
+    for (Node * with_node = with_nodes->item(0); with_node; with_node = next_with_node)
     {
-        Node * with_node = with_nodes->item(i);
-
+        next_with_node = with_node->nextSibling();
         bool merged = false;
         bool remove = false;
         if (with_node->nodeType() == Node::ELEMENT_NODE)
@@ -204,12 +410,20 @@ void ConfigProcessor::mergeRecursive(XMLDocumentPtr config, Node * config_root, 
                 }
                 else if (replace)
                 {
-                    with_element.removeAttribute("replace");
                     NodePtr new_node = config->importNode(with_node, true);
                     config_root->replaceChild(new_node, config_node);
                 }
                 else
                 {
+                    Element & config_element = dynamic_cast<Element &>(*config_node);
+
+                    /// Remove substitution attributes from the merge target node if source node already has a value
+                    bool source_has_value = with_element.hasChildNodes();
+                    if (source_has_value)
+                        for (const auto & attr_name: SUBSTITUTION_ATTRS)
+                            config_element.removeAttribute(attr_name);
+
+                    mergeAttributes(config_element, with_element);
                     mergeRecursive(config, config_node, with_node);
                 }
                 merged = true;
@@ -217,13 +431,17 @@ void ConfigProcessor::mergeRecursive(XMLDocumentPtr config, Node * config_root, 
         }
         if (!merged && !remove)
         {
+            /// Since we didn't find a pair to this node in default config, we will paste it as is.
+            /// But it may have some child nodes which have attributes like "replace" or "remove".
+            /// They are useless in preprocessed configuration.
+            deleteAttributesRecursive(with_node);
             NodePtr new_node = config->importNode(with_node, true);
             config_root->appendChild(new_node);
         }
     }
 }
 
-void ConfigProcessor::merge(XMLDocumentPtr config, XMLDocumentPtr with)
+bool ConfigProcessor::merge(XMLDocumentPtr config, XMLDocumentPtr with)
 {
     Node * config_root = getRootNode(config.get());
     Node * with_root = getRootNode(with.get());
@@ -238,67 +456,50 @@ void ConfigProcessor::merge(XMLDocumentPtr config, XMLDocumentPtr with)
         && !((config_root_node_name == "yandex" || config_root_node_name == "clickhouse")
             && (merged_root_node_name == "yandex" || merged_root_node_name == "clickhouse")))
     {
+        if (config_root_node_name != "clickhouse" && config_root_node_name != "yandex")
+            return false;
+
         throw Poco::Exception("Root element doesn't have the corresponding root element as the config file."
             " It must be <" + config_root->nodeName() + ">");
     }
 
     mergeRecursive(config, config_root, with_root);
-}
-
-static std::string layerFromHost()
-{
-    struct utsname buf;
-    if (uname(&buf))
-        throw Poco::Exception(std::string("uname failed: ") + errnoToString(errno));
-
-    std::string layer = numberFromHost(buf.nodename);
-    if (layer.empty())
-        throw Poco::Exception(std::string("no layer in host name: ") + buf.nodename);
-
-    return layer;
+    return true;
 }
 
 void ConfigProcessor::doIncludesRecursive(
-        XMLDocumentPtr config,
-        XMLDocumentPtr include_from,
-        Node * node,
-        zkutil::ZooKeeperNodeCache * zk_node_cache,
-        const zkutil::EventPtr & zk_changed_event,
-        std::unordered_set<std::string> & contributing_zk_paths)
+    XMLDocumentPtr config,
+    XMLDocumentPtr include_from,
+    const Substitutions & substitutions,
+    bool throw_on_bad_incl,
+    Poco::XML::DOMParser & dom_parser,
+    const LoggerPtr & log,
+    Node * node,
+    zkutil::ZooKeeperNodeCache * zk_node_cache,
+    const Coordination::EventPtr & zk_changed_event,
+    std::unordered_set<std::string> * contributing_zk_paths)
 {
     if (node->nodeType() == Node::TEXT_NODE)
     {
-        for (auto & substitution : substitutions)
+        for (const auto & substitution : substitutions)
         {
             std::string value = node->nodeValue();
 
-            bool replace_occured = false;
-            size_t pos;
+            bool replace_occurred = false;
+            size_t pos = 0;
             while ((pos = value.find(substitution.first)) != std::string::npos)
             {
                 value.replace(pos, substitution.first.length(), substitution.second);
-                replace_occured = true;
+                replace_occurred = true;
             }
 
-            if (replace_occured)
+            if (replace_occurred)
                 node->setNodeValue(value);
         }
     }
 
     if (node->nodeType() != Node::ELEMENT_NODE)
         return;
-
-    /// Substitute <layer> for the number extracted from the hostname only if there is an
-    /// empty <layer> tag without attributes in the original file.
-    if (node->nodeName() == "layer"
-        && !node->hasAttributes()
-        && !node->hasChildNodes()
-        && node->nodeValue().empty())
-    {
-        NodePtr new_node = config->createTextNode(layerFromHost());
-        node->appendChild(new_node);
-        return;
-    }
 
     std::map<std::string, const Node *> attr_nodes;
     NamedNodeMapPtr attributes = node->attributes();
@@ -323,6 +524,18 @@ void ConfigProcessor::doIncludesRecursive(
 
     /// Replace the original contents, not add to it.
     bool replace = attributes->getNamedItem("replace");
+    /// Merge with the original contents
+    bool merge = attributes->getNamedItem("merge");
+    const auto * yaml_attr = attributes->getNamedItem("yaml");
+
+    if (yaml_attr)
+    {
+        if (!attr_nodes["from_zk"] || node->nodeName() != "include")
+            throw Poco::Exception("Attribute 'yaml' is allowed only on <include from_zk=...>");
+
+        if (yaml_attr->getNodeValue() != "true")
+            throw Poco::Exception("Attribute 'yaml' for <include from_zk=...> must be 'true'");
+    }
 
     bool included_something = false;
 
@@ -346,14 +559,25 @@ void ConfigProcessor::doIncludesRecursive(
         }
         else
         {
-            /// Replace the whole node not just contents.
             if (node->nodeName() == "include")
             {
                 const NodeListPtr children = node_to_include->childNodes();
-                for (size_t i = 0, size = children->length(); i < size; ++i)
+                Node * next_child = nullptr;
+                for (Node * child = children->item(0); child; child = next_child)
                 {
-                    NodePtr new_node = config->importNode(children->item(i), true);
-                    node->parentNode()->insertBefore(new_node, node);
+                    next_child = child->nextSibling();
+
+                    /// Recursively replace existing nodes in merge mode
+                    if (merge)
+                    {
+                        NodePtr new_node = config->importNode(child->parentNode(), true);
+                        mergeRecursive(config, node->parentNode(), new_node);
+                    }
+                    else  /// Append to existing node by default
+                    {
+                        NodePtr new_node = config->importNode(child, true);
+                        node->parentNode()->insertBefore(new_node, node);
+                    }
                 }
 
                 node->parentNode()->removeChild(node);
@@ -374,16 +598,20 @@ void ConfigProcessor::doIncludesRecursive(
                 }
 
                 const NodeListPtr children = node_to_include->childNodes();
-                for (size_t i = 0, size = children->length(); i < size; ++i)
+                Node * next_child = nullptr;
+                for (Node * child = children->item(0); child; child = next_child)
                 {
-                    NodePtr new_node = config->importNode(children->item(i), true);
+                    next_child = child->nextSibling();
+                    NodePtr new_node = config->importNode(child, true);
                     node->appendChild(new_node);
                 }
 
                 const NamedNodeMapPtr from_attrs = node_to_include->attributes();
-                for (size_t i = 0, size = from_attrs->length(); i < size; ++i)
+                Node * next_attr = nullptr;
+                for (Node * attr = from_attrs->item(0); attr; attr = next_attr)
                 {
-                    element.setAttributeNode(dynamic_cast<Attr *>(config->importNode(from_attrs->item(i), true)));
+                    next_attr = attr->nextSibling();
+                    element.setAttributeNode(dynamic_cast<Attr *>(config->importNode(attr, true)));
                 }
 
                 included_something = true;
@@ -403,7 +631,12 @@ void ConfigProcessor::doIncludesRecursive(
 
     if (attr_nodes["from_zk"]) /// we have zookeeper subst
     {
-        contributing_zk_paths.insert(attr_nodes["from_zk"]->getNodeValue());
+        /// only allow substitution for nodes with no value and without "replace"
+        if (node->hasChildNodes() && !replace)
+            throw Poco::Exception("Element <" + node->nodeName() + "> has value and does not have 'replace' attribute, can't process from_zk substitution");
+
+        if (contributing_zk_paths)
+            contributing_zk_paths->insert(attr_nodes["from_zk"]->getNodeValue());
 
         if (zk_node_cache)
         {
@@ -414,8 +647,56 @@ void ConfigProcessor::doIncludesRecursive(
                 if (!znode.exists)
                     return nullptr;
 
-                /// Enclose contents into a fake <from_zk> tag to allow pure text substitutions.
-                zk_document = dom_parser.parseString("<from_zk>" + znode.contents + "</from_zk>");
+                /// Unlike `from_env` (which is always plain text), the contents of a ZooKeeper
+                /// node may be a whole subtree. The format is autodetected the same way as for
+                /// configuration files, based on whether the value begins with '<':
+                ///
+                ///  - A value that begins with '<' is parsed as an XML fragment. This is how a
+                ///    subtree is spliced into ANY element, both a structural `<include from_zk=.../>`
+                ///    and an ordinary container such as `<profiles from_zk=.../>` or
+                ///    `<http_handlers from_zk=.../>`. This is kept for backward compatibility:
+                ///    earlier versions always interpreted a `from_zk` value as XML.
+                ///  - A value that does not begin with '<' is parsed as a YAML subtree only for
+                ///    `<include from_zk="..." yaml="true"/>`. This explicitly opts in to YAML
+                ///    parsing wherever the generic `<include>` form is used, including inside a
+                ///    leaf element; it must not be used for a literal secret or setting. In a build
+                ///    without `yaml-cpp` (`ENABLE_YAML_CPP=0`, so `USE_YAML_CPP` is 0), an opted-in
+                ///    YAML substitution reports that YAML parsing is unavailable.
+                ///  - Any other value that does not begin with '<' is kept as literal text using
+                ///    its exact original bytes. YAML autodetection is deliberately NOT applied
+                ///    here, even for an ordinary container element such as
+                ///    `<profiles from_zk=.../>`: such an element may just as well be a leaf holding
+                ///    a scalar — for example `<password from_zk=.../>` or `<some_setting from_zk=.../>`
+                ///    — whose exact bytes must be preserved. So a non-`<` value is never reinterpreted
+                ///    by the YAML parser: a value such as `abc: def` is not turned into an
+                ///    `<abc>def</abc>` sub-element, and `abc # rotated` keeps its `# rotated` suffix
+                ///    instead of being treated as a YAML comment. To splice a subtree into an ordinary
+                ///    element, provide it as XML (a value beginning with '<'). XML special characters
+                ///    (for example `&`, `<` or `>`) are escaped the same way as for `from_env`, so a
+                ///    literal value can contain any XML-1.0-representable text (see the note on
+                ///    `escapeForXMLText` about control characters that XML cannot represent).
+                const size_t pos = firstNonWhitespacePos(znode.contents);
+                if (pos != std::string::npos && znode.contents[pos] == '<')
+                {
+                    /// Enclose the contents into a fake <from_zk> tag to allow pure text substitutions.
+                    zk_document = dom_parser.parseString("<from_zk>" + znode.contents + "</from_zk>");
+                }
+                else if (yaml_attr)
+                {
+                    /// An explicitly opted-in YAML subtree is expanded the same way as a
+                    /// configuration file. Parsing errors intentionally propagate: `yaml="true"`
+                    /// identifies this as a structural substitution rather than a leaf value.
+                    /// `DummyYAMLParser::parseString` reports that YAML parsing is unavailable in
+                    /// builds without `yaml-cpp`, instead of silently treating the subtree as text.
+                    zk_document = YAMLParser::parseString(znode.contents);
+                }
+                else
+                {
+                    /// A leaf value, ordinary element, or an `<include>` without the explicit
+                    /// YAML opt-in: keep the value as literal text using its exact original bytes.
+                    /// A subtree must be provided as XML or use `<include ... yaml="true"/>`.
+                    zk_document = dom_parser.parseString("<from_zk>" + escapeForXMLText(znode.contents) + "</from_zk>");
+                }
                 return getRootNode(zk_document.get());
             };
 
@@ -425,14 +706,30 @@ void ConfigProcessor::doIncludesRecursive(
 
     if (attr_nodes["from_env"]) /// we have env subst
     {
+        /// only allow substitution for nodes with no value and without "replace"
+        if (node->hasChildNodes() && !replace)
+            throw Poco::Exception("Element <" + node->nodeName() + "> has value and does not have 'replace' attribute, can't process from_env substitution");
+
         XMLDocumentPtr env_document;
         auto get_env_node = [&](const std::string & name) -> const Node *
         {
-            const char * env_val = std::getenv(name.c_str());
+            const char * env_val = std::getenv(name.c_str()); // NOLINT(concurrency-mt-unsafe) // this is safe on Linux glibc/Musl, but potentially not safe on other platforms
             if (env_val == nullptr)
                 return nullptr;
 
-            env_document = dom_parser.parseString("<from_env>" + std::string{env_val} + "</from_env>");
+            if (node->nodeName() == "include")
+            {
+                /// Keep the established `<include from_env=.../>` behavior: its value is an XML
+                /// fragment whose children are spliced into the parent element. Direct `from_env`
+                /// substitutions remain literal text, so an XML-looking scalar is not reinterpreted.
+                env_document = dom_parser.parseString("<from_env>" + std::string{env_val} + "</from_env>");
+            }
+            else
+            {
+                /// A direct environment substitution is always a plain-text value. Escape XML
+                /// special characters so the scalar remains literal even when it resembles XML.
+                env_document = dom_parser.parseString("<from_env>" + escapeForXMLText(std::string{env_val}) + "</from_env>");
+            }
 
             return getRootNode(env_document.get());
         };
@@ -441,13 +738,20 @@ void ConfigProcessor::doIncludesRecursive(
     }
 
     if (included_something)
-        doIncludesRecursive(config, include_from, node, zk_node_cache, zk_changed_event, contributing_zk_paths);
+        doIncludesRecursive(
+            config, include_from, substitutions, throw_on_bad_incl,
+            dom_parser, log, node, zk_node_cache, zk_changed_event, contributing_zk_paths);
     else
     {
         NodeListPtr children = node->childNodes();
-        Node * child = nullptr;
-        for (size_t i = 0; (child = children->item(i)); ++i)
-            doIncludesRecursive(config, include_from, child, zk_node_cache, zk_changed_event, contributing_zk_paths);
+        Node * next_child = nullptr;
+        for (Node * child = children->item(0); child; child = next_child)
+        {
+            next_child = child->nextSibling();
+            doIncludesRecursive(
+                config, include_from, substitutions, throw_on_bad_incl,
+                dom_parser, log, child, zk_node_cache, zk_changed_event, contributing_zk_paths);
+        }
     }
 }
 
@@ -486,62 +790,80 @@ ConfigProcessor::Files ConfigProcessor::getConfigMergeFiles(const std::string & 
         }
     }
 
-    std::sort(files.begin(), files.end());
+    /// `std::string` ordering is lexicographical, so files from each merge directory are processed by name.
+    /// Sorting the complete paths also makes the order deterministic if multiple merge directories are present.
+    ::sort(files.begin(), files.end());
 
     return files;
+}
+
+XMLDocumentPtr ConfigProcessor::parseConfig(const std::string & config_path, Poco::XML::DOMParser & dom_parser)
+{
+    fs::path p(config_path);
+    std::string extension = p.extension();
+    boost::algorithm::to_lower(extension);
+
+    if (extension == ".xml")
+        return dom_parser.parse(config_path);
+    if (extension == ".yaml" || extension == ".yml")
+        return YAMLParser::parse(config_path);
+
+    /// Suppose non regular file parsed as XML, such as pipe: /dev/fd/X (regardless it has .xml extension or not)
+    if (!fs::is_regular_file(config_path))
+        return dom_parser.parse(config_path);
+
+    /// If the regular file begins with < it might be XML, otherwise it might be YAML.
+    bool maybe_xml = false;
+    {
+        std::ifstream file(config_path);
+        if (!file.is_open())
+            throw Exception(ErrorCodes::CANNOT_LOAD_CONFIG, "Unknown format of '{}' config", config_path);
+
+        std::string line;
+        while (std::getline(file, line))
+        {
+            const size_t pos = firstNonWhitespacePos(line);
+
+            if (pos < line.size() && '<' == line[pos])
+            {
+                maybe_xml = true;
+                break;
+            }
+            if (pos != std::string::npos)
+                break;
+        }
+    }
+    if (maybe_xml)
+        return dom_parser.parse(config_path);
+    return YAMLParser::parse(config_path);
 }
 
 XMLDocumentPtr ConfigProcessor::processConfig(
     bool * has_zk_includes,
     zkutil::ZooKeeperNodeCache * zk_node_cache,
-    const zkutil::EventPtr & zk_changed_event)
+    const Coordination::EventPtr & zk_changed_event,
+    bool is_config_changed)
 {
-    LOG_DEBUG(log, "Processing configuration file '{}'.", path);
+    if (is_config_changed)
+        LOG_DEBUG(log, "Processing configuration file '{}'.", path);
 
     XMLDocumentPtr config;
 
     if (fs::exists(path))
     {
-        fs::path p(path);
-
-        std::string extension = p.extension();
-        boost::algorithm::to_lower(extension);
-
-        if (extension == ".yaml" || extension == ".yml")
-        {
-            config = YAMLParser::parse(path);
-        }
-        else if (extension == ".xml" || extension == ".conf" || extension.empty())
-        {
-            config = dom_parser.parse(path);
-        }
-        else
-        {
-            throw Exception(ErrorCodes::CANNOT_LOAD_CONFIG, "Unknown format of '{}' config", path);
-        }
+        config = parseConfig(path, dom_parser);
     }
     else
     {
-        /// These embedded files added during build with some cmake magic.
-        /// Look at the end of programs/sever/CMakeLists.txt.
-        std::string embedded_name;
-        if (path == "config.xml")
-            embedded_name = "embedded.xml";
-
-        if (path == "keeper_config.xml")
-            embedded_name = "keeper_embedded.xml";
-
-        /// When we can use config embedded in binary.
-        if (!embedded_name.empty())
+        /// When we can use a config embedded in the binary.
+        if (auto it = embedded_configs.find(path); it != embedded_configs.end())
         {
-            auto resource = getResource(embedded_name);
-            if (resource.empty())
-                throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "Configuration file {} doesn't exist and there is no embedded config", path);
-            LOG_DEBUG(log, "There is no file '{}', will use embedded config.", path);
-            config = dom_parser.parseMemory(resource.data(), resource.size());
+            if (is_config_changed)
+                LOG_DEBUG(log, "There is no file '{}', will use embedded config.", path);
+            config = dom_parser.parseMemory(it->second.data(), it->second.size());
         }
         else
-            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "Configuration file {} doesn't exist", path);
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "Configuration file {} doesn't exist and there is no embedded config", path);
     }
 
     std::vector<std::string> contributing_files;
@@ -551,24 +873,19 @@ XMLDocumentPtr ConfigProcessor::processConfig(
     {
         try
         {
-            LOG_DEBUG(log, "Merging configuration file '{}'.", merge_file);
+            if (is_config_changed)
+                LOG_DEBUG(log, "Merging configuration file '{}'.", merge_file);
 
             XMLDocumentPtr with;
-
-            fs::path p(merge_file);
-            std::string extension = p.extension();
-            boost::algorithm::to_lower(extension);
-
-            if (extension == ".yaml" || extension == ".yml")
+            with = parseConfig(merge_file, dom_parser);
+            if (!merge(config, with))
             {
-                with = YAMLParser::parse(merge_file);
+                LOG_DEBUG(
+                    log, "Merging bypassed - configuration file '{}' "
+                    "doesn't belong to configuration '{}' - merging root node name '{}' doesn't match '{}'",
+                    merge_file, path, getRootNode(with.get())->nodeName(), getRootNode(config.get())->nodeName());
+                continue;
             }
-            else
-            {
-                with = dom_parser.parse(merge_file);
-            }
-
-            merge(config, with);
 
             contributing_files.push_back(merge_file);
         }
@@ -584,33 +901,42 @@ XMLDocumentPtr ConfigProcessor::processConfig(
     }
 
     std::unordered_set<std::string> contributing_zk_paths;
+
     try
     {
         Node * node = getRootNode(config.get())->getNodeByPath("include_from");
-
-        XMLDocumentPtr include_from;
         std::string include_from_path;
         if (node)
         {
             /// if we include_from env or zk.
-            doIncludesRecursive(config, nullptr, node, zk_node_cache, zk_changed_event, contributing_zk_paths);
+            doIncludesRecursive(
+                config, nullptr, substitutions, throw_on_bad_incl, dom_parser, log,
+                node, zk_node_cache, zk_changed_event, &contributing_zk_paths);
+
             include_from_path = node->innerText();
         }
-        else
-        {
-            std::string default_path = "/etc/metrika.xml";
-            if (fs::exists(default_path))
-                include_from_path = default_path;
-        }
-        if (!include_from_path.empty())
-        {
-            LOG_DEBUG(log, "Including configuration file '{}'.", include_from_path);
 
-            contributing_files.push_back(include_from_path);
-            include_from = dom_parser.parse(include_from_path);
+        /// When --try is passed and the include_from file is missing, drop the path so that
+        /// processIncludes does not try to parse it. We must still call processIncludes
+        /// because it also performs from_env/from_zk/incl substitutions on the rest of the
+        /// config; skipping it would silently strip those values (issue #101704).
+        if (!throw_on_bad_include_from && !include_from_path.empty() && !fs::exists(include_from_path))
+        {
+            LOG_WARNING(log, "File {} (from 'include_from') does not exist. Ignoring.", include_from_path);
+            include_from_path.clear();
         }
 
-        doIncludesRecursive(config, include_from, getRootNode(config.get()), zk_node_cache, zk_changed_event, contributing_zk_paths);
+        processIncludes(
+            config,
+            substitutions,
+            include_from_path,
+            throw_on_bad_incl,
+            dom_parser,
+            log,
+            &contributing_zk_paths,
+            &contributing_files,
+            zk_node_cache,
+            zk_changed_event);
     }
     catch (Exception & e)
     {
@@ -649,13 +975,40 @@ XMLDocumentPtr ConfigProcessor::processConfig(
     return config;
 }
 
-ConfigProcessor::LoadedConfig ConfigProcessor::loadConfig(bool allow_zk_includes)
+void ConfigProcessor::processIncludes(
+    XMLDocumentPtr & config,
+    const Substitutions & substitutions,
+    const std::string & include_from_path,
+    bool throw_on_bad_incl,
+    Poco::XML::DOMParser & dom_parser,
+    const LoggerPtr & log,
+    std::unordered_set<std::string> * contributing_zk_paths,
+    std::vector<std::string> * contributing_files,
+    zkutil::ZooKeeperNodeCache * zk_node_cache,
+    const Coordination::EventPtr & zk_changed_event)
 {
-    bool has_zk_includes;
-    XMLDocumentPtr config_xml = processConfig(&has_zk_includes);
+    XMLDocumentPtr include_from;
+    if (!include_from_path.empty())
+    {
+        LOG_DEBUG(log, "Including configuration file '{}'.", include_from_path);
+
+        include_from = parseConfig(include_from_path, dom_parser);
+        if (contributing_files)
+            contributing_files->push_back(include_from_path);
+    }
+
+    doIncludesRecursive(
+        config, include_from, substitutions, throw_on_bad_incl, dom_parser, log,
+        getRootNode(config.get()), zk_node_cache, zk_changed_event, contributing_zk_paths);
+}
+
+ConfigProcessor::LoadedConfig ConfigProcessor::loadConfig(bool allow_zk_includes, bool is_config_changed)
+{
+    bool has_zk_includes = false;
+    XMLDocumentPtr config_xml = processConfig(&has_zk_includes, nullptr, nullptr, is_config_changed);
 
     if (has_zk_includes && !allow_zk_includes)
-        throw Poco::Exception("Error while loading config '" + path + "': from_zk includes are not allowed!");
+        throw Poco::Exception("Error while loading config '" + path + "': from_zk includes are not allowed");
 
     ConfigurationPtr configuration(new Poco::Util::XMLConfiguration(config_xml));
 
@@ -663,16 +1016,20 @@ ConfigProcessor::LoadedConfig ConfigProcessor::loadConfig(bool allow_zk_includes
 }
 
 ConfigProcessor::LoadedConfig ConfigProcessor::loadConfigWithZooKeeperIncludes(
-        zkutil::ZooKeeperNodeCache & zk_node_cache,
-        const zkutil::EventPtr & zk_changed_event,
-        bool fallback_to_preprocessed)
+    zkutil::ZooKeeperNodeCache * zk_node_cache,
+    const Coordination::EventPtr & zk_changed_event,
+    bool fallback_to_preprocessed,
+    bool is_config_changed)
 {
     XMLDocumentPtr config_xml;
-    bool has_zk_includes;
+    bool has_zk_includes = false;
     bool processed_successfully = false;
     try
     {
-        config_xml = processConfig(&has_zk_includes, &zk_node_cache, zk_changed_event);
+        auto component_guard = Coordination::setCurrentComponent("ConfigProcessor::loadConfigWithZooKeeperIncludes");
+        if (zk_node_cache)
+            zk_node_cache->sync();
+        config_xml = processConfig(&has_zk_includes, zk_node_cache, zk_changed_event, is_config_changed);
         processed_successfully = true;
     }
     catch (const Poco::Exception & ex)
@@ -694,7 +1051,29 @@ ConfigProcessor::LoadedConfig ConfigProcessor::loadConfigWithZooKeeperIncludes(
     return LoadedConfig{configuration, has_zk_includes, !processed_successfully, config_xml, path};
 }
 
-void ConfigProcessor::savePreprocessedConfig(const LoadedConfig & loaded_config, std::string preprocessed_dir)
+XMLDocumentPtr ConfigProcessor::hideElements(XMLDocumentPtr xml_tree)
+{
+    /// Create a copy of XML Document because hiding elements from preprocessed_xml document
+    /// also influences on configuration which has a pointer to preprocessed_xml document.
+
+    XMLDocumentPtr xml_tree_copy = new Poco::XML::Document(name_pool);
+
+    for (Node * node = xml_tree->firstChild(); node; node = node->nextSibling())
+    {
+        NodePtr new_node = xml_tree_copy->importNode(node, true);
+        xml_tree_copy->appendChild(new_node);
+    }
+    Node * new_config_root = getRootNode(xml_tree_copy.get());
+    hideRecursive(new_config_root);
+
+    return xml_tree_copy;
+}
+
+void ConfigProcessor::savePreprocessedConfig(LoadedConfig & loaded_config, std::string preprocessed_dir
+#if USE_SSL
+    , bool skip_zk_encryption_keys
+#endif
+)
 {
     try
     {
@@ -705,6 +1084,10 @@ void ConfigProcessor::savePreprocessedConfig(const LoadedConfig & loaded_config,
             if (new_path.starts_with(main_config_path))
                 new_path.erase(0, main_config_path.size());
             std::replace(new_path.begin(), new_path.end(), '/', '_');
+
+            /// If we have config file in YAML format, the preprocessed config will inherit .yaml extension
+            /// but will contain config in XML format, so some tools like clickhouse extract-from-config won't work
+            new_path = fs::path(new_path).replace_extension(".xml").string();
 
             if (preprocessed_dir.empty())
             {
@@ -734,13 +1117,50 @@ void ConfigProcessor::savePreprocessedConfig(const LoadedConfig & loaded_config,
             if (!preprocessed_path_parent.empty())
                 fs::create_directories(preprocessed_path_parent);
         }
-        DOMWriter().writeNode(preprocessed_path, loaded_config.preprocessed_xml);
+        DOMWriter writer;
+        writer.setNewLine("\n");
+        writer.setIndent("    ");
+        writer.setOptions(Poco::XML::XMLWriter::PRETTY_PRINT);
+        XMLDocumentPtr preprocessed_xml_without_hidden_elements = hideElements(loaded_config.preprocessed_xml);
+        writer.writeNode(preprocessed_path, preprocessed_xml_without_hidden_elements);
         LOG_DEBUG(log, "Saved preprocessed configuration to '{}'.", preprocessed_path);
     }
     catch (Poco::Exception & e)
     {
         LOG_WARNING(log, "Couldn't save preprocessed config to {}: {}", preprocessed_path, e.displayText());
     }
+
+#if USE_SSL
+    /* Some callers (e.g. during very early server startup) will not have access to Zookeeper. Such callers can specify `skip_zk_encryption_keys = false`
+    (but they will not be able to decrypt encrypted elements). If there are no `encryption_codecs` tags with `from_zk` attributes, we can decrypt anyways.
+
+    Config example we process here:
+    <clickhouse>
+      <encryption_codecs>
+        <aes_128_gcm_siv>
+            <key_hex>00112233445566778899aabbccddeeff</key_hex>
+        </aes_128_gcm_siv>
+      </encryption_codecs>
+      <max_table_size_to_drop encrypted_by="AES_128_GCM_SIV">96260000000B0000000000E8FE3C087CED2205A5071078B29FD5C3B97F824911DED3217E980C</max_table_size_to_drop>
+    </clickhouse>
+
+    Config example we do not process here:
+    <clickhouse>
+      <encryption_codecs>
+        <aes_128_gcm_siv>
+            <key_hex from_zk="/clickhouse/aes128_key_hex"/>
+        </aes_128_gcm_siv>
+      </encryption_codecs>
+      <max_table_size_to_drop encrypted_by="AES_128_GCM_SIV">96260000000B0000000000E8FE3C087CED2205A5071078B29FD5C3B97F824911DED3217E980C</max_table_size_to_drop>
+    </clickhouse>
+    */
+    constexpr auto encryption_codecs_key = "encryption_codecs";
+    if (!skip_zk_encryption_keys || !hasNodeWithNameAndChildNodeWithAttribute(loaded_config, encryption_codecs_key, "from_zk"))
+    {
+        CompressionCodecEncrypted::Configuration::instance().load(*loaded_config.configuration, encryption_codecs_key);
+        decryptEncryptedElements(loaded_config);
+    }
+#endif
 }
 
 void ConfigProcessor::setConfigPath(const std::string & config_path)

@@ -1,27 +1,29 @@
 #pragma once
 
-#include <Common/config.h>
+#include <Common/DequeWithMemoryTracking.h>
+#include "config.h"
 
 #if USE_AWS_S3
 
-#    include <memory>
-#    include <vector>
-#    include <base/logger_useful.h>
-#    include <base/types.h>
+#include <base/types.h>
+#include <Common/logger_useful.h>
+#include <IO/WriteBufferFromFileBase.h>
+#include <IO/WriteBuffer.h>
+#include <IO/WriteSettings.h>
+#include <IO/StdIStreamFromMemory.h>
+#include <IO/S3Settings.h>
+#include <IO/S3/Requests.h>
+#include <Common/threadPoolCallbackRunner.h>
+#include <Common/BlobStorageLogWriter.h>
+#include <Common/BufferAllocationPolicy.h>
 
-#    include <IO/BufferWithOwnMemory.h>
-#    include <IO/WriteBuffer.h>
+#include <memory>
+#include <vector>
+#include <list>
 
-#    include <aws/core/utils/memory/stl/AWSStringStream.h>
-
-namespace Aws::S3
-{
-class S3Client;
-}
 
 namespace DB
 {
-
 /**
  * Buffer to write a data to a S3 object with specified bucket and key.
  * If data size written to the buffer is less than 'max_single_part_upload_size' write is performed using singlepart upload.
@@ -29,50 +31,102 @@ namespace DB
  * Data is divided on chunks with size greater than 'minimum_upload_part_size'. Last chunk can be less than this threshold.
  * Each chunk is written as a part to S3.
  */
-class WriteBufferFromS3 : public BufferWithOwnMemory<WriteBuffer>
+class TaskTracker;
+
+class WriteBufferFromS3 final : public WriteBufferFromFileBase
 {
 public:
-    explicit WriteBufferFromS3(
-        std::shared_ptr<Aws::S3::S3Client> client_ptr_,
+    WriteBufferFromS3(
+        std::shared_ptr<const S3::Client> client_ptr_,
         const String & bucket_,
         const String & key_,
-        size_t minimum_upload_part_size_,
-        size_t max_single_part_upload_size_,
-        std::optional<std::map<String, String>> object_metadata_ = std::nullopt,
-        size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE);
+        size_t buf_size_,
+        const S3::S3RequestSettings & request_settings_,
+        BlobStorageLogWriterPtr blob_log_,
+        std::optional<ObjectAttributes> object_metadata_ = std::nullopt,
+        ThreadPoolCallbackRunnerUnsafe<void> schedule_ = {},
+        const WriteSettings & write_settings_ = {});
 
     ~WriteBufferFromS3() override;
-
     void nextImpl() override;
+    void preFinalize() override;
+    std::string getFileName() const override { return key; }
+    void sync() override { next(); }
 
 private:
-    void allocateBuffer();
-
-    void createMultipartUpload();
-    void writePart();
-    void completeMultipartUpload();
-
-    void makeSinglepartUpload();
-
     /// Receives response from the server after sending all data.
     void finalizeImpl() override;
 
-    String bucket;
-    String key;
-    std::optional<std::map<String, String>> object_metadata;
-    std::shared_ptr<Aws::S3::S3Client> client_ptr;
-    size_t minimum_upload_part_size;
-    size_t max_single_part_upload_size;
-    /// Buffer to accumulate data.
-    std::shared_ptr<Aws::StringStream> temporary_buffer;
-    size_t last_part_size;
+    void cancelImpl() noexcept override;
+
+    String getVerboseLogDetails() const;
+    String getShortLogDetails() const;
+
+    struct PartData;
+    std::optional<S3::RequestChecksum::Algorithm> getUploadChecksumAlgorithm() const;
+    void hidePartialData();
+    void reallocateFirstBuffer();
+    void detachBuffer();
+    void allocateBuffer();
+    void setFakeBufferWhenPreFinalized();
+
+    S3::UploadPartRequest getUploadRequest(size_t part_number, PartData & data);
+    void writePart(PartData && data);
+    void writeMultipartUpload();
+    void createMultipartUpload();
+    bool completeMultipartUpload();
+    void abortMultipartUpload();
+    void tryToAbortMultipartUpload() noexcept;
+
+    S3::PutObjectRequest getPutRequest(PartData & data);
+    void makeSinglepartUpload(PartData && data);
+
+    /// `object_metadata` with `idempotency_id` merged in, if it is not empty.
+    ObjectAttributes metadataWithIdempotencyId() const;
+
+    /// Returns true if not a single byte was written to the buffer
+    bool isEmpty() const { return total_size == 0 && count() == 0 && hidden_size == 0 && offset() == 0; }
+
+    const String bucket;
+    const String key;
+    const S3::S3RequestSettings request_settings;
+    const WriteSettings write_settings;
+    const std::shared_ptr<const S3::Client> client_ptr;
+    const std::optional<ObjectAttributes> object_metadata;
+    /// Unique identifier of this write, stamped on the object it creates so a replay can recognise it.
+    /// Empty if disabled by the `use_idempotency_id` request setting.
+    const String idempotency_id;
+    LoggerPtr log = getLogger("WriteBufferFromS3");
+    LogSeriesLimiterPtr limited_log = std::make_shared<LogSeriesLimiter>(log, 1, 5);
+
+    BufferAllocationPolicyPtr buffer_allocation_policy;
 
     /// Upload in S3 is made in parts.
     /// We initiate upload, then upload each part and get ETag as a response, and then finalizeImpl() upload with listing all our parts.
     String multipart_upload_id;
-    std::vector<String> part_tags;
+    DequeWithMemoryTracking<String> multipart_tags;
+    DequeWithMemoryTracking<String> multipart_checksums; // if enabled
+    bool multipart_upload_finished = false;
 
-    Poco::Logger * log = &Poco::Logger::get("WriteBufferFromS3");
+    /// Track that prefinalize() is called only once
+    bool is_prefinalized = false;
+
+    /// First fully filled buffer has to be delayed
+    /// There are two ways after:
+    /// First is to call prefinalize/finalize, which leads to single part upload
+    /// Second is to write more data, which leads to multi part upload
+    DequeWithMemoryTracking<PartData> detached_part_data;
+    char fake_buffer_when_prefinalized[1] = {};
+
+    /// offset() and count() are unstable inside nextImpl
+    /// For example nextImpl changes position hence offset() and count() is changed
+    /// This vars are dedicated to store information about sizes when offset() and count() are unstable
+    size_t total_size = 0;
+    size_t hidden_size = 0;
+
+    std::unique_ptr<TaskTracker> task_tracker;
+
+    BlobStorageLogWriterPtr blob_log;
 };
 
 }

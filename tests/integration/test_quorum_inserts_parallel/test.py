@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 
-import pytest
-from helpers.cluster import ClickHouseCluster
 from multiprocessing.dummy import Pool
-from helpers.network import PartitionManager
-from helpers.client import QueryRuntimeException
-from helpers.test_tools import assert_eq_with_retry
 
+import pytest
+
+from helpers.client import QueryRuntimeException
+from helpers.cluster import ClickHouseCluster
+from helpers.network import PartitionManager
+from helpers.test_tools import assert_eq_with_retry
 
 cluster = ClickHouseCluster(__file__)
 
 node1 = cluster.add_instance("node1", with_zookeeper=True)
 node2 = cluster.add_instance("node2", with_zookeeper=True)
 node3 = cluster.add_instance("node3", with_zookeeper=True)
+
 
 @pytest.fixture(scope="module")
 def started_cluster():
@@ -26,14 +28,31 @@ def started_cluster():
 
 
 def test_parallel_quorum_actually_parallel(started_cluster):
-    settings = {"insert_quorum": "3", "insert_quorum_parallel": "1"}
+    settings = {
+        "insert_quorum": "3",
+        "insert_quorum_parallel": "1",
+        "function_sleep_max_microseconds_per_block": "0",
+    }
     for i, node in enumerate([node1, node2, node3]):
-        node.query("CREATE TABLE r (a UInt64, b String) ENGINE=ReplicatedMergeTree('/test/r', '{num}') ORDER BY tuple()".format(num=i))
+        node.query(
+            "CREATE TABLE r (a UInt64, b String) ENGINE=ReplicatedMergeTree('/test/r', '{num}') ORDER BY tuple()".format(
+                num=i
+            )
+        )
 
     p = Pool(10)
 
+    # The total sleep for the long insert (rows * seconds-per-row) must be larger
+    # than the time taken by the parallel inserts and assertions below. Otherwise
+    # the long insert can finish before the COUNT() == 2 assertions run, causing
+    # COUNT() to return 7 instead of 2. Sanitizer builds (`MSan`, `TSan`,
+    # `ASan + UBSan`) can slow client/server interaction by 10-20x, so use a
+    # generous total sleep duration (5 rows * 3s = 15s).
     def long_insert(node):
-        node.query("INSERT INTO r SELECT number, toString(number) FROM numbers(5) where sleepEachRow(1) == 0", settings=settings)
+        node.query(
+            "INSERT INTO r SELECT number, toString(number) FROM numbers(5) where sleepEachRow(3) == 0",
+            settings=settings,
+        )
 
     job = p.apply_async(long_insert, (node1,))
 
@@ -58,19 +77,40 @@ def test_parallel_quorum_actually_parallel(started_cluster):
 
 def test_parallel_quorum_actually_quorum(started_cluster):
     for i, node in enumerate([node1, node2, node3]):
-        node.query("CREATE TABLE q (a UInt64, b String) ENGINE=ReplicatedMergeTree('/test/q', '{num}') ORDER BY tuple()".format(num=i))
+        node.query(
+            # node2 stays partitioned off node1/node3 (port 9009) for the whole test, so its
+            # GET_PART entries fail repeatedly and accumulate exponential fetch backoff. Disable
+            # it so node2 catches up promptly once the partition heals (see SYSTEM SYNC REPLICA).
+            "CREATE TABLE q (a UInt64, b String) ENGINE=ReplicatedMergeTree('/test/q', '{num}') ORDER BY tuple() SETTINGS max_postpone_time_for_failed_replicated_fetches_ms = 0".format(
+                num=i
+            )
+        )
 
     with PartitionManager() as pm:
         pm.partition_instances(node2, node1, port=9009)
         pm.partition_instances(node2, node3, port=9009)
         with pytest.raises(QueryRuntimeException):
-            node1.query("INSERT INTO q VALUES(1, 'Hello')", settings={"insert_quorum": "3", "insert_quorum_parallel": "1", "insert_quorum_timeout": "3000"})
+            node1.query(
+                "INSERT INTO q VALUES(1, 'Hello')",
+                settings={
+                    "insert_quorum": "3",
+                    "insert_quorum_parallel": "1",
+                    "insert_quorum_timeout": "3000",
+                },
+            )
 
         assert_eq_with_retry(node1, "SELECT COUNT() FROM q", "1")
         assert_eq_with_retry(node2, "SELECT COUNT() FROM q", "0")
         assert_eq_with_retry(node3, "SELECT COUNT() FROM q", "1")
 
-        node1.query("INSERT INTO q VALUES(2, 'wlrd')", settings={"insert_quorum": "2", "insert_quorum_parallel": "1", "insert_quorum_timeout": "3000"})
+        node1.query(
+            "INSERT INTO q VALUES(2, 'wlrd')",
+            settings={
+                "insert_quorum": "2",
+                "insert_quorum_parallel": "1",
+                "insert_quorum_timeout": "3000",
+            },
+        )
 
         assert_eq_with_retry(node1, "SELECT COUNT() FROM q", "2")
         assert_eq_with_retry(node2, "SELECT COUNT() FROM q", "0")
@@ -79,24 +119,67 @@ def test_parallel_quorum_actually_quorum(started_cluster):
         def insert_value_to_node(node, settings):
             node.query("INSERT INTO q VALUES(3, 'Hi')", settings=settings)
 
-        p = Pool(2)
-        res = p.apply_async(insert_value_to_node, (node1, {"insert_quorum": "3", "insert_quorum_parallel": "1", "insert_quorum_timeout": "60000"}))
+        def insert_fail_quorum_timeout(node, settings):
+            if "insert_quorum_timeout" not in settings:
+                settings["insert_quorum_timeout"] = "1000"
+            error = node.query_and_get_error(
+                "INSERT INTO q VALUES(3, 'Hi')", settings=settings
+            )
+            assert (
+                "DB::Exception: Unknown quorum status. The data was inserted in the local replica but we could not verify quorum. Reason: Timeout while waiting for quorum"
+                in error
+            ), error
 
-        assert_eq_with_retry(node1, "SELECT COUNT() FROM system.parts WHERE table == 'q' and active == 1", "3")
-        assert_eq_with_retry(node3, "SELECT COUNT() FROM system.parts WHERE table == 'q' and active == 1", "3")
-        assert_eq_with_retry(node2, "SELECT COUNT() FROM system.parts WHERE table == 'q' and active == 1", "0")
+        p = Pool(2)
+        res = p.apply_async(
+            insert_fail_quorum_timeout,
+            (
+                node1,
+                {
+                    "insert_quorum": "3",
+                    "insert_quorum_parallel": "1",
+                    "insert_quorum_timeout": "1000",
+                },
+            ),
+        )
+
+        assert_eq_with_retry(
+            node1,
+            "SELECT COUNT() FROM system.parts WHERE table == 'q' and active == 1",
+            "3",
+        )
+        assert_eq_with_retry(
+            node3,
+            "SELECT COUNT() FROM system.parts WHERE table == 'q' and active == 1",
+            "3",
+        )
+        assert_eq_with_retry(
+            node2,
+            "SELECT COUNT() FROM system.parts WHERE table == 'q' and active == 1",
+            "0",
+        )
 
         # Insert to the second to satisfy quorum
-        insert_value_to_node(node2, {"insert_quorum": "3", "insert_quorum_parallel": "1"})
+        insert_fail_quorum_timeout(
+            node2,
+            {
+                "insert_quorum": "3",
+                "insert_quorum_parallel": "1",
+                "insert_quorum_timeout": "1000",
+            },
+        )
 
         res.get()
 
         assert_eq_with_retry(node1, "SELECT COUNT() FROM q", "3")
-        assert_eq_with_retry(node2, "SELECT COUNT() FROM q", "1")
+        assert_eq_with_retry(node2, "SELECT COUNT() FROM q", "0")
         assert_eq_with_retry(node3, "SELECT COUNT() FROM q", "3")
 
         p.close()
         p.join()
 
-    node2.query("SYSTEM SYNC REPLICA q", timeout=10)
+    # Generous barrier timeout: under the parallel sanitizer flaky-check the post-heal
+    # catch-up fetch can take several seconds. Correctness is still gated by the retrying
+    # assert below, so a real "node2 never syncs" bug fails there rather than being hidden.
+    node2.query("SYSTEM SYNC REPLICA q", timeout=60)
     assert_eq_with_retry(node2, "SELECT COUNT() FROM q", "3")

@@ -1,15 +1,15 @@
 #pragma once
 
 #include <memory>
-#include <time.h>
+#include <optional>
+#include <ctime>
 #include <IO/ReadBufferFromFileBase.h>
-#include "CompressedReadBufferBase.h"
+#include <Compression/CompressedReadBufferBase.h>
 #include <IO/UncompressedCache.h>
 
 
 namespace DB
 {
-
 
 /** A buffer for reading from a compressed file using the cache of decompressed blocks.
   * The external cache is passed as an argument to the constructor.
@@ -17,7 +17,7 @@ namespace DB
   * Disadvantages:
   * - in case you need to read a lot of data in a row, but some of them only a part is cached, you have to do seek-and.
   */
-class CachedCompressedReadBuffer : public CompressedReadBufferBase, public ReadBuffer
+class CachedCompressedReadBuffer final : public CompressedReadBufferBase, public ReadBuffer
 {
 private:
     std::function<std::unique_ptr<ReadBufferFromFileBase>()> file_in_creator;
@@ -29,6 +29,9 @@ private:
     /// Current position in file_in
     size_t file_pos;
 
+    /// The bound passed to `file_in`: its input may end there, before the end of the file.
+    std::optional<size_t> read_until_position;
+
     /// A piece of data from the cache, or a piece of read data that we put into the cache.
     UncompressedCache::MappedPtr owned_cell;
 
@@ -36,7 +39,7 @@ private:
 
     bool nextImpl() override;
 
-    void prefetch() override;
+    void prefetch(Priority priority) override;
 
     /// Passed into file_in.
     ReadBufferFromFileBase::ProfileCallback profile_callback;
@@ -51,7 +54,9 @@ public:
 
     /// Seek is lazy. It doesn't move the position anywhere, just remember them and perform actual
     /// seek inside nextImpl.
-    void seek(size_t offset_in_compressed_file, size_t offset_in_decompressed_block);
+    void seek(size_t offset_in_compressed_file, size_t offset_in_decompressed_block) override;
+
+    off_t getPosition() const override { return file_pos; }
 
     void setProfileCallback(const ReadBufferFromFileBase::ProfileCallback & profile_callback_, clockid_t clock_type_ = CLOCK_MONOTONIC_COARSE)
     {
@@ -61,14 +66,22 @@ public:
 
     void setReadUntilPosition(size_t position) override
     {
-        if (file_in)
-            file_in->setReadUntilPosition(position);
+        initInput();
+        file_in->setReadUntilPosition(position);
+        read_until_position = position;
     }
 
     void setReadUntilEnd() override
     {
-        if (file_in)
-            file_in->setReadUntilEnd();
+        initInput();
+        file_in->setReadUntilEnd();
+        read_until_position.reset();
+    }
+
+    void setRequestMap(ByteRangeSet ranges) override
+    {
+        initInput();
+        file_in->setRequestMap(std::move(ranges));
     }
 };
 

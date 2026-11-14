@@ -4,7 +4,8 @@
 #include <string>
 
 #include <Core/Defines.h>
-
+#include <Core/Types.h>
+#include <IO/SnappyMode.h>
 
 namespace DB
 {
@@ -16,7 +17,7 @@ class WriteBuffer;
   *  (they use non-standard framing, indexes, checksums...)
   */
 
-enum class CompressionMethod
+enum class CompressionMethod : uint8_t
 {
     None,
     /// DEFLATE compression with gzip header and CRC32 checksum.
@@ -33,7 +34,8 @@ enum class CompressionMethod
     Zstd,
     Brotli,
     Lz4,
-    Bzip2
+    Bzip2,
+    Snappy,
 };
 
 /// How the compression method is named in HTTP.
@@ -46,9 +48,29 @@ std::string toContentEncodingName(CompressionMethod method);
   */
 CompressionMethod chooseCompressionMethod(const std::string & path, const std::string & hint);
 
+/// Whether `chooseCompressionMethod` derives the method from the path for this hint (an empty hint or `auto`).
+bool isCompressionMethodHintAuto(const std::string & hint);
+
+/** File name suffixes that `chooseCompressionMethod` recognizes for the given compression method
+  * hint, e.g. `{"gz", "gzip"}` for `gzip`. An empty hint or `auto` yields the suffixes of every
+  * supported method, `none` yields nothing, and an unrecognized hint throws the same exception as
+  * `chooseCompressionMethod`.
+  * Used to build globs that have to match compressed files by name.
+  */
+Strings getFileSuffixesForCompressionMethodHint(const std::string & hint);
+
+/** Choose a compression method from HTTP header list of supported compression methods.
+  */
+CompressionMethod chooseHTTPCompressionMethod(const std::string & list);
+
+/// Get a range of the valid compression levels for the compression method.
+std::pair<uint64_t, uint64_t> getCompressionLevelRange(const CompressionMethod & method);
+
 std::unique_ptr<ReadBuffer> wrapReadBufferWithCompressionMethod(
     std::unique_ptr<ReadBuffer> nested,
     CompressionMethod method,
+    int zstd_window_log_max = 0,
+    SnappyMode snappy_mode = SnappyMode::Basic,
     size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
     char * existing_memory = nullptr,
     size_t alignment = 0);
@@ -57,8 +79,22 @@ std::unique_ptr<WriteBuffer> wrapWriteBufferWithCompressionMethod(
     std::unique_ptr<WriteBuffer> nested,
     CompressionMethod method,
     int level,
+    int zstd_window_log = 0,
+    SnappyMode snappy_mode = SnappyMode::Basic,
     size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
     char * existing_memory = nullptr,
-    size_t alignment = 0);
+    size_t alignment = 0,
+    bool compress_empty = true);
+
+std::unique_ptr<WriteBuffer> wrapWriteBufferWithCompressionMethod(
+    WriteBuffer * nested,
+    CompressionMethod method,
+    int level,
+    int zstd_window_log,
+    SnappyMode snappy_mode = SnappyMode::Basic,
+    size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
+    char * existing_memory = nullptr,
+    size_t alignment = 0,
+    bool compress_empty = true);
 
 }

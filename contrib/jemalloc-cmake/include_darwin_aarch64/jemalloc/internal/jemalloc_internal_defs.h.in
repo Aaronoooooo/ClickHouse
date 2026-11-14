@@ -7,7 +7,7 @@
  * multiple allocators simultaneously.
  */
 #define JEMALLOC_PREFIX "je_"
-#define JEMALLOC_CPREFIX "JE_"
+#define JEMALLOC_CPREFIX ""
 
 /*
  * Define overrides for non-standard allocator-related functions if they are
@@ -36,6 +36,7 @@
 #define CPU_SPINWAIT
 /* 1 if CPU_SPINWAIT is defined, 0 otherwise. */
 #define HAVE_CPU_SPINWAIT 0
+/* #undef HAVE_RDTSCP */
 
 /*
  * Number of significant bits in virtual addresses.  This may be less than the
@@ -45,17 +46,17 @@
 #define LG_VADDR 64
 
 /* Defined if C11 atomics are available. */
-#define JEMALLOC_C11_ATOMICS 1
+#define JEMALLOC_C11_ATOMICS
 
 /* Defined if GCC __atomic atomics are available. */
-#define JEMALLOC_GCC_ATOMIC_ATOMICS 1
+#define JEMALLOC_GCC_ATOMIC_ATOMICS
 /* and the 8-bit variant support. */
-#define JEMALLOC_GCC_U8_ATOMIC_ATOMICS 1
+#define JEMALLOC_GCC_U8_ATOMIC_ATOMICS
 
 /* Defined if GCC __sync atomics are available. */
-#define JEMALLOC_GCC_SYNC_ATOMICS 1
+#define JEMALLOC_GCC_SYNC_ATOMICS
 /* and the 8-bit variant support. */
-#define JEMALLOC_GCC_U8_SYNC_ATOMICS 1
+#define JEMALLOC_GCC_U8_SYNC_ATOMICS
 
 /*
  * Defined if __builtin_clz() and __builtin_clzl() are available.
@@ -64,8 +65,15 @@
 
 /*
  * Defined if os_unfair_lock_*() functions are available, as provided by Darwin.
+ *
+ * ClickHouse: intentionally left undefined so that malloc_mutex_t uses
+ * pthread_mutex_t (as on Linux and FreeBSD). jemalloc's background thread waits
+ * on a pthread condition variable bound to this mutex
+ * (pthread_cond_wait(&info->cond, &info->mtx.lock)), which requires a real
+ * pthread_mutex_t and does not work with an os_unfair_lock. This is a
+ * prerequisite for enabling JEMALLOC_BACKGROUND_THREAD below on macOS.
  */
-#define JEMALLOC_OS_UNFAIR_LOCK
+/* #undef JEMALLOC_OS_UNFAIR_LOCK */
 
 /* Defined if syscall(2) is usable. */
 /* #undef JEMALLOC_USE_SYSCALL */
@@ -86,6 +94,12 @@
 /* Defined if pthread_setname_np(3) is available. */
 /* #undef JEMALLOC_HAVE_PTHREAD_SETNAME_NP */
 
+/* Defined if pthread_getname_np(3) is available. */
+#define JEMALLOC_HAVE_PTHREAD_GETNAME_NP
+
+/* Defined if pthread_get_name_np(3) is available. */
+/* #undef JEMALLOC_HAVE_PTHREAD_GET_NAME_NP */
+
 /*
  * Defined if clock_gettime(CLOCK_MONOTONIC_COARSE, ...) is available.
  */
@@ -98,8 +112,29 @@
 
 /*
  * Defined if mach_absolute_time() is available.
+ *
+ * ClickHouse: intentionally left undefined so that nstime_get() falls back to
+ * gettimeofday() (CLOCK_REALTIME). With this defined, nstime_get() uses
+ * mach_absolute_time(), a monotonic uptime clock. But the background thread's
+ * condition variable is created with the default clock (CLOCK_REALTIME): macOS
+ * provides no pthread_condattr_setclock to bind it to a monotonic clock, and
+ * jemalloc only attempts that when JEMALLOC_HAVE_CLOCK_MONOTONIC[_COARSE] is
+ * defined, which it is not here. background_thread_sleep() builds the
+ * pthread_cond_timedwait() deadline from the nstime (uptime) clock and passes
+ * it to a CLOCK_REALTIME wait; the uptime value is decades behind the realtime
+ * epoch, so the deadline is always in the past and the wait returns ETIMEDOUT
+ * immediately - the background thread busy-spins a CPU core instead of sleeping
+ * for dirty_decay_ms. Falling back to gettimeofday() makes nstime_get() use the
+ * same clock the condvar waits on (CLOCK_REALTIME), so the deadline is honoured.
+ * This is a prerequisite for JEMALLOC_BACKGROUND_THREAD to work correctly on
+ * macOS. See https://github.com/ClickHouse/ClickHouse/issues/108429
  */
-#define JEMALLOC_HAVE_MACH_ABSOLUTE_TIME 1
+/* #undef JEMALLOC_HAVE_MACH_ABSOLUTE_TIME */
+
+/*
+ * Defined if clock_gettime(CLOCK_REALTIME, ...) is available.
+ */
+#define JEMALLOC_HAVE_CLOCK_REALTIME
 
 /*
  * Defined if _malloc_thread_cleanup() exists.  At least in the case of
@@ -128,6 +163,14 @@
 #define JEMALLOC_TLS_MODEL __attribute__((tls_model("initial-exec")))
 
 /*
+ * Route TSD thread-local address computation through a noinline
+ * optimization-barrier accessor so the compiler cannot cache it across a
+ * user-space context switch (fibers migrating between OS threads).  See
+ * tsd_tls_addr.h.
+ */
+#define JEMALLOC_EXPERIMENTAL_FIBER_SAFE_TLS
+
+/*
  * JEMALLOC_DEBUG enables assertions and other sanity checks, and disables
  * inline functions.
  */
@@ -151,6 +194,12 @@
 /* Use gcc intrinsics for profile backtracing if defined. */
 /* #undef JEMALLOC_PROF_GCC */
 
+/* JEMALLOC_PAGEID enabled page id */
+/* #undef JEMALLOC_PAGEID */
+
+/* JEMALLOC_HAVE_PRCTL checks prctl */
+/* #undef JEMALLOC_HAVE_PRCTL */
+
 /*
  * JEMALLOC_DSS enables use of sbrk(2) to allocate extents from the data storage
  * segment (DSS).
@@ -162,6 +211,9 @@
 
 /* Support utrace(2)-based tracing. */
 /* #undef JEMALLOC_UTRACE */
+
+/* Support utrace(2)-based tracing (label based signature). */
+/* #undef JEMALLOC_UTRACE_LABEL */
 
 /* Support optional abort() on OOM. */
 /* #undef JEMALLOC_XMALLOC */
@@ -177,6 +229,9 @@
 
 /* One page is 2^LG_PAGE bytes. */
 #define LG_PAGE 14
+
+/* Maximum number of regions in a slab. */
+/* #undef CONFIG_LG_SLAB_MAXREGS */
 
 /*
  * One huge page is 2^LG_HUGEPAGE bytes.  Note that this is defined even if the
@@ -200,7 +255,7 @@
  * common sequences of mmap()/munmap() calls will cause virtual memory map
  * holes.
  */
-/* #undef JEMALLOC_RETAIN */
+#define JEMALLOC_RETAIN
 
 /* TLS is used to map arenas and magazine caches to threads. */
 /* #undef JEMALLOC_TLS */
@@ -292,16 +347,48 @@
 /* #undef JEMALLOC_MADVISE_DONTDUMP */
 
 /*
+ * Defined if MADV_[NO]CORE is supported as an argument to madvise.
+ */
+/* #undef JEMALLOC_MADVISE_NOCORE */
+
+/* Defined if process_madvise(2) is available. */
+#undef JEMALLOC_HAVE_PROCESS_MADVISE
+
+/* Defined if mprotect(2) is available. */
+#define JEMALLOC_HAVE_MPROTECT
+
+/*
  * Defined if transparent huge pages (THPs) are supported via the
  * MADV_[NO]HUGEPAGE arguments to madvise(2), and THP support is enabled.
  */
 /* #undef JEMALLOC_THP */
 
+/* Defined if posix_madvise is available. */
+/* #undef JEMALLOC_HAVE_POSIX_MADVISE */
+
+/*
+ * Method for purging unused pages using posix_madvise.
+ *
+ *   posix_madvise(..., POSIX_MADV_DONTNEED)
+ */
+/* #undef JEMALLOC_PURGE_POSIX_MADVISE_DONTNEED */
+/* #undef JEMALLOC_PURGE_POSIX_MADVISE_DONTNEED_ZEROS */
+
+/*
+ * Defined if memcntl page admin call is supported
+ */
+/* #undef JEMALLOC_HAVE_MEMCNTL */
+
+/*
+ * Defined if malloc_size is supported
+ */
+#define JEMALLOC_HAVE_MALLOC_SIZE
+
 /* Define if operating system has alloca.h header. */
 /* #undef JEMALLOC_HAS_ALLOCA_H */
 
 /* C99 restrict keyword supported. */
-#define JEMALLOC_HAS_RESTRICT 1
+#define JEMALLOC_HAS_RESTRICT
 
 /* For use by hash code. */
 /* #undef JEMALLOC_BIG_ENDIAN */
@@ -341,8 +428,14 @@
 
 /*
  * If defined, all the features necessary for background threads are present.
+ *
+ * ClickHouse: enabled on macOS. Upstream jemalloc leaves this undefined on
+ * Darwin (abi == macho and os_unfair_lock in use), but background threads work
+ * once malloc_mutex_t uses pthread_mutex_t (see JEMALLOC_OS_UNFAIR_LOCK above).
+ * This lets jemalloc purge dirty pages on a background thread with a finite
+ * dirty_decay_ms instead of purging eagerly (a madvise() per free).
  */
-/* #undef JEMALLOC_BACKGROUND_THREAD */
+#define JEMALLOC_BACKGROUND_THREAD
 
 /*
  * If defined, jemalloc symbols are not exported (doesn't work when
@@ -351,7 +444,7 @@
 /* #undef JEMALLOC_EXPORT */
 
 /* config.malloc_conf options string. */
-#define JEMALLOC_CONFIG_MALLOC_CONF ""
+#define JEMALLOC_CONFIG_MALLOC_CONF "@JEMALLOC_CONFIG_MALLOC_CONF@"
 
 /* If defined, jemalloc takes the malloc/free/etc. symbol names. */
 /* #undef JEMALLOC_IS_MALLOC */
@@ -363,5 +456,23 @@
 
 /* Performs additional safety checks when defined. */
 /* #undef JEMALLOC_OPT_SAFETY_CHECKS */
+
+/* Is C++ support being built? */
+/* #undef JEMALLOC_ENABLE_CXX */
+
+/* Are C++ exceptions enabled? */
+#define JEMALLOC_HAVE_CXX_EXCEPTIONS
+
+/* Performs additional size checks when defined. */
+/* #undef JEMALLOC_OPT_SIZE_CHECKS */
+
+/* Allows sampled junk and stash for checking use-after-free when defined. */
+/* #undef JEMALLOC_UAF_DETECTION */
+
+/* Darwin VM_MAKE_TAG support */
+#define JEMALLOC_HAVE_VM_MAKE_TAG
+
+/* If defined, realloc(ptr, 0) defaults to "free" instead of "alloc". */
+/* #undef JEMALLOC_ZERO_REALLOC_DEFAULT_FREE */
 
 #endif /* JEMALLOC_INTERNAL_DEFS_H_ */

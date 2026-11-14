@@ -1,4 +1,4 @@
-#include "ProtobufWriter.h"
+#include <Formats/ProtobufWriter.h>
 
 #if USE_PROTOBUF
 #   include <IO/WriteHelpers.h>
@@ -44,8 +44,6 @@ namespace
         ptr = writeVarint(value, ptr);
         buf.resize_assume_reserved(ptr - buf.data());
     }
-
-    UInt64 encodeZigZag(Int64 value) { return (static_cast<UInt64>(value) << 1) ^ static_cast<UInt64>(value >> 63); }
 
     enum WireType
     {
@@ -124,7 +122,7 @@ void ProtobufWriter::endNestedMessage(int field_number, bool is_group, bool skip
         num_bytes_skipped = num_bytes_skipped_at_start;
         return;
     }
-    size_t num_bytes_inserted;
+    size_t num_bytes_inserted = 0;
     if (is_group)
     {
         writeFieldNumber(field_number, GROUP_END, buffer);
@@ -196,7 +194,7 @@ template void ProtobufWriter::writeFixed<UInt64>(int field_number, UInt64 value)
 template void ProtobufWriter::writeFixed<Float32>(int field_number, Float32 value);
 template void ProtobufWriter::writeFixed<Float64>(int field_number, Float64 value);
 
-void ProtobufWriter::writeString(int field_number, const std::string_view & str)
+void ProtobufWriter::writeString(int field_number, std::string_view str)
 {
     size_t length = str.length();
     size_t old_size = buffer.size();

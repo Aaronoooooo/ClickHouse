@@ -1,12 +1,13 @@
 #pragma once
 
+#include <Common/VectorWithMemoryTracking.h>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <vector>
-#include <variant>
-#include <cstdint>
 
 #include <Core/Block.h>
+#include <Core/Block_fwd.h>
 #include <Core/Defines.h>
 #include <Processors/Chunk.h>
 #include <Common/Exception.h>
@@ -20,18 +21,19 @@ class IProcessor;
 
 namespace ErrorCodes
 {
-    extern const int LOGICAL_ERROR;
+extern const int LOGICAL_ERROR;
 }
 
 class Port
 {
-    friend void connect(OutputPort &, InputPort &);
+    friend void connect(OutputPort &, InputPort &, bool);
+    friend void disconnect(OutputPort &, InputPort &);
     friend class IProcessor;
 
 public:
     struct UpdateInfo
     {
-        using UpdateList = std::vector<void *>;
+        using UpdateList = VectorWithMemoryTracking<void *>;
 
         UpdateList * update_list = nullptr;
         void * id = nullptr;
@@ -60,6 +62,8 @@ protected:
             /// Note: std::variant can be used. But move constructor for it can't be inlined.
             Chunk chunk;
             std::exception_ptr exception;
+
+            bool isEmpty() const { return chunk.empty() && !exception; }
         };
 
     private:
@@ -89,7 +93,7 @@ protected:
             DataPtr() : data(new Data())
             {
                 if (unlikely((getUInt(data) & FLAGS_MASK) != 0))
-                    throw Exception("Not alignment memory for Port.", ErrorCodes::LOGICAL_ERROR);
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Not alignment memory for Port");
             }
             /// Pointer can store flags in case of exception in swap.
             ~DataPtr() { delete getPtr(getUInt(data) & PTR_MASK); }
@@ -110,7 +114,7 @@ protected:
                 return result;
             }
 
-            uintptr_t ALWAYS_INLINE swap(std::atomic<Data *> & value, std::uintptr_t flags, std::uintptr_t mask)
+            uintptr_t ALWAYS_INLINE swap(std::atomic<Data *> & value, std::uintptr_t flags, std::uintptr_t mask) /// NOLINT
             {
                 Data * expected = nullptr;
                 Data * desired = getPtr(flags | getUInt(data));
@@ -133,7 +137,7 @@ protected:
         State() : data(new Data())
         {
             if (unlikely((getUInt(data) & FLAGS_MASK) != 0))
-                throw Exception("Not alignment memory for Port.", ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Not alignment memory for Port");
         }
 
         ~State()
@@ -153,14 +157,14 @@ protected:
 
             /// It's possible to push data into finished port. Will just ignore it.
             /// if (flags & IS_FINISHED)
-            ///    throw Exception("Cannot push block to finished port.", ErrorCodes::LOGICAL_ERROR);
+            ///    throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot push block to finished port.");
 
             /// It's possible to push data into port which is not needed now.
             /// if ((flags & IS_NEEDED) == 0)
-            ///    throw Exception("Cannot push block to port which is not needed.", ErrorCodes::LOGICAL_ERROR);
+            ///    throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot push block to port which is not needed.");
 
             if (unlikely(flags & HAS_DATA))
-                throw Exception("Cannot push block to port which already has data.", ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot push block to port which already has data");
         }
 
         void ALWAYS_INLINE pull(DataPtr & data_, std::uintptr_t & flags, bool set_not_needed = false)
@@ -174,10 +178,10 @@ protected:
 
             /// It's ok to check because this flag can be changed only by pulling thread.
             if (unlikely((flags & IS_NEEDED) == 0) && !set_not_needed)
-                throw Exception("Cannot pull block from port which is not needed.", ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot pull block from port which is not needed");
 
             if (unlikely((flags & HAS_DATA) == 0))
-                throw Exception("Cannot pull block from port which has no data.", ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot pull block from port which has no data");
         }
 
         std::uintptr_t ALWAYS_INLINE setFlags(std::uintptr_t flags, std::uintptr_t mask)
@@ -200,7 +204,7 @@ protected:
         std::atomic<Data *> data;
     };
 
-    Block header;
+    const SharedHeader header;
     std::shared_ptr<State> state;
 
     /// This object is only used for data exchange between port and shared state.
@@ -214,18 +218,29 @@ protected:
 public:
     using Data = State::Data;
 
-    Port(Block header_) : header(std::move(header_)) {}
-    Port(Block header_, IProcessor * processor_) : header(std::move(header_)), processor(processor_) {}
+
+    Port(SharedHeader header_) : header(std::move(header_)) { } // NOLINT(google-explicit-constructor)
+    Port(Block && header_) : header(std::make_shared<const Block>(std::move(header_))) { } // NOLINT(google-explicit-constructor)
+    Port(const Block & header_) : header(std::make_shared<const Block>(header_)) { } // NOLINT(google-explicit-constructor)
+    Port(Block header_, IProcessor * processor_) : header(std::make_shared<const Block>(std::move(header_))), processor(processor_) { }
 
     void setUpdateInfo(UpdateInfo * info) { update_info = info; }
+    bool hasUpdateInfo() const { return update_info != nullptr; }
 
-    const Block & getHeader() const { return header; }
+    const Block & getHeader() const { return *header; }
+    const SharedHeader & getSharedHeader() const { return header; }
     bool ALWAYS_INLINE isConnected() const { return state != nullptr; }
+
+    /// Identity of the shared state of two connected ports (both sides return the same value).
+    /// Lets diagnostics match an output port to its peer input port without dereferencing the
+    /// peer processor, whose lifetime is not guaranteed during pipeline teardown. Opaque on
+    /// purpose: only pointer identity is meaningful.
+    const void * getConnectionId() const { return state.get(); }
 
     void ALWAYS_INLINE assumeConnected() const
     {
         if (unlikely(!isConnected()))
-            throw Exception("Port is not connected", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Port is not connected");
     }
 
     bool ALWAYS_INLINE hasData() const
@@ -237,14 +252,14 @@ public:
     IProcessor & getProcessor()
     {
         if (!processor)
-            throw Exception("Port does not belong to Processor", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Port does not belong to Processor");
         return *processor;
     }
 
     const IProcessor & getProcessor() const
     {
         if (!processor)
-            throw Exception("Port does not belong to Processor", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Port does not belong to Processor");
         return *processor;
     }
 
@@ -254,6 +269,10 @@ protected:
         if (likely(update_info))
             update_info->update();
     }
+
+    /// For processors_profile_log
+    size_t rows = 0;
+    size_t bytes = 0;
 };
 
 /// Invariants:
@@ -263,7 +282,8 @@ protected:
 ///   * You can pull only if port hasData().
 class InputPort : public Port
 {
-    friend void connect(OutputPort &, InputPort &);
+    friend void connect(OutputPort &, InputPort &, bool);
+    friend void disconnect(OutputPort &, InputPort &);
 
 private:
     OutputPort * output_port = nullptr;
@@ -285,30 +305,35 @@ public:
 
         is_finished = flags & State::IS_FINISHED;
 
-        if (unlikely(!data->exception && data->chunk.getNumColumns() != header.columns()))
+        if (unlikely(!data->exception && data->chunk.getNumColumns() != header->columns()))
         {
             auto & chunk = data->chunk;
 
-            String msg = "Invalid number of columns in chunk pulled from OutputPort. Expected "
-                         + std::to_string(header.columns()) + ", found " + std::to_string(chunk.getNumColumns()) + '\n';
-
-            msg += "Header: " + header.dumpStructure() + '\n';
-            msg += "Chunk: " + chunk.dumpStructure() + '\n';
-
-            throw Exception(msg, ErrorCodes::LOGICAL_ERROR);
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Invalid number of columns in chunk pulled from OutputPort. Expected {}, found {}\n"
+                "Header: {}\n"
+                "Chunk: {}\n",
+                header->columns(),
+                chunk.getNumColumns(),
+                header->dumpStructure(),
+                chunk.dumpStructure());
         }
+
+        rows += data->chunk.getNumRows();
+        bytes += data->chunk.bytes();
 
         return std::move(*data);
     }
 
     Chunk ALWAYS_INLINE pull(bool set_not_needed = false)
     {
-        auto data_ = pullData(set_not_needed);
+        auto pull_data = pullData(set_not_needed);
 
-        if (data_.exception)
-            std::rethrow_exception(data_.exception);
+        if (pull_data.exception)
+            std::rethrow_exception(pull_data.exception);
 
-        return std::move(data_.chunk);
+        return std::move(pull_data.chunk);
     }
 
     bool ALWAYS_INLINE isFinished() const
@@ -381,7 +406,8 @@ public:
 ///   * You can push only if port doesn't hasData().
 class OutputPort : public Port
 {
-    friend void connect(OutputPort &, InputPort &);
+    friend void connect(OutputPort &, InputPort &, bool);
+    friend void disconnect(OutputPort &, InputPort &);
 
 private:
     InputPort * input_port = nullptr;
@@ -396,21 +422,22 @@ public:
 
     void ALWAYS_INLINE pushException(std::exception_ptr exception)
     {
-        pushData({.chunk = {}, .exception = std::move(exception)});
+        pushData({.chunk = {}, .exception = exception});
     }
 
     void ALWAYS_INLINE pushData(Data data_)
     {
-        if (unlikely(!data_.exception && data_.chunk.getNumColumns() != header.columns()))
+        if (unlikely(!data_.exception && data_.chunk.getNumColumns() != header->columns()))
         {
-            String msg = "Invalid number of columns in chunk pushed to OutputPort. Expected "
-                         + std::to_string(header.columns())
-                         + ", found " + std::to_string(data_.chunk.getNumColumns()) + '\n';
-
-            msg += "Header: " + header.dumpStructure() + '\n';
-            msg += "Chunk: " + data_.chunk.dumpStructure() + '\n';
-
-            throw Exception(msg, ErrorCodes::LOGICAL_ERROR);
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Invalid number of columns in chunk pushed to OutputPort. Expected {}, found {}\n"
+                "Header: {}\n"
+                "Chunk: {}\n",
+                header->columns(),
+                data_.chunk.getNumColumns(),
+                header->dumpStructure(),
+                data_.chunk.dumpStructure());
         }
 
         updateVersion();
@@ -419,6 +446,10 @@ public:
 
         std::uintptr_t flags = 0;
         *data = std::move(data_);
+
+        rows += data->chunk.getNumRows();
+        bytes += data->chunk.bytes();
+
         state->push(data, flags);
     }
 
@@ -469,6 +500,7 @@ using InputPorts = std::list<InputPort>;
 using OutputPorts = std::list<OutputPort>;
 
 
-void connect(OutputPort & output, InputPort & input);
+void connect(OutputPort & output, InputPort & input, bool reconnect = false);
+void disconnect(OutputPort & output, InputPort & input);
 
 }

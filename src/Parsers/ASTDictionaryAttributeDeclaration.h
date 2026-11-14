@@ -3,6 +3,8 @@
 #include <Parsers/IAST.h>
 #include <Parsers/ASTExpressionList.h>
 
+namespace Poco::JSON { class Object; }
+
 namespace DB
 {
 
@@ -19,16 +21,22 @@ public:
     /// Attribute expression
     ASTPtr expression;
     /// Is attribute mirrored to the parent identifier
-    bool hierarchical;
+    bool hierarchical = false;
+    /// Is hierarchical attribute bidirectional
+    bool bidirectional = false;
     /// Flag that shows whether the id->attribute image is injective
-    bool injective;
+    bool injective = false;
     /// MongoDB object ID
-    bool is_object_id;
+    bool is_object_id = false;
 
     String getID(char delim) const override { return "DictionaryAttributeDeclaration" + (delim + name); }
 
     ASTPtr clone() const override;
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    void writeJSON(WriteBuffer & out) const override;
+    void readJSON(const Poco::JSON::Object & json) override;
+
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 }

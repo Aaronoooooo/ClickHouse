@@ -1,3 +1,5 @@
+-- Tags: no-parallel
+
 DROP TABLE IF EXISTS one;
 CREATE TABLE one(dummy UInt8) ENGINE = Memory;
 

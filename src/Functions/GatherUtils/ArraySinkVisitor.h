@@ -1,10 +1,9 @@
 #pragma once
 #include <Common/Visitor.h>
-#include <base/Typelists.h>
+#include <base/TypeLists.h>
 
 namespace DB::GatherUtils
 {
-#pragma GCC visibility push(hidden)
 
 template <typename T>
 struct NumericArraySink;
@@ -14,12 +13,12 @@ struct GenericArraySink;
 template <typename ArraySink>
 struct NullableArraySink;
 
-using NumericArraySinks = TLMap<NumericArraySink, TLNumbersWithUUID>;
-using BasicArraySinks = TLAppend<GenericArraySink, NumericArraySinks>;
-using NullableArraySinks = TLMap<NullableArraySink, BasicArraySinks>;
-using TLArraySinks = TLConcat<BasicArraySinks, NullableArraySinks>;
+using NumericArraySinks = TypeListMap<NumericArraySink, TypeListNumberWithUUID>;
+using BasicArraySinks = TypeListAppend<GenericArraySink, NumericArraySinks>;
+using NullableArraySinks = TypeListMap<NullableArraySink, BasicArraySinks>;
+using TLArraySinks = TypeListConcat<BasicArraySinks, NullableArraySinks>;
 
-class ArraySinkVisitor : public TLChangeRoot<Visitor, TLArraySinks>
+class ArraySinkVisitor : public TypeListChangeRoot<Visitor, TLArraySinks>
 {
 protected:
     ~ArraySinkVisitor() = default;
@@ -32,5 +31,4 @@ protected:
     ~ArraySinkVisitorImpl() = default;
 };
 
-#pragma GCC visibility pop
 }

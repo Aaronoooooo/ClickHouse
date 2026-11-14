@@ -1,12 +1,24 @@
-#include <Disks/LocalDirectorySyncGuard.h>
-#include <Common/Exception.h>
-#include <Disks/IDisk.h>
+#include <utility>
 #include <fcntl.h> // O_RDWR
+#include <Disks/IDisk.h>
+#include <Disks/LocalDirectorySyncGuard.h>
+#include <base/scope_guard.h>
+#include <Common/ErrnoException.h>
+#include <Common/Exception.h>
+#include <Common/FailPoint.h>
+#include <Common/ProfileEvents.h>
+#include <Common/Stopwatch.h>
 
 /// OSX does not have O_DIRECTORY
 #ifndef O_DIRECTORY
 #define O_DIRECTORY O_RDWR
 #endif
+
+namespace ProfileEvents
+{
+    extern const Event DirectorySync;
+    extern const Event DirectorySyncElapsedMicroseconds;
+}
 
 namespace DB
 {
@@ -19,27 +31,24 @@ namespace ErrorCodes
     extern const int CANNOT_CLOSE_FILE;
 }
 
+namespace FailPoints
+{
+    extern const char local_directory_sync_fail[];
+}
+
 LocalDirectorySyncGuard::LocalDirectorySyncGuard(const String & full_path)
     : fd(::open(full_path.c_str(), O_DIRECTORY))
 {
     if (-1 == fd)
-        throwFromErrnoWithPath("Cannot open file " + full_path, full_path,
-            errno == ENOENT ? ErrorCodes::FILE_DOESNT_EXIST : ErrorCodes::CANNOT_OPEN_FILE);
+        ErrnoException::throwFromPath(
+            errno == ENOENT ? ErrorCodes::FILE_DOESNT_EXIST : ErrorCodes::CANNOT_OPEN_FILE, full_path, "Cannot open file {}", full_path);
 }
 
 LocalDirectorySyncGuard::~LocalDirectorySyncGuard()
 {
     try
     {
-#if defined(OS_DARWIN)
-        if (fcntl(fd, F_FULLFSYNC, 0))
-            throwFromErrno("Cannot fcntl(F_FULLFSYNC)", ErrorCodes::CANNOT_FSYNC);
-#else
-        if (-1 == ::fdatasync(fd))
-            throw Exception("Cannot fdatasync", ErrorCodes::CANNOT_FSYNC);
-#endif
-        if (-1 == ::close(fd))
-            throw Exception("Cannot close file", ErrorCodes::CANNOT_CLOSE_FILE);
+        sync();
     }
     catch (...)
     {
@@ -47,4 +56,39 @@ LocalDirectorySyncGuard::~LocalDirectorySyncGuard()
     }
 }
 
+void LocalDirectorySyncGuard::sync()
+{
+    if (fd < 0)
+        return;
+
+    int sync_fd = std::exchange(fd, -1);
+    SCOPE_EXIT({
+        if (sync_fd >= 0)
+        {
+            [[maybe_unused]] int result = ::close(sync_fd);
+        }
+    });
+
+    ProfileEvents::increment(ProfileEvents::DirectorySync);
+    Stopwatch watch;
+
+    /// Fault injection for tests: the directory sync fails like a disk error would.
+    fiu_do_on(FailPoints::local_directory_sync_fail,
+    {
+        ErrnoException::throwWithErrno(ErrorCodes::CANNOT_FSYNC, EIO, "Injected transient failure while syncing directory");
+    });
+
+#if defined(OS_DARWIN)
+    /// macOS does not declare `fdatasync` in this build.
+    if (-1 == ::fsync(sync_fd))
+        ErrnoException::throwWithErrno(ErrorCodes::CANNOT_FSYNC, errno, "Cannot fsync directory");
+#else
+    if (-1 == ::fdatasync(sync_fd))
+        ErrnoException::throwWithErrno(ErrorCodes::CANNOT_FSYNC, errno, "Cannot fdatasync directory");
+#endif
+    if (-1 == ::close(std::exchange(sync_fd, -1)))
+        ErrnoException::throwWithErrno(ErrorCodes::CANNOT_CLOSE_FILE, errno, "Cannot close directory");
+
+    ProfileEvents::increment(ProfileEvents::DirectorySyncElapsedMicroseconds, watch.elapsedMicroseconds());
+}
 }

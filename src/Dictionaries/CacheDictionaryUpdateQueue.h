@@ -1,10 +1,6 @@
 #pragma once
 
-#include <atomic>
 #include <mutex>
-#include <shared_mutex>
-#include <utility>
-#include <vector>
 #include <functional>
 
 #include <Common/ThreadPool.h>
@@ -12,7 +8,7 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/PODArray.h>
 #include <Common/HashTable/HashMap.h>
-#include <Columns/IColumn.h>
+#include <Columns/IColumn_fwd.h>
 #include <Dictionaries/ICacheDictionaryStorage.h>
 
 namespace CurrentMetrics
@@ -39,7 +35,7 @@ template <DictionaryKeyType dictionary_key_type>
 class CacheDictionaryUpdateUnit
 {
 public:
-    using KeyType = std::conditional_t<dictionary_key_type == DictionaryKeyType::Simple, UInt64, StringRef>;
+    using KeyType = std::conditional_t<dictionary_key_type == DictionaryKeyType::Simple, UInt64, std::string_view>;
 
     /// Constructor for complex keys update request
     explicit CacheDictionaryUpdateUnit(
@@ -74,8 +70,11 @@ private:
     template <DictionaryKeyType>
     friend class CacheDictionaryUpdateQueue;
 
-    std::atomic<bool> is_done{false};
-    std::exception_ptr current_exception{nullptr};
+    mutable std::mutex update_mutex;
+    mutable std::condition_variable is_update_finished;
+
+    bool is_done{false};
+    std::exception_ptr current_exception{nullptr}; /// NOLINT
 
     /// While UpdateUnit is alive, it is accounted in update_queue size.
     CurrentMetrics::Increment alive_batch{CurrentMetrics::CacheDictionaryUpdateQueueBatches};
@@ -159,9 +158,6 @@ private:
 
     UpdateQueue update_queue;
     ThreadPool update_pool;
-
-    mutable std::mutex update_mutex;
-    mutable std::condition_variable is_update_finished;
 };
 
 extern template class CacheDictionaryUpdateQueue<DictionaryKeyType::Simple>;

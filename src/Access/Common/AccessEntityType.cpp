@@ -1,8 +1,9 @@
+#include <algorithm>
+#include <Common/StringUtils.h>
 #include <Access/Common/AccessEntityType.h>
 #include <Common/Exception.h>
 #include <Common/quoteString.h>
-#include <boost/algorithm/string/case_conv.hpp>
-#include <boost/algorithm/string/replace.hpp>
+#include <base/range.h>
 
 
 namespace DB
@@ -14,7 +15,9 @@ namespace ErrorCodes
     extern const int UNKNOWN_ROW_POLICY;
     extern const int UNKNOWN_QUOTA;
     extern const int THERE_IS_NO_PROFILE;
+    extern const int UNKNOWN_MASKING_POLICY;
     extern const int LOGICAL_ERROR;
+    extern const int BAD_ARGUMENTS;
 }
 
 
@@ -41,13 +44,13 @@ const AccessEntityTypeInfo & AccessEntityTypeInfo::get(AccessEntityType type_)
         {
             String & init_name = init_names[i];
             String & init_alias = init_aliases[i];
-            boost::to_upper(init_name);
-            boost::replace_all(init_name, "_", " ");
+            toUpperASCII(init_name);
+            std::replace(init_name.begin(), init_name.end(), '_', ' ');
             if (auto underscore_pos = init_name.find_first_of(' '); underscore_pos != String::npos)
                 init_alias = init_name.substr(underscore_pos + 1);
         }
         String init_name_for_output_with_entity_name = init_names[0];
-        boost::to_lower(init_name_for_output_with_entity_name);
+        toLowerASCII(init_name_for_output_with_entity_name);
         return AccessEntityTypeInfo{raw_name_, plural_raw_name_, std::move(init_names[0]), std::move(init_aliases[0]), std::move(init_names[1]), std::move(init_aliases[1]), std::move(init_name_for_output_with_entity_name), unique_char_, not_found_error_code_};
     };
 
@@ -78,9 +81,25 @@ const AccessEntityTypeInfo & AccessEntityTypeInfo::get(AccessEntityType type_)
             static const auto info = make_info("QUOTA", "QUOTAS", 'Q', ErrorCodes::UNKNOWN_QUOTA);
             return info;
         }
+        case AccessEntityType::MASKING_POLICY:
+        {
+            static const auto info = make_info("MASKING_POLICY", "MASKING_POLICIES", 'M', ErrorCodes::UNKNOWN_MASKING_POLICY);
+            return info;
+        }
         case AccessEntityType::MAX: break;
     }
-    throw Exception("Unknown type: " + std::to_string(static_cast<size_t>(type_)), ErrorCodes::LOGICAL_ERROR);
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown type: {}", static_cast<size_t>(type_));
+}
+
+AccessEntityType AccessEntityTypeInfo::parseType(const String & name_)
+{
+    for (auto type : collections::range(AccessEntityType::MAX))
+    {
+        const auto & info = get(type);
+        if (equalsCaseInsensitive(info.name, name_))
+            return type;
+    }
+    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown type: {}", name_);
 }
 
 }

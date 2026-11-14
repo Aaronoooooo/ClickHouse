@@ -1,4 +1,6 @@
 #include <IO/ZstdInflatingReadBuffer.h>
+#include <IO/WithFileName.h>
+#include <zstd_errors.h>
 
 
 namespace DB
@@ -8,10 +10,10 @@ namespace ErrorCodes
     extern const int ZSTD_DECODER_FAILED;
 }
 
-ZstdInflatingReadBuffer::ZstdInflatingReadBuffer(std::unique_ptr<ReadBuffer> in_, size_t buf_size, char * existing_memory, size_t alignment)
-    : BufferWithOwnMemory<ReadBuffer>(buf_size, existing_memory, alignment), in(std::move(in_))
+ZstdInflatingReadBuffer::ZstdInflatingReadBuffer(std::unique_ptr<ReadBuffer> in_, size_t buf_size, char * existing_memory, size_t alignment, int zstd_window_log_max)
+    : CompressedReadBufferWrapper(std::move(in_), buf_size, existing_memory, alignment)
 {
-    dctx = ZSTD_createDCtx();
+    dctx.reset(ZSTD_createDCtx());
     input = {nullptr, 0, 0};
     output = {nullptr, 0, 0};
 
@@ -19,11 +21,16 @@ ZstdInflatingReadBuffer::ZstdInflatingReadBuffer(std::unique_ptr<ReadBuffer> in_
     {
         throw Exception(ErrorCodes::ZSTD_DECODER_FAILED, "zstd_stream_decoder init failed: zstd version: {}", ZSTD_VERSION_STRING);
     }
-}
 
-ZstdInflatingReadBuffer::~ZstdInflatingReadBuffer()
-{
-    ZSTD_freeDCtx(dctx);
+    size_t ret = ZSTD_DCtx_setParameter(dctx.get(), ZSTD_d_windowLogMax, zstd_window_log_max);
+    if (ZSTD_isError(ret))
+    {
+        throw Exception(
+            ErrorCodes::ZSTD_DECODER_FAILED,
+            "zstd_stream_decoder init failed for zstd_window_log_max = {}: {}",
+            zstd_window_log_max,
+            ZSTD_getErrorName(ret));
+    }
 }
 
 bool ZstdInflatingReadBuffer::nextImpl()
@@ -31,7 +38,7 @@ bool ZstdInflatingReadBuffer::nextImpl()
     do
     {
         // If it is known that end of file was reached, return false
-        if (eof)
+        if (eof_flag)
             return false;
 
         /// If end was reached, get next part
@@ -49,13 +56,22 @@ bool ZstdInflatingReadBuffer::nextImpl()
         output.pos = 0;
 
         /// Decompress data and check errors.
-        size_t ret = ZSTD_decompressStream(dctx, &output, &input);
-        if (ZSTD_isError(ret))
+        size_t ret = ZSTD_decompressStream(dctx.get(), &output, &input);
+        if (ZSTD_getErrorCode(ret))
+        {
             throw Exception(
-                ErrorCodes::ZSTD_DECODER_FAILED, "Zstd stream encoding failed: error '{}'; zstd version: {}", ZSTD_getErrorName(ret), ZSTD_VERSION_STRING);
+                ErrorCodes::ZSTD_DECODER_FAILED,
+                "ZSTD stream decoding failed: error '{}'{}; ZSTD version: {}{}",
+                ZSTD_getErrorName(ret),
+                ZSTD_error_frameParameter_windowTooLarge == ret
+                    ? ". You can increase the maximum window size with the 'zstd_window_log_max' setting in ClickHouse. Example: 'SET zstd_window_log_max = 31'"
+                    : "",
+                ZSTD_VERSION_STRING,
+                getExceptionEntryWithFileName(*in));
+        }
 
         /// Check that something has changed after decompress (input or output position)
-        assert(in->eof() || output.pos > 0 || in->position() < in->buffer().begin() + input.pos);
+        chassert(output.pos > 0 || in->position() < in->buffer().begin() + input.pos || in->available() == 0);
 
         /// move position to the end of read data
         in->position() = in->buffer().begin() + input.pos;
@@ -64,7 +80,7 @@ bool ZstdInflatingReadBuffer::nextImpl()
         /// If end of file is reached, fill eof variable and return true if there is some data in buffer, otherwise return false
         if (in->eof())
         {
-            eof = true;
+            eof_flag = true;
             return !working_buffer.empty();
         }
         /// It is possible, that input buffer is not at eof yet, but nothing was decompressed in current iteration.

@@ -1,7 +1,7 @@
 <test>
-    <preconditions>
-        <table_exists>test.hits</table_exists>
-    </preconditions>
+    <settings>
+        <count_matches_stop_at_empty_match>1</count_matches_stop_at_empty_match>
+    </settings>
 
     <query>SELECT count() FROM test.hits WHERE NOT ignore(countMatches(URL, 'yandex'))</query>
     <query>SELECT count() FROM test.hits WHERE NOT ignore(countMatches(URL, 'yandex|google'))</query>

@@ -1,23 +1,38 @@
-#include <Storages/System/StorageSystemGraphite.h>
-#include <Storages/MergeTree/MergeTreeData.h>
+#include <AggregateFunctions/IAggregateFunction.h>
+#include <Storages/System/SystemTableSourceRegistry.h>
+#include <Core/ColumnsWithTypeAndName.h>
+#include <DataTypes/DataTypeString.h>
+#include <Core/NamesAndTypes.h>
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Storages/StorageProxy.h>
+#include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/System/StorageSystemGraphite.h>
 
 
 namespace DB
 {
 
-NamesAndTypesList StorageSystemGraphite::getNamesAndTypes()
+ColumnsDescription StorageSystemGraphite::getColumnsDescription()
 {
-    return {
-        {"config_name",     std::make_shared<DataTypeString>()},
-        {"regexp",          std::make_shared<DataTypeString>()},
-        {"function",        std::make_shared<DataTypeString>()},
-        {"age",             std::make_shared<DataTypeUInt64>()},
-        {"precision",       std::make_shared<DataTypeUInt64>()},
-        {"priority",        std::make_shared<DataTypeUInt16>()},
-        {"is_default",      std::make_shared<DataTypeUInt8>()},
-        {"Tables.database", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
-        {"Tables.table",    std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
+    return ColumnsDescription
+    {
+        {"config_name",     std::make_shared<DataTypeString>(), "graphite_rollup parameter name."},
+        {"rule_type",       std::make_shared<DataTypeString>(),
+            "The rule type. Possible values: RuleTypeAll = 0 - default, with regex, compatible with old scheme; "
+            "RuleTypePlain = 1 - plain metrics, with regex, compatible with old scheme; "
+            "RuleTypeTagged = 2 - tagged metrics, with regex, compatible with old scheme; "
+            "RuleTypeTagList = 3 - tagged metrics, with regex (converted to RuleTypeTagged from string like 'retention=10min ; env=(staging|prod)')"},
+        {"regexp",          std::make_shared<DataTypeString>(), "A pattern for the metric name."},
+        {"function",        std::make_shared<DataTypeString>(), "The name of the aggregating function."},
+        {"age",             std::make_shared<DataTypeUInt64>(), "The minimum age of the data in seconds."},
+        {"precision",       std::make_shared<DataTypeUInt64>(), "How precisely to define the age of the data in seconds."},
+        {"priority",        std::make_shared<DataTypeUInt16>(), "Pattern priority."},
+        {"is_default",      std::make_shared<DataTypeUInt8>(), "Whether the pattern is the default."},
+        {"Tables.database", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "Array of names of database tables that use the `config_name` parameter."},
+        {"Tables.table",    std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "Array of table names that use the `config_name` parameter."},
     };
 }
 
@@ -27,22 +42,18 @@ NamesAndTypesList StorageSystemGraphite::getNamesAndTypes()
  */
 static StorageSystemGraphite::Configs getConfigs(ContextPtr context)
 {
-    const Databases databases = DatabaseCatalog::instance().getDatabases();
+    const Databases databases = DatabaseCatalog::instance().getDatabases(GetDatabasesOptions{.with_datalake_catalogs = false});
     StorageSystemGraphite::Configs graphite_configs;
 
     for (const auto & db : databases)
     {
         /// Check if database can contain MergeTree tables
-        if (!db.second->canContainMergeTreeTables())
+        if (db.second->isExternal())
             continue;
 
         for (auto iterator = db.second->getTablesIterator(context); iterator->isValid(); iterator->next())
         {
-            const auto & table = iterator->table();
-            if (!table)
-                continue;
-
-            const MergeTreeData * table_data = dynamic_cast<const MergeTreeData *>(table.get());
+            auto table_data = castStorage<MergeTreeData>(iterator->table(), DeferredTable::Skip);
             if (!table_data)
                 continue;
 
@@ -51,7 +62,7 @@ static StorageSystemGraphite::Configs getConfigs(ContextPtr context)
                 const String & config_name = table_data->merging_params.graphite_params.config_name;
 
                 auto table_id = table_data->getStorageID();
-                if (!graphite_configs.count(config_name))
+                if (!graphite_configs.contains(config_name))
                 {
                     StorageSystemGraphite::Config new_config =
                     {
@@ -73,7 +84,7 @@ static StorageSystemGraphite::Configs getConfigs(ContextPtr context)
     return graphite_configs;
 }
 
-void StorageSystemGraphite::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo &) const
+void StorageSystemGraphite::fillData(MutableColumns & res_columns, ContextPtr context, const ActionsDAG::Node *, std::vector<UInt8>) const
 {
     Configs graphite_configs = getConfigs(context);
 
@@ -85,6 +96,7 @@ void StorageSystemGraphite::fillData(MutableColumns & res_columns, ContextPtr co
             bool is_default = pattern.regexp == nullptr;
             String regexp;
             String function;
+            const String & rule_type = ruleTypeStr(pattern.rule_type);
 
             if (is_default)
             {
@@ -107,6 +119,7 @@ void StorageSystemGraphite::fillData(MutableColumns & res_columns, ContextPtr co
                 {
                     size_t i = 0;
                     res_columns[i++]->insert(config.first);
+                    res_columns[i++]->insert(rule_type);
                     res_columns[i++]->insert(regexp);
                     res_columns[i++]->insert(function);
                     res_columns[i++]->insert(retention.age);
@@ -121,6 +134,7 @@ void StorageSystemGraphite::fillData(MutableColumns & res_columns, ContextPtr co
             {
                 size_t i = 0;
                 res_columns[i++]->insert(config.first);
+                res_columns[i++]->insert(rule_type);
                 res_columns[i++]->insert(regexp);
                 res_columns[i++]->insert(function);
                 res_columns[i++]->insertDefault();
@@ -135,3 +149,6 @@ void StorageSystemGraphite::fillData(MutableColumns & res_columns, ContextPtr co
 }
 
 }
+
+/// Register the source file of this system table for `system.documentation`.
+namespace DB { REGISTER_SYSTEM_TABLE_SOURCE(StorageSystemGraphite) }

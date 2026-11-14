@@ -3,12 +3,13 @@
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/DatabaseAndTableWithAlias.h>
 #include <Interpreters/InDepthNodeVisitor.h>
-#include <Parsers/ASTFunction.h>
-#include <Parsers/ASTIdentifier.h>
 #include <Parsers/IAST_fwd.h>
 
 namespace DB
 {
+
+class ASTFunction;
+class ASTIdentifier;
 
 
 struct ExpressionInfoMatcher
@@ -18,6 +19,7 @@ struct ExpressionInfoMatcher
         const TablesWithColumns & tables;
 
         bool is_array_join = false;
+        bool is_untuple = false;
         bool is_stateful_function = false;
         bool is_aggregate_function = false;
         bool is_window_function = false;

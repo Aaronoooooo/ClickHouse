@@ -6,7 +6,7 @@
 #include <limits>
 #include <type_traits>
 
-#include "config_core.h"
+#include "config.h"
 
 
 namespace DB
@@ -24,9 +24,13 @@ struct GCDLCMImpl
     using ResultType = typename NumberTraits::ResultOfAdditionMultiplication<A, B>::Type;
     static const constexpr bool allow_fixed_string = false;
     static const constexpr bool allow_string_integer = false;
+    /// Documentation-only: the legacy widening accepts wider integers than `NativeInteger`
+    /// (e.g. `Int128`) and resolves the result type via the arithmetic promotion matrix,
+    /// which the current DSL cannot express. Keep the legacy `getReturnTypeImpl` authoritative.
+    static constexpr auto signature_documentation = "(Integer, Integer) -> Integer";
 
     template <typename Result = ResultType>
-    static inline Result apply(A a, B b)
+    static Result apply(A a, B b)
     {
         throwIfDivisionLeadsToFPE(typename NumberTraits::ToInteger<A>::Type(a), typename NumberTraits::ToInteger<B>::Type(b));
         throwIfDivisionLeadsToFPE(typename NumberTraits::ToInteger<B>::Type(b), typename NumberTraits::ToInteger<A>::Type(a));
@@ -41,7 +45,9 @@ struct GCDLCMImpl
             Int min = std::numeric_limits<Int>::lowest();
             Int max = std::numeric_limits<Int>::max();
             if (unlikely((a_s == min || a_s == max) || (b_s == min || b_s == max)))
-                throw Exception(ErrorCodes::DECIMAL_OVERFLOW, "Intermediate result overflow (signed a = {}, signed b = {}, min = {}, max = {})", a_s, b_s, min, max);
+                throw Exception(ErrorCodes::DECIMAL_OVERFLOW,
+                                "Intermediate result overflow (signed a = {}, signed b = {}, min = {}, max = {})",
+                                a_s, b_s, min, max);
         }
 
         return Impl::applyImpl(a, b);

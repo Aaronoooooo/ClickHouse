@@ -1,123 +1,39 @@
 #pragma once
 
-#include <cmath>
+#include <Columns/ColumnFixedSizeHelper.h>
 #include <Columns/IColumn.h>
 #include <Columns/IColumnImpl.h>
-#include <Columns/ColumnVectorHelper.h>
-#include <base/unaligned.h>
-#include <Core/Field.h>
 #include <Common/assert_cast.h>
+#include <Core/CompareHelper.h>
+#include <Core/Field.h>
 #include <Core/TypeId.h>
 #include <base/TypeName.h>
+#include <base/unaligned.h>
 
+#include <bit>
+
+#include "config.h"
+
+class SipHash;
 
 namespace DB
 {
 
-namespace ErrorCodes
-{
-    extern const int NOT_IMPLEMENTED;
-}
-
-
-/** Stuff for comparing numbers.
-  * Integer values are compared as usual.
-  * Floating-point numbers are compared this way that NaNs always end up at the end
-  *  (if you don't do this, the sort would not work at all).
-  */
-template <class T, class U = T>
-struct CompareHelper
-{
-    static constexpr bool less(T a, U b, int /*nan_direction_hint*/) { return a < b; }
-    static constexpr bool greater(T a, U b, int /*nan_direction_hint*/) { return a > b; }
-    static constexpr bool equals(T a, U b, int /*nan_direction_hint*/) { return a == b; }
-
-    /** Compares two numbers. Returns a number less than zero, equal to zero, or greater than zero if a < b, a == b, a > b, respectively.
-      * If one of the values is NaN, then
-      * - if nan_direction_hint == -1 - NaN are considered less than all numbers;
-      * - if nan_direction_hint == 1 - NaN are considered to be larger than all numbers;
-      * Essentially: nan_direction_hint == -1 says that the comparison is for sorting in descending order.
-      */
-    static constexpr int compare(T a, U b, int /*nan_direction_hint*/)
-    {
-        return a > b ? 1 : (a < b ? -1 : 0);
-    }
-};
-
-template <class T>
-struct FloatCompareHelper
-{
-    static constexpr bool less(T a, T b, int nan_direction_hint)
-    {
-        const bool isnan_a = std::isnan(a);
-        const bool isnan_b = std::isnan(b);
-
-        if (isnan_a && isnan_b)
-            return false;
-        if (isnan_a)
-            return nan_direction_hint < 0;
-        if (isnan_b)
-            return nan_direction_hint > 0;
-
-        return a < b;
-    }
-
-    static constexpr bool greater(T a, T b, int nan_direction_hint)
-    {
-        const bool isnan_a = std::isnan(a);
-        const bool isnan_b = std::isnan(b);
-
-        if (isnan_a && isnan_b)
-            return false;
-        if (isnan_a)
-            return nan_direction_hint > 0;
-        if (isnan_b)
-            return nan_direction_hint < 0;
-
-        return a > b;
-    }
-
-    static constexpr bool equals(T a, T b, int nan_direction_hint)
-    {
-        return compare(a, b, nan_direction_hint) == 0;
-    }
-
-    static constexpr int compare(T a, T b, int nan_direction_hint)
-    {
-        const bool isnan_a = std::isnan(a);
-        const bool isnan_b = std::isnan(b);
-
-        if (unlikely(isnan_a || isnan_b))
-        {
-            if (isnan_a && isnan_b)
-                return 0;
-
-            return isnan_a
-                ? nan_direction_hint
-                : -nan_direction_hint;
-        }
-
-        return (T(0) < (a - b)) - ((a - b) < T(0));
-    }
-};
-
-template <class U> struct CompareHelper<Float32, U> : public FloatCompareHelper<Float32> {};
-template <class U> struct CompareHelper<Float64, U> : public FloatCompareHelper<Float64> {};
-
-
 /** A template for columns that use a simple array to store.
  */
 template <typename T>
-class ColumnVector final : public COWHelper<ColumnVectorHelper, ColumnVector<T>>
+class ColumnVector final : public COWHelper<IColumnHelper<ColumnVector<T>, ColumnFixedSizeHelper>, ColumnVector<T>>
 {
     static_assert(!is_decimal<T>);
 
 private:
     using Self = ColumnVector;
-    friend class COWHelper<ColumnVectorHelper, Self>;
+    friend class COWHelper<IColumnHelper<Self, ColumnFixedSizeHelper>, Self>;
 
     struct less;
+    struct less_stable;
     struct greater;
+    struct greater_stable;
     struct equals;
 
 public:
@@ -125,10 +41,11 @@ public:
     using Container = PaddedPODArray<ValueType>;
 
 private:
-    ColumnVector() {}
-    ColumnVector(const size_t n) : data(n) {}
+    ColumnVector() = default;
+    explicit ColumnVector(const size_t n) : data(n) {}
     ColumnVector(const size_t n, const ValueType x) : data(n, x) {}
     ColumnVector(const ColumnVector & src) : data(src.data.begin(), src.data.end()) {}
+    ColumnVector(Container::const_iterator begin, Container::const_iterator end) : data(begin, end) { }
 
     /// Sugar constructor.
     ColumnVector(std::initializer_list<T> il) : data{il} {}
@@ -136,14 +53,33 @@ private:
 public:
     bool isNumeric() const override { return is_arithmetic_v<T>; }
 
-    size_t size() const override
+    size_t size() const final
     {
         return data.size();
     }
 
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
     void insertFrom(const IColumn & src, size_t n) override
+#else
+    void doInsertFrom(const IColumn & src, size_t n) override
+#endif
     {
         data.push_back(assert_cast<const Self &>(src).getData()[n]);
+    }
+
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
+    void insertManyFrom(const IColumn & src, size_t position, size_t length) override
+#else
+    void doInsertManyFrom(const IColumn & src, size_t position, size_t length) override
+#endif
+    {
+        ValueType v = assert_cast<const Self &>(src).getData()[position];
+        data.resize_fill(data.size() + length, v);
+    }
+
+    void insertMany(const Field & field, size_t length) override
+    {
+        data.resize_fill(data.size() + length, static_cast<T>(field.safeGet<T>()));
     }
 
     void insertData(const char * pos, size_t) override
@@ -163,18 +99,18 @@ public:
 
     void popBack(size_t n) override
     {
+        if (n > size())
+            throwCannotPopBack(n, this->getName(), size());
+
         data.resize_assume_reserved(data.size() - n);
     }
 
-    StringRef serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const override;
-
-    const char * deserializeAndInsertFromArena(const char * pos) override;
-
-    const char * skipSerializedInArena(const char * pos) const override;
+    void deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings * settings) override;
 
     void updateHashWithValue(size_t n, SipHash & hash) const override;
+    void updateHashWithValueRange(size_t begin, size_t end, SipHash & hash) const override;
 
-    void updateWeakHash32(WeakHash32 & hash) const override;
+    void computeHashInto(size_t row_begin, size_t row_end, UInt32 * hash_out, bool initial) const override;
 
     void updateHashFast(SipHash & hash) const override;
 
@@ -210,41 +146,62 @@ public:
     }
 
     /// This method implemented in header because it could be possibly devirtualized.
-    int compareAt(size_t n, size_t m, const IColumn & rhs_, int nan_direction_hint) const override
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
+    int compareAt(size_t n, size_t m, const IColumn & rhs_, int nan_direction_hint) const final
+#else
+    int doCompareAt(size_t n, size_t m, const IColumn & rhs_, int nan_direction_hint) const override
+#endif
     {
         return CompareHelper<T>::compare(data[n], assert_cast<const Self &>(rhs_).data[m], nan_direction_hint);
     }
 
+    [[nodiscard]] Int64 compareTrackAt(size_t n, size_t m, const IColumn & rhs_, int nan_direction_hint) const final;
+
+#if USE_EMBEDDED_COMPILER
+
+    bool isComparatorCompilable() const override;
+
+    llvm::Value * compileComparator(llvm::IRBuilderBase & /*builder*/, llvm::Value * /*lhs*/, llvm::Value * /*rhs*/, llvm::Value * /*nan_direction_hint*/) const override;
+
+#endif
+
     void compareColumn(const IColumn & rhs, size_t rhs_row_num,
-                       PaddedPODArray<UInt64> * row_indexes, PaddedPODArray<Int8> & compare_results,
-                       int direction, int nan_direction_hint) const override
-    {
-        return this->template doCompareColumn<Self>(assert_cast<const Self &>(rhs), rhs_row_num, row_indexes,
-                                                    compare_results, direction, nan_direction_hint);
-    }
+        PaddedPODArray<UInt64> * row_indexes, PaddedPODArray<Int8> & compare_results,
+        int direction, int nan_direction_hint) const override;
 
-    bool hasEqualValues() const override
-    {
-        return this->template hasEqualValuesImpl<Self>();
-    }
+    size_t getEqualRangeEndAssumeSorted(size_t begin, size_t end, int nan_direction_hint) const final;
 
-    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, IColumn::Permutation & res) const override;
+    void getPermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                    size_t limit, int nan_direction_hint, IColumn::Permutation & res) const override;
 
-    void updatePermutation(bool reverse, size_t limit, int nan_direction_hint, IColumn::Permutation & res, EqualRanges& equal_range) const override;
+    void updatePermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                    size_t limit, int nan_direction_hint, IColumn::Permutation & res, EqualRanges& equal_ranges) const override;
+
+    size_t estimateCardinalityInPermutedRange(const IColumn::Permutation & permutation, const EqualRange & equal_range) const override;
 
     void reserve(size_t n) override
     {
-        data.reserve(n);
+        data.reserve_exact(n);
+    }
+
+    size_t capacity() const override
+    {
+        return data.capacity();
+    }
+
+    void shrinkToFit() override
+    {
+        data.shrink_to_fit();
     }
 
     const char * getFamilyName() const override { return TypeName<T>.data(); }
-    TypeIndex getDataType() const override { return TypeId<T>; }
+    TypeIndex getDataType() const override { return TypeToTypeIndex<T>; }
 
     MutableColumnPtr cloneResized(size_t size) const override;
 
     Field operator[](size_t n) const override
     {
-        assert(n < data.size()); /// This assert is more strict than the corresponding assert inside PODArray.
+        chassert(n < data.size()); /// This assert is more strict than the corresponding assert inside PODArray.
         return data[n];
     }
 
@@ -253,6 +210,8 @@ public:
     {
         res = (*this)[n];
     }
+
+    void getValueNameImpl(WriteBufferFromOwnString & name_buf, size_t n, const IColumn::Options &) const override;
 
     UInt64 get64(size_t n) const override;
 
@@ -265,7 +224,7 @@ public:
         if constexpr (is_arithmetic_v<T>)
             return UInt64(data[n]);
         else
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot get the value of {} as UInt", TypeName<T>);
+            throwColumnConvertNotSupported(TypeName<T>, "UInt");
     }
 
     /// Out of range conversion is permitted.
@@ -274,7 +233,7 @@ public:
         if constexpr (is_arithmetic_v<T>)
             return Int64(data[n]);
         else
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot get the value of {} as Int", TypeName<T>);
+            throwColumnConvertNotSupported(TypeName<T>, "Int");
     }
 
     bool getBool(size_t n) const override
@@ -282,17 +241,25 @@ public:
         if constexpr (is_arithmetic_v<T>)
             return bool(data[n]);
         else
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot get the value of {} as bool", TypeName<T>);
+            throwColumnConvertNotSupported(TypeName<T>, "bool");
     }
 
     void insert(const Field & x) override
     {
-        data.push_back(DB::get<T>(x));
+        data.push_back(static_cast<T>(x.safeGet<T>()));
     }
 
+    bool tryInsert(const DB::Field & x) override;
+
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
     void insertRangeFrom(const IColumn & src, size_t start, size_t length) override;
+#else
+    void doInsertRangeFrom(const IColumn & src, size_t start, size_t length) override;
+#endif
 
     ColumnPtr filter(const IColumn::Filter & filt, ssize_t result_size_hint) const override;
+
+    void filter(const IColumn::Filter & filt) override;
 
     void expand(const IColumn::Filter & mask, bool inverted) override;
 
@@ -305,38 +272,65 @@ public:
 
     ColumnPtr replicate(const IColumn::Offsets & offsets) const override;
 
-    void getExtremes(Field & min, Field & max) const override;
-
-    MutableColumns scatter(IColumn::ColumnIndex num_columns, const IColumn::Selector & selector) const override
-    {
-        return this->template scatterImpl<Self>(num_columns, selector);
-    }
-
-    void gather(ColumnGathererStream & gatherer_stream) override;
+    void getExtremes(Field & min, Field & max, size_t start, size_t end) const override;
 
     bool canBeInsideNullable() const override { return true; }
     bool isFixedAndContiguous() const override { return true; }
     size_t sizeOfValueIfFixed() const override { return sizeof(T); }
+    std::span<char> insertRawUninitialized(size_t count) override;
 
-    StringRef getRawData() const override
+    std::string_view getRawData() const override
     {
-        return StringRef(reinterpret_cast<const char*>(data.data()), byteSize());
+        return {reinterpret_cast<const char*>(data.data()), byteSize()};
     }
 
-    StringRef getDataAt(size_t n) const override
+    std::string_view getDataAt(size_t n) const override
     {
-        return StringRef(reinterpret_cast<const char *>(&data[n]), sizeof(data[n]));
+        return std::string_view(reinterpret_cast<const char *>(&data[n]), sizeof(data[n]));
     }
+
+    bool isDefaultAt(size_t n) const override
+    {
+        if constexpr (is_floating_point<T>)
+        {
+            /// For floating-point types, use bit_cast to compare raw bit patterns instead of
+            /// arithmetic equality. IEEE 754 defines -0.0 == +0.0, so the arithmetic check
+            /// would incorrectly treat -0.0 as the default value, losing the sign on
+            /// deserialization. Comparing bits directly distinguishes the two: +0.0 is
+            /// all-zero bits, while -0.0 has its sign bit set.
+            ///
+            /// std::conditional_t selects an unsigned integer type of the same size as T,
+            /// satisfying the requirement of std::bit_cast that both types have equal size.
+            /// Unsigned integers are chosen because their value equals their bit pattern,
+            /// making the comparison to 0 unambiguous.
+            using Bits = std::conditional_t<sizeof(T) == 2, UInt16,
+                         std::conditional_t<sizeof(T) == 4, UInt32, UInt64>>;
+            return std::bit_cast<Bits>(data[n]) == 0;
+        }
+        else
+        {
+            return data[n] == T{};
+        }
+    }
+
+    bool hasOnlyTypeDefaults() const override;
 
     bool structureEquals(const IColumn & rhs) const override
     {
         return typeid(rhs) == typeid(ColumnVector<T>);
     }
 
-    ColumnPtr compress() const override;
+    ColumnPtr createWithOffsets(const IColumn::Offsets & offsets, const ColumnConst & column_with_default_value, size_t total_rows, size_t shift) const override;
+
+    void updateAt(const IColumn & src, size_t dst_pos, size_t src_pos) override;
+
+    ColumnPtr compress(bool force_compression) const override;
 
     /// Replace elements that match the filter with zeroes. If inverted replaces not matched elements.
     void applyZeroMap(const IColumn::Filter & filt, bool inverted = false);
+
+    void serializeAsComparable(size_t n, String & out) const override;
+    void batchSerializeAsComparable(size_t num_rows, VectorWithMemoryTracking<String> & out, const IColumn::Permutation * permutation, const UInt8 * null_map) const override;
 
     /** More efficient methods of manipulation - to manipulate with data directly. */
     Container & getData()
@@ -363,19 +357,8 @@ protected:
     Container data;
 };
 
-template <typename T>
-template <typename Type>
-ColumnPtr ColumnVector<T>::indexImpl(const PaddedPODArray<Type> & indexes, size_t limit) const
-{
-    assert(limit <= indexes.size());
-
-    auto res = this->create(limit);
-    typename Self::Container & res_data = res->getData();
-    for (size_t i = 0; i < limit; ++i)
-        res_data[i] = data[indexes[i]];
-
-    return res;
-}
+template <class TCol>
+concept is_col_vector = std::is_same_v<TCol, ColumnVector<typename TCol::ValueType>>;
 
 /// Prevent implicit template instantiation of ColumnVector for common types
 
@@ -391,8 +374,11 @@ extern template class ColumnVector<Int32>;
 extern template class ColumnVector<Int64>;
 extern template class ColumnVector<Int128>;
 extern template class ColumnVector<Int256>;
+extern template class ColumnVector<BFloat16>;
 extern template class ColumnVector<Float32>;
 extern template class ColumnVector<Float64>;
 extern template class ColumnVector<UUID>;
+extern template class ColumnVector<IPv4>;
+extern template class ColumnVector<IPv6>;
 
 }

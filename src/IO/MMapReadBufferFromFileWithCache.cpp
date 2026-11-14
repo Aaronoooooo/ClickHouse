@@ -1,4 +1,5 @@
 #include <IO/MMapReadBufferFromFileWithCache.h>
+#include <base/getPageSize.h>
 
 
 namespace DB
@@ -14,17 +15,20 @@ namespace ErrorCodes
 void MMapReadBufferFromFileWithCache::init()
 {
     size_t length = mapped->getLength();
-    BufferBase::set(mapped->getData(), length, 0);
-
     size_t page_size = static_cast<size_t>(::getPageSize());
-    ReadBuffer::padded = (length % page_size) > 0 && (length % page_size) <= (page_size - 15);
+    bool has_padding = (length % page_size) > 0 && (length % page_size) <= (page_size - (PADDING_FOR_SIMD - 1));
+    if (has_padding)
+        setAssumePadded(mapped->getData(), length, 0);
+    else
+        BufferBase::set(mapped->getData(), length, 0);
+    ReadBufferFromFileBase::file_size = length;
 }
 
 
 MMapReadBufferFromFileWithCache::MMapReadBufferFromFileWithCache(
     MMappedFileCache & cache, const std::string & file_name, size_t offset, size_t length)
 {
-    mapped = cache.getOrSet(cache.hash(file_name, offset, length), [&]
+    mapped = cache.getOrSet(MMappedFileCache::hash(file_name, offset, length), [&]
     {
         return std::make_shared<MMappedFile>(file_name, offset, length);
     });
@@ -35,7 +39,7 @@ MMapReadBufferFromFileWithCache::MMapReadBufferFromFileWithCache(
 MMapReadBufferFromFileWithCache::MMapReadBufferFromFileWithCache(
     MMappedFileCache & cache, const std::string & file_name, size_t offset)
 {
-    mapped = cache.getOrSet(cache.hash(file_name, offset, -1), [&]
+    mapped = cache.getOrSet(MMappedFileCache::hash(file_name, offset, -1), [&]
     {
         return std::make_shared<MMappedFile>(file_name, offset);
     });
@@ -56,7 +60,7 @@ off_t MMapReadBufferFromFileWithCache::getPosition()
 
 off_t MMapReadBufferFromFileWithCache::seek(off_t offset, int whence)
 {
-    off_t new_pos;
+    off_t new_pos = 0;
     if (whence == SEEK_SET)
         new_pos = offset;
     else if (whence == SEEK_CUR)
@@ -64,7 +68,7 @@ off_t MMapReadBufferFromFileWithCache::seek(off_t offset, int whence)
     else
         throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "MMapReadBufferFromFileWithCache::seek expects SEEK_SET or SEEK_CUR as whence");
 
-    working_buffer = internal_buffer;
+    setWorkingBufferFromInternal();
     if (new_pos < 0 || new_pos > off_t(working_buffer.size()))
         throw Exception(ErrorCodes::CANNOT_SEEK_THROUGH_FILE,
             "Cannot seek through file {} because seek position ({}) is out of bounds [0, {}]",

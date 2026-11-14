@@ -1,7 +1,9 @@
 #pragma once
 
+#include <Common/Exception.h>
 #include <Common/FieldVisitors.h>
 #include <Common/NaNUtils.h>
+#include <Core/AccurateComparison.h>
 #include <base/demangle.h>
 #include <type_traits>
 
@@ -12,7 +14,6 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CANNOT_CONVERT_TYPE;
-    extern const int NOT_IMPLEMENTED;
 }
 
 
@@ -23,107 +24,142 @@ class FieldVisitorConvertToNumber : public StaticVisitor<T>
 public:
     T operator() (const Null &) const
     {
-        throw Exception("Cannot convert NULL to " + demangle(typeid(T).name()), ErrorCodes::CANNOT_CONVERT_TYPE);
+        throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert NULL to {}", demangle(typeid(T).name()));
     }
 
     T operator() (const String &) const
     {
-        throw Exception("Cannot convert String to " + demangle(typeid(T).name()), ErrorCodes::CANNOT_CONVERT_TYPE);
+        throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert String to {}", demangle(typeid(T).name()));
     }
 
     T operator() (const Array &) const
     {
-        throw Exception("Cannot convert Array to " + demangle(typeid(T).name()), ErrorCodes::CANNOT_CONVERT_TYPE);
+        throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert Array to {}", demangle(typeid(T).name()));
     }
 
     T operator() (const Tuple &) const
     {
-        throw Exception("Cannot convert Tuple to " + demangle(typeid(T).name()), ErrorCodes::CANNOT_CONVERT_TYPE);
+        throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert Tuple to {}", demangle(typeid(T).name()));
     }
 
     T operator() (const Map &) const
     {
-        throw Exception("Cannot convert Map to " + demangle(typeid(T).name()), ErrorCodes::CANNOT_CONVERT_TYPE);
+        throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert Map to {}", demangle(typeid(T).name()));
+    }
+
+    T operator() (const Object &) const
+    {
+        throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert Object to {}", demangle(typeid(T).name()));
     }
 
     T operator() (const UInt64 & x) const { return T(x); }
     T operator() (const Int64 & x) const { return T(x); }
-    T operator() (const Int128 & x) const { return T(x); }
     T operator() (const UUID & x) const { return T(x.toUnderType()); }
+    T operator() (const IPv4 & x) const { return T(x.toUnderType()); }
+    T operator() (const IPv6 & x) const { return T(x.toUnderType()); }
 
     T operator() (const Float64 & x) const
     {
-        if constexpr (!std::is_floating_point_v<T>)
+        /// Converting to `bool` is a truthiness test, not a numeric cast, so no range check is done:
+        /// every non-zero value is `true`, including `NaN`, the infinities and values outside `{0, 1}`.
+        /// This is the same rule the logical functions apply to non-constant columns (`x != 0`), so
+        /// range-checking here would make `SELECT 1 OR 2.0` throw while `SELECT 1 OR materialize(2.0)`
+        /// returns `1`, see issue #71904.
+        if constexpr (std::is_same_v<T, bool>)
         {
-            if (!isFinite(x))
-            {
-                /// When converting to bool it's ok (non-zero converts to true, NaN including).
-                if (std::is_same_v<T, bool>)
-                    return true;
-
-                /// Conversion of infinite values to integer is undefined.
-                throw Exception("Cannot convert infinite value to integer type", ErrorCodes::CANNOT_CONVERT_TYPE);
-            }
-            else if (x > std::numeric_limits<T>::max() || x < std::numeric_limits<T>::lowest())
-            {
-                throw Exception("Cannot convert out of range floating point value to integer type", ErrorCodes::CANNOT_CONVERT_TYPE);
-            }
-        }
-
-        if constexpr (std::is_same_v<Decimal256, T>)
-        {
-            return Int256(x);
+            return x != 0;
         }
         else
         {
-            return T(x);
-        }
-    }
+            if constexpr (!is_floating_point<T>)
+            {
+                /// Conversion of infinite values to integer is undefined.
+                if (!isFinite(x))
+                    throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert infinite value to integer type");
 
-    T operator() (const UInt128 &) const
-    {
-        throw Exception("Cannot convert UInt128 to " + demangle(typeid(T).name()), ErrorCodes::CANNOT_CONVERT_TYPE);
+                /// Use precision-correct float-vs-integer comparison via `accurate::greaterOp` / `accurate::lessOp`.
+                /// A naive `x > Float64(numeric_limits<T>::max())` is wrong for wide integer types
+                /// (`Int64`, `UInt64`, `Int128`, `UInt128`, `Int256`, `UInt256`): when `numeric_limits<T>::max()`
+                /// has more than 53 significant bits, converting it to `Float64` rounds it UP, so the comparison
+                /// fails to reject `Float64` values equal to that rounded-up boundary, leading to undefined
+                /// behavior in the subsequent `static_cast<T>(x)` (UBSan: "value 1.84467e+19 is outside the range
+                /// of representable values of type 'unsigned long'", see issue #103817).
+                if (accurate::greaterOp(x, std::numeric_limits<T>::max())
+                    || accurate::lessOp(x, std::numeric_limits<T>::lowest()))
+                {
+                    throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert out of range floating point value to integer type");
+                }
+            }
+
+            if constexpr (std::is_same_v<Decimal256, T>)
+            {
+                return Int256(x);
+            }
+            else
+            {
+                return T(x);
+            }
+        }
     }
 
     template <typename U>
     T operator() (const DecimalField<U> & x) const
     {
-        if constexpr (std::is_floating_point_v<T>)
-            return x.getValue(). template convertTo<T>() / x.getScaleMultiplier(). template convertTo<T>();
-        else if constexpr (std::is_same_v<T, UInt128>)
-        {
-            if constexpr (sizeof(U) < 16)
-            {
-                return UInt128(0, (x.getValue() / x.getScaleMultiplier()).value);
-            }
-            else if constexpr (sizeof(U) == 16)
-            {
-                auto tmp = (x.getValue() / x.getScaleMultiplier()).value;
-                return UInt128(tmp >> 64, UInt64(tmp));
-            }
-            else
-                throw Exception("No conversion to old UInt128 from " + demangle(typeid(U).name()), ErrorCodes::NOT_IMPLEMENTED);
-        }
+        /// See the `Float64` overload: converting to `bool` asks whether the value is non-zero.
+        /// Dividing by the scale multiplier first would report `0.5` as `false`.
+        if constexpr (std::is_same_v<T, bool>)
+            return x.getValue().value != 0;
+        else if constexpr (is_floating_point<T>)
+            return x.getValue().template convertTo<T>() / x.getScaleMultiplier().template convertTo<T>();
         else
-            return (x.getValue() / x.getScaleMultiplier()). template convertTo<T>();
+            return (x.getValue() / x.getScaleMultiplier()).template convertTo<T>();
     }
 
     T operator() (const AggregateFunctionStateData &) const
     {
-        throw Exception("Cannot convert AggregateFunctionStateData to " + demangle(typeid(T).name()), ErrorCodes::CANNOT_CONVERT_TYPE);
+        throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert AggregateFunctionStateData to {}", demangle(typeid(T).name()));
     }
 
-    template <typename U, typename = std::enable_if_t<is_big_int_v<U>> >
+    T operator() (const CustomType &) const
+    {
+        throw Exception(ErrorCodes::CANNOT_CONVERT_TYPE, "Cannot convert CustomType to {}", demangle(typeid(T).name()));
+    }
+
+    T operator() (const NumberLiteral & x) const
+    {
+        /// Resolve to a concrete numeric type first: an integer literal wider than 2^53 would lose
+        /// precision if it went through Float64.
+        const Field resolved = Field(x).resolveNumberLiteral();
+        return applyVisitor(*this, resolved);
+    }
+
+    template <typename U>
+    requires is_big_int_v<U>
     T operator() (const U & x) const
     {
         if constexpr (is_decimal<T>)
             return static_cast<T>(static_cast<typename T::NativeType>(x));
-        else if constexpr (std::is_same_v<T, UInt128>)
-            throw Exception("No conversion to old UInt128 from " + demangle(typeid(U).name()), ErrorCodes::NOT_IMPLEMENTED);
         else
             return static_cast<T>(x);
     }
+
+    T operator() (const bool & x) const { return T(x); }
 };
 
-}
+extern template class FieldVisitorConvertToNumber<Int8>;
+extern template class FieldVisitorConvertToNumber<UInt8>;
+extern template class FieldVisitorConvertToNumber<Int16>;
+extern template class FieldVisitorConvertToNumber<UInt16>;
+extern template class FieldVisitorConvertToNumber<Int32>;
+extern template class FieldVisitorConvertToNumber<UInt32>;
+extern template class FieldVisitorConvertToNumber<Int64>;
+extern template class FieldVisitorConvertToNumber<UInt64>;
+extern template class FieldVisitorConvertToNumber<Int128>;
+extern template class FieldVisitorConvertToNumber<UInt128>;
+extern template class FieldVisitorConvertToNumber<Int256>;
+extern template class FieldVisitorConvertToNumber<UInt256>;
+//extern template class FieldVisitorConvertToNumber<BFloat16>;
+extern template class FieldVisitorConvertToNumber<Float32>;
+extern template class FieldVisitorConvertToNumber<Float64>;
 
+}

@@ -19,14 +19,14 @@ struct RolesOrUsersSet;
 class QuotaCache
 {
 public:
-    QuotaCache(const AccessControl & access_control_);
+    explicit QuotaCache(const AccessControl & access_control_);
     ~QuotaCache();
 
     std::shared_ptr<const EnabledQuota> getEnabledQuota(
         const UUID & user_id,
         const String & user_name,
         const boost::container::flat_set<UUID> & enabled_roles,
-        const Poco::Net::IPAddress & address,
+        const std::shared_ptr<Poco::Net::IPAddress> & address,
         const String & forwarded_address,
         const String & client_key);
 
@@ -35,6 +35,8 @@ public:
 private:
     using Interval = EnabledQuota::Interval;
     using Intervals = EnabledQuota::Intervals;
+    using SingleQuota = EnabledQuota::SingleQuota;
+    using Quotas = EnabledQuota::Quotas;
 
     struct QuotaInfo
     {
@@ -43,7 +45,7 @@ private:
 
         String calculateKey(const EnabledQuota & enabled_quota) const;
         boost::shared_ptr<const Intervals> getOrBuildIntervals(const String & key);
-        boost::shared_ptr<const Intervals> rebuildIntervals(const String & key);
+        boost::shared_ptr<const Intervals> rebuildIntervals(const String & key, std::chrono::system_clock::time_point current_time);
         void rebuildAllIntervals();
 
         QuotaPtr quota;
@@ -53,15 +55,18 @@ private:
     };
 
     void ensureAllQuotasRead();
-    void quotaAddedOrChanged(const UUID & quota_id, const std::shared_ptr<const Quota> & new_quota);
-    void quotaRemoved(const UUID & quota_id);
-    void chooseQuotaToConsume();
-    void chooseQuotaToConsumeFor(EnabledQuota & enabled_quota);
+    void quotaAddedOrChanged(const UUID & quota_id, const std::shared_ptr<const Quota> & new_quota) TSA_REQUIRES(mutex);
+    void quotaRemoved(const UUID & quota_id) TSA_REQUIRES(mutex);
+    void chooseQuotaToConsumeIfNeeded() TSA_REQUIRES(mutex);
+    void chooseQuotaToConsume() TSA_REQUIRES(mutex);
+    void chooseQuotaToConsumeFor(EnabledQuota & enabled_quota) TSA_REQUIRES(mutex);
 
     const AccessControl & access_control;
     mutable std::mutex mutex;
     std::unordered_map<UUID /* quota id */, QuotaInfo> all_quotas;
     bool all_quotas_read = false;
+    /// Set while applying a batch of changes; the rebuild is coalesced to once per notification batch.
+    bool need_choose_quota TSA_GUARDED_BY(mutex) = false;
     scope_guard subscription;
     std::map<EnabledQuota::Params, std::weak_ptr<EnabledQuota>> enabled_quotas;
 };

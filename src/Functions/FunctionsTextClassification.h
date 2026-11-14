@@ -1,0 +1,69 @@
+#pragma once
+
+#include <Columns/ColumnString.h>
+#include <Core/Settings.h>
+#include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
+#include <Functions/FunctionFactory.h>
+#include <Interpreters/Context.h>
+
+namespace DB
+{
+namespace Setting
+{
+    extern const SettingsBool allow_experimental_nlp_functions;
+}
+
+/// Functions for text classification
+
+namespace ErrorCodes
+{
+extern const int ILLEGAL_COLUMN;
+extern const int SUPPORT_IS_DISABLED;
+}
+
+template <typename Impl, typename Name>
+class FunctionTextClassificationString final : public IFunction
+{
+public:
+    static constexpr auto name = Name::name;
+
+    static FunctionPtr create(ContextPtr context)
+    {
+        if (!context->getSettingsRef()[Setting::allow_experimental_nlp_functions])
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                            "Natural language processing function '{}' is experimental. "
+                            "Set `allow_experimental_nlp_functions` setting to enable it", name);
+
+        return std::make_shared<FunctionTextClassificationString>();
+    }
+
+    String getName() const override { return name; }
+
+    size_t getNumberOfArguments() const override { return 1; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
+    bool useDefaultImplementationForConstants() const override { return true; }
+
+    String getSignatureString() const override
+    {
+        return "(String) -> String";
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & /*result_type*/, size_t input_rows_count) const override
+    {
+        const ColumnPtr & column = arguments[0].column;
+        const ColumnString * col = checkAndGetColumn<ColumnString>(column.get());
+
+        if (!col)
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}",
+                arguments[0].column->getName(), getName());
+
+        auto col_res = ColumnString::create();
+        Impl::vector(col->getChars(), col->getOffsets(), col_res->getChars(), col_res->getOffsets(), input_rows_count);
+        return col_res;
+    }
+};
+
+}

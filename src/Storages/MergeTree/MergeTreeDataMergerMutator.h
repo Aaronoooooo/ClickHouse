@@ -1,37 +1,30 @@
 #pragma once
 
-#include <atomic>
-#include <mutex>
-#include <functional>
+#include <Storages/MergeTree/Compaction/MergeSelectorApplier.h>
+#include <Storages/MergeTree/Compaction/MergeSelectors/TTLMergeSelector.h>
+#include <Storages/MergeTree/Compaction/PartProperties.h>
+#include <Storages/MergeTree/Compaction/PartsCollectors/IPartsCollector.h>
+#include <Storages/MergeTree/Compaction/MergePredicates/IMergePredicate.h>
 
-#include <Common/ActionBlocker.h>
-#include <Storages/MergeTree/MergeTreeData.h>
-#include <Storages/MutationCommands.h>
-#include <Storages/MergeTree/TTLMergeSelector.h>
-#include <Storages/MergeTree/MergeAlgorithm.h>
-#include <Storages/MergeTree/MergeType.h>
 #include <Storages/MergeTree/MergeTask.h>
 #include <Storages/MergeTree/MutateTask.h>
-#include <Storages/MergeTree/IMergedBlockOutputStream.h>
 
+#include <expected>
+#include <optional>
 
 namespace DB
 {
 
-class MergeProgressCallback;
-
-enum class SelectPartsDecision
+struct SelectMergeFailure
 {
-    SELECTED = 0,
-    CANNOT_SELECT = 1,
-    NOTHING_TO_MERGE = 2,
-};
+    enum class Reason : uint8_t
+    {
+        CANNOT_SELECT = 0,
+        NOTHING_TO_MERGE = 1,
+    };
 
-enum class ExecuteTTLType
-{
-    NONE = 0,
-    NORMAL = 1,
-    RECALCULATE= 2,
+    Reason reason = Reason::CANNOT_SELECT;
+    PreformattedMessage explanation = {};
 };
 
 /** Can select parts for background processes and do them.
@@ -39,25 +32,24 @@ enum class ExecuteTTLType
  */
 class MergeTreeDataMergerMutator
 {
+    void updateTTLMergeTimes(const MergeSelectorChoices & choices, const MergeTreeSettingsPtr & settings, time_t current_time);
+
 public:
-    using AllowedMergingPredicate = std::function<bool (const MergeTreeData::DataPartPtr &, const MergeTreeData::DataPartPtr &, String *)>;
+    /// Undo the due time that `updateTTLMergeTimes` advanced for a TTL merge that was selected but
+    /// discarded before it could run (`StorageMergeTree::merge` does that when no executor slot is
+    /// free). Only restores the due time if it is still exactly the value that selection installed,
+    /// so an advance made by a later selection is never overwritten.
+    void rollbackTTLMergeTime(const String & partition_id, MergeType merge_type);
 
-    MergeTreeDataMergerMutator(MergeTreeData & data_, size_t max_tasks_count_);
+    explicit MergeTreeDataMergerMutator(MergeTreeData & data_);
 
-    /** Get maximum total size of parts to do merge, at current moment of time.
-      * It depends on number of free threads in background_pool and amount of free space in disk.
+    /** Useful to quickly get a list of partitions that contain parts that we may want to merge.
+      * Used to reduce ZooKeeper requests during merge predicate construction for RMT.
       */
-    UInt64 getMaxSourcePartsSizeForMerge() const;
-
-    /** For explicitly passed size of pool and number of used tasks.
-      * This method could be used to calculate threshold depending on number of tasks in replication queue.
-      */
-    UInt64 getMaxSourcePartsSizeForMerge(size_t max_count, size_t scheduled_tasks_count) const;
-
-    /** Get maximum total size of parts to do mutation, at current moment of time.
-      * It depends only on amount of free space in disk.
-      */
-    UInt64 getMaxSourcePartSizeForMutation() const;
+    PartitionIdsHint getPartitionsThatMayBeMerged(
+        const PartsCollectorPtr & parts_collector,
+        const MergePredicatePtr & merge_predicate,
+        const MergeSelectorApplier & selector) const;
 
     /** Selects which parts to merge. Uses a lot of heuristics.
       *
@@ -66,28 +58,24 @@ public:
       *  - Parts between which another part can still appear can not be merged. Refer to METR-7001.
       *  - A part that already merges with something in one place, you can not start to merge into something else in another place.
       */
-    SelectPartsDecision selectPartsToMerge(
-        FutureMergedMutatedPartPtr future_part,
-        bool aggressive,
-        size_t max_total_size_to_merge,
-        const AllowedMergingPredicate & can_merge,
-        bool merge_with_ttl_allowed,
-        String * out_disable_reason = nullptr);
+    std::expected<MergeSelectorChoices, SelectMergeFailure> selectPartsToMerge(
+        const PartsCollectorPtr & parts_collector,
+        const MergePredicatePtr & merge_predicate,
+        const MergeSelectorApplier & selector,
+        const std::optional<PartitionIdsHint> & partitions_hint);
 
     /** Select all the parts in the specified partition for merge, if possible.
       * final - choose to merge even a single part - that is, allow to merge one part "with itself",
       * but if setting optimize_skip_merged_partitions is true than single part with level > 0
       * and without expired TTL won't be merged with itself.
       */
-    SelectPartsDecision selectAllPartsToMergeWithinPartition(
-        FutureMergedMutatedPartPtr future_part,
-        UInt64 & available_disk_space,
-        const AllowedMergingPredicate & can_merge,
+    std::expected<MergeSelectorChoices, SelectMergeFailure> selectAllPartsToMergeWithinPartition(
+        const StorageMetadataPtr & metadata_snapshot,
+        const PartsCollectorPtr & parts_collector,
+        const MergePredicatePtr & merge_predicate,
         const String & partition_id,
         bool final,
-        const StorageMetadataPtr & metadata_snapshot,
-        String * out_disable_reason = nullptr,
-        bool optimize_skip_merged_partitions = false);
+        bool optimize_skip_merged_partitions);
 
     /** Creates a task to merge parts.
       * If `reservation != nullptr`, now and then reduces the size of the reserved space
@@ -98,121 +86,109 @@ public:
       */
     MergeTaskPtr mergePartsToTemporaryPart(
         FutureMergedMutatedPartPtr future_part,
-        const StorageMetadataPtr & metadata_snapshot,
+        StorageMetadataPtr metadata_snapshot,
         MergeListEntry * merge_entry,
         std::unique_ptr<MergeListElement> projection_merge_list_element,
-        TableLockHolder table_lock_holder,
+        TableLockHolder & table_lock_holder,
         time_t time_of_merge,
         ContextPtr context,
         ReservationSharedPtr space_reservation,
         bool deduplicate,
         const Names & deduplicate_by_columns,
-        const MergeTreeData::MergingParams & merging_params,
-        const IMergeTreeDataPart * parent_part = nullptr,
+        bool cleanup,
+        MergeTreeData::MergingParams merging_params,
+        MergeTreeTransactionPtr txn,
+        ProjectionDescriptionRawPtr projection = nullptr,
+        IMergeTreeDataPart * parent_part = nullptr,
         const String & suffix = "");
 
-    /// Mutate a single data part with the specified commands. Will create and return a temporary part.
+    /** Mutate a single data part with the specified commands. Will create and return a temporary part.
+      */
     MutateTaskPtr mutatePartToTemporaryPart(
         FutureMergedMutatedPartPtr future_part,
         StorageMetadataPtr metadata_snapshot,
         MutationCommandsConstPtr commands,
         MergeListEntry * merge_entry,
         time_t time_of_mutation,
-        ContextPtr context,
+        ContextMutablePtr context,
+        const MergeTreeTransactionPtr & txn,
         ReservationSharedPtr space_reservation,
         TableLockHolder & table_lock_holder);
 
     MergeTreeData::DataPartPtr renameMergedTemporaryPart(
         MergeTreeData::MutableDataPartPtr & new_data_part,
         const MergeTreeData::DataPartsVector & parts,
-        MergeTreeData::Transaction * out_transaction = nullptr);
+        const MergeTreeTransactionPtr & txn,
+        MergeTreeData::Transaction & out_transaction);
 
-
-    /// The approximate amount of disk space needed for merge or mutation. With a surplus.
-    static size_t estimateNeededDiskSpace(const MergeTreeData::DataPartsVector & source_parts);
-
-private:
-    /** Select all parts belonging to the same partition.
-      */
-    MergeTreeData::DataPartsVector selectAllPartsFromPartition(const String & partition_id);
-
-    friend class MutateTask;
-    friend class MergeTask;
-
-    /** Split mutation commands into two parts:
-      * First part should be executed by mutations interpreter.
-      * Other is just simple drop/renames, so they can be executed without interpreter.
-      */
-    static void splitMutationCommands(
-        MergeTreeData::DataPartPtr part,
-        const MutationCommands & commands,
-        MutationCommands & for_interpreter,
-        MutationCommands & for_file_renames);
-
-    /// Get the columns list of the resulting part in the same order as storage_columns.
-    static NamesAndTypesList getColumnsForNewDataPart(
-        MergeTreeData::DataPartPtr source_part,
-        const Block & updated_header,
-        NamesAndTypesList storage_columns,
-        const MutationCommands & commands_for_removes);
-
-    static ExecuteTTLType shouldExecuteTTL(
-        const StorageMetadataPtr & metadata_snapshot, const ColumnDependencies & dependencies);
-
-public :
     /** Is used to cancel all merges and mutations. On cancel() call all currently running actions will throw exception soon.
       * All new attempts to start a merge or mutation will throw an exception until all 'LockHolder' objects will be destroyed.
       */
-    ActionBlocker merges_blocker;
+    PartitionActionBlocker merges_blocker;
     ActionBlocker ttl_merges_blocker;
 
 private:
-
-    MergeAlgorithm chooseMergeAlgorithm(
-        const MergeTreeData::DataPartsVector & parts,
-        size_t rows_upper_bound,
-        const NamesAndTypesList & gathering_columns,
-        bool deduplicate,
-        bool need_remove_expired_values,
-        const MergeTreeData::MergingParams & merging_params) const;
-
-private:
     MergeTreeData & data;
-    const size_t max_tasks_count;
 
-    Poco::Logger * log;
-
-    /// When the last time you wrote to the log that the disk space was running out (not to write about this too often).
-    time_t disk_space_warning_time = 0;
+    LoggerPtr log;
 
     /// Stores the next TTL delete merge due time for each partition (used only by TTLDeleteMergeSelector)
-    ITTLMergeSelector::PartitionIdToTTLs next_delete_ttl_merge_times_by_partition;
+    PartitionIdToTTLs next_delete_ttl_merge_times_by_partition;
 
     /// Stores the next TTL recompress merge due time for each partition (used only by TTLRecompressionMergeSelector)
-    ITTLMergeSelector::PartitionIdToTTLs next_recompress_ttl_merge_times_by_partition;
+    PartitionIdToTTLs next_recompress_ttl_merge_times_by_partition;
+
+    /// The due time advance of the last TTL merge selection of a partition, kept so that a
+    /// discarded selection can be undone. See `rollbackTTLMergeTime`.
+    struct TTLMergeTimeAdvance
+    {
+        time_t installed = 0;
+        std::optional<time_t> previous;
+    };
+    std::unordered_map<String, TTLMergeTimeAdvance> last_delete_ttl_merge_time_advance;
+    std::unordered_map<String, TTLMergeTimeAdvance> last_recompress_ttl_merge_time_advance;
     /// Performing TTL merges independently for each partition guarantees that
     /// there is only a limited number of TTL merges and no partition stores data, that is too stale
-
-public:
-    /// Returns true if passed part name is active.
-    /// (is the destination for one of active mutation/merge).
-    ///
-    /// NOTE: that it accept basename (i.e. dirname), not the path,
-    /// since later requires canonical form.
-    bool hasTemporaryPart(const std::string & basename) const;
-
-private:
-    /// Set of active temporary paths that is used as the destination.
-    /// List of such paths is required to avoid trying to remove them during cleanup.
-    ///
-    /// NOTE: It is pretty short, so use STL is fine.
-    std::unordered_set<std::string> tmp_parts;
-    /// Lock for "tmp_parts".
-    ///
-    /// NOTE: mutable is required to mark hasTemporaryPath() const
-    mutable std::mutex tmp_parts_lock;
-
 };
 
+std::string convertMergeConstraintsToString(const MergeConstraints & constraints);
+
+std::expected<void, PreformattedMessage> canMergeAllParts(const PartsRange & range, const MergePredicatePtr & merge_predicate);
+std::unordered_map<String, PartitionStatistics> calculateStatisticsForPartitions(const PartsRanges & ranges);
+
+String getBestPartitionToOptimizeEntire(
+    size_t max_total_size_to_merge,
+    const ContextPtr & context,
+    const MergeTreeSettingsPtr & settings,
+    const std::unordered_map<String, PartitionStatistics> & stats,
+    const LoggerPtr & log);
+
+PartsRanges grabAllPossibleRanges(
+    const PartsCollectorPtr & parts_collector,
+    const StorageMetadataPtr & metadata_snapshot,
+    const StoragePolicyPtr & storage_policy,
+    const time_t & current_time,
+    const std::optional<PartitionIdsHint> & partitions_hint,
+    LogSeriesLimiter & series_log);
+
+MergeSelectorChoices chooseMergesFrom(
+    const MergeSelectorApplier & selector,
+    const IMergePredicate & predicate,
+    const PartsRanges & ranges,
+    const PartitionsStatistics & partitions_stats,
+    const StorageMetadataPtr & metadata_snapshot,
+    const MergeTreeSettingsPtr & data_settings,
+    const PartitionIdToTTLs & next_delete_times,
+    const PartitionIdToTTLs & next_recompress_times,
+    bool can_use_ttl_merges,
+    time_t current_time,
+    const LoggerPtr & log);
+
+std::expected<PartsRange, PreformattedMessage> grabAllPartsInsidePartition(
+    const PartsCollectorPtr & parts_collector,
+    const StorageMetadataPtr & metadata_snapshot,
+    const StoragePolicyPtr & storage_policy,
+    const time_t & current_time,
+    const std::string & partition_id);
 
 }

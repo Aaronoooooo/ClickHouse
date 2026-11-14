@@ -2,6 +2,8 @@
 
 #include <Common/FieldVisitors.h>
 
+#include <cstddef>
+
 namespace DB
 {
 
@@ -16,17 +18,24 @@ public:
     void operator() (const Int128 & x, WriteBuffer & buf) const;
     void operator() (const Int256 & x, WriteBuffer & buf) const;
     void operator() (const UUID & x, WriteBuffer & buf) const;
+    void operator() (const IPv4 & x, WriteBuffer & buf) const;
+    void operator() (const IPv6 & x, WriteBuffer & buf) const;
     void operator() (const Float64 & x, WriteBuffer & buf) const;
     void operator() (const String & x, WriteBuffer & buf) const;
     void operator() (const Array & x, WriteBuffer & buf) const;
     void operator() (const Tuple & x, WriteBuffer & buf) const;
     void operator() (const Map & x, WriteBuffer & buf) const;
+    void operator() (const Object & x, WriteBuffer & buf) const;
     void operator() (const DecimalField<Decimal32> & x, WriteBuffer & buf) const;
     void operator() (const DecimalField<Decimal64> & x, WriteBuffer & buf) const;
     void operator() (const DecimalField<Decimal128> & x, WriteBuffer & buf) const;
     void operator() (const DecimalField<Decimal256> & x, WriteBuffer & buf) const;
     void operator() (const AggregateFunctionStateData & x, WriteBuffer & buf) const;
+    void operator() (const CustomType & x, WriteBuffer & buf) const;
+    void operator() (const NumberLiteral & x, WriteBuffer & buf) const;
+    void operator() (const bool & x, WriteBuffer & buf) const;
 };
 
-}
+size_t getFieldBinarySize(const Field & x);
 
+}

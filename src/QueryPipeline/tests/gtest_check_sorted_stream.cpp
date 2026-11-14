@@ -29,7 +29,7 @@ static Block getSortedBlockWithSize(
 {
     ColumnsWithTypeAndName cols;
     size_t size_of_row_in_bytes = columns.size() * sizeof(UInt64);
-    for (size_t i = 0; i * sizeof(UInt64) < size_of_row_in_bytes; i++)
+    for (size_t i = 0; i * sizeof(UInt64) < size_of_row_in_bytes; ++i)
     {
         auto column = ColumnUInt64::create(rows, 0);
         for (size_t j = 0; j < rows; ++j)
@@ -47,7 +47,7 @@ static Block getUnSortedBlockWithSize(const std::vector<std::string> & columns, 
 {
     ColumnsWithTypeAndName cols;
     size_t size_of_row_in_bytes = columns.size() * sizeof(UInt64);
-    for (size_t i = 0; i * sizeof(UInt64) < size_of_row_in_bytes; i++)
+    for (size_t i = 0; i * sizeof(UInt64) < size_of_row_in_bytes; ++i)
     {
         auto column = ColumnUInt64::create(rows, 0);
         for (size_t j = 0; j < rows; ++j)
@@ -71,7 +71,7 @@ static Block getEqualValuesBlockWithSize(
 {
     ColumnsWithTypeAndName cols;
     size_t size_of_row_in_bytes = columns.size() * sizeof(UInt64);
-    for (size_t i = 0; i * sizeof(UInt64) < size_of_row_in_bytes; i++)
+    for (size_t i = 0; i * sizeof(UInt64) < size_of_row_in_bytes; ++i)
     {
         auto column = ColumnUInt64::create(rows, 0);
         for (size_t j = 0; j < rows; ++j)
@@ -83,7 +83,7 @@ static Block getEqualValuesBlockWithSize(
 }
 
 
-TEST(CheckSortedBlockInputStream, CheckGoodCase)
+TEST(CheckSortedTransform, CheckGoodCase)
 {
     std::vector<std::string> key_columns{"K1", "K2", "K3"};
     auto sort_description = getSortDescription(key_columns);
@@ -93,7 +93,7 @@ TEST(CheckSortedBlockInputStream, CheckGoodCase)
         blocks.push_back(getSortedBlockWithSize(key_columns, 10, 1, i * 10));
 
     Pipe pipe(std::make_shared<BlocksListSource>(std::move(blocks)));
-    pipe.addSimpleTransform([&](const Block & header)
+    pipe.addSimpleTransform([&](const SharedHeader & header)
     {
         return std::make_shared<CheckSortedTransform>(header, sort_description);
     });
@@ -109,7 +109,7 @@ TEST(CheckSortedBlockInputStream, CheckGoodCase)
     EXPECT_FALSE(executor.pull(chunk));
 }
 
-TEST(CheckSortedBlockInputStream, CheckBadLastRow)
+TEST(CheckSortedTransform, CheckBadLastRow)
 {
     std::vector<std::string> key_columns{"K1", "K2", "K3"};
     auto sort_description = getSortDescription(key_columns);
@@ -120,7 +120,7 @@ TEST(CheckSortedBlockInputStream, CheckBadLastRow)
     blocks.push_back(getSortedBlockWithSize(key_columns, 100, 1, 300));
 
     Pipe pipe(std::make_shared<BlocksListSource>(std::move(blocks)));
-    pipe.addSimpleTransform([&](const Block & header)
+    pipe.addSimpleTransform([&](const SharedHeader & header)
     {
         return std::make_shared<CheckSortedTransform>(header, sort_description);
     });
@@ -132,11 +132,14 @@ TEST(CheckSortedBlockInputStream, CheckBadLastRow)
     Chunk chunk;
     EXPECT_NO_THROW(executor.pull(chunk));
     EXPECT_NO_THROW(executor.pull(chunk));
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
     EXPECT_THROW(executor.pull(chunk), DB::Exception);
+#endif
 }
 
 
-TEST(CheckSortedBlockInputStream, CheckUnsortedBlock1)
+TEST(CheckSortedTransform, CheckUnsortedBlock1)
 {
     std::vector<std::string> key_columns{"K1", "K2", "K3"};
     auto sort_description = getSortDescription(key_columns);
@@ -144,7 +147,7 @@ TEST(CheckSortedBlockInputStream, CheckUnsortedBlock1)
     blocks.push_back(getUnSortedBlockWithSize(key_columns, 100, 1, 0, 5, 1, 77));
 
     Pipe pipe(std::make_shared<BlocksListSource>(std::move(blocks)));
-    pipe.addSimpleTransform([&](const Block & header)
+    pipe.addSimpleTransform([&](const SharedHeader & header)
     {
         return std::make_shared<CheckSortedTransform>(header, sort_description);
     });
@@ -154,10 +157,13 @@ TEST(CheckSortedBlockInputStream, CheckUnsortedBlock1)
     PullingPipelineExecutor executor(pipeline);
 
     Chunk chunk;
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
     EXPECT_THROW(executor.pull(chunk), DB::Exception);
+#endif
 }
 
-TEST(CheckSortedBlockInputStream, CheckUnsortedBlock2)
+TEST(CheckSortedTransform, CheckUnsortedBlock2)
 {
     std::vector<std::string> key_columns{"K1", "K2", "K3"};
     auto sort_description = getSortDescription(key_columns);
@@ -165,7 +171,7 @@ TEST(CheckSortedBlockInputStream, CheckUnsortedBlock2)
     blocks.push_back(getUnSortedBlockWithSize(key_columns, 100, 1, 0, 99, 2, 77));
 
     Pipe pipe(std::make_shared<BlocksListSource>(std::move(blocks)));
-    pipe.addSimpleTransform([&](const Block & header)
+    pipe.addSimpleTransform([&](const SharedHeader & header)
     {
         return std::make_shared<CheckSortedTransform>(header, sort_description);
     });
@@ -175,10 +181,12 @@ TEST(CheckSortedBlockInputStream, CheckUnsortedBlock2)
     PullingPipelineExecutor executor(pipeline);
 
     Chunk chunk;
+#ifndef DEBUG_OR_SANITIZER_BUILD
     EXPECT_THROW(executor.pull(chunk), DB::Exception);
+#endif
 }
 
-TEST(CheckSortedBlockInputStream, CheckUnsortedBlock3)
+TEST(CheckSortedTransform, CheckUnsortedBlock3)
 {
     std::vector<std::string> key_columns{"K1", "K2", "K3"};
     auto sort_description = getSortDescription(key_columns);
@@ -186,7 +194,7 @@ TEST(CheckSortedBlockInputStream, CheckUnsortedBlock3)
     blocks.push_back(getUnSortedBlockWithSize(key_columns, 100, 1, 0, 50, 0, 77));
 
     Pipe pipe(std::make_shared<BlocksListSource>(std::move(blocks)));
-    pipe.addSimpleTransform([&](const Block & header)
+    pipe.addSimpleTransform([&](const SharedHeader & header)
     {
         return std::make_shared<CheckSortedTransform>(header, sort_description);
     });
@@ -196,10 +204,12 @@ TEST(CheckSortedBlockInputStream, CheckUnsortedBlock3)
     PullingPipelineExecutor executor(pipeline);
 
     Chunk chunk;
+#ifndef DEBUG_OR_SANITIZER_BUILD
     EXPECT_THROW(executor.pull(chunk), DB::Exception);
+#endif
 }
 
-TEST(CheckSortedBlockInputStream, CheckEqualBlock)
+TEST(CheckSortedTransform, CheckEqualBlock)
 {
     std::vector<std::string> key_columns{"K1", "K2", "K3"};
     auto sort_description = getSortDescription(key_columns);
@@ -209,7 +219,7 @@ TEST(CheckSortedBlockInputStream, CheckEqualBlock)
     blocks.push_back(getEqualValuesBlockWithSize(key_columns, 1));
 
     Pipe pipe(std::make_shared<BlocksListSource>(std::move(blocks)));
-    pipe.addSimpleTransform([&](const Block & header)
+    pipe.addSimpleTransform([&](const SharedHeader & header)
     {
         return std::make_shared<CheckSortedTransform>(header, sort_description);
     });

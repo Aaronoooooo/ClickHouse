@@ -7,31 +7,53 @@ DIR=
 
 if [ "${OS}" = "Linux" ]
 then
-    if [ "${ARCH}" = "x86_64" ]
+    if [ "${ARCH}" = "x86_64" -o "${ARCH}" = "amd64" ]
     then
-        DIR="amd64"
-    elif [ "${ARCH}" = "aarch64" ]
+        # The default build targets x86-64-v3 which requires AVX2, BMI1, BMI2, FMA, etc.
+        # On older hardware, fall back to the compat build (plain x86-64, SSE2 baseline).
+        # Check avx2 as a proxy, since every real CPU with AVX2 also has the other v3 features.
+        if grep -q avx2 /proc/cpuinfo
+        then
+            if ldd --version 2>&1 | grep -q musl
+            then
+                DIR="amd64musl"
+            else
+                DIR="amd64"
+            fi
+        else
+            DIR="amd64compat"
+        fi
+    elif [ "${ARCH}" = "aarch64" -o "${ARCH}" = "arm64" ]
     then
-        DIR="aarch64"
-    elif [ "${ARCH}" = "powerpc64le" ]
+        # Dispatch between standard and compatibility builds, see cmake/cpu_features.cmake for details. Unfortunately, (1) the ARM ISA level
+        # cannot be read directly, we need to guess from the "features" in /proc/cpuinfo, and (2) the flags in /proc/cpuinfo are named
+        # differently than the flags passed to the compiler in cpu_features.cmake.
+        HAS_ARMV82=$(grep -m 1 'Features' /proc/cpuinfo | awk '/asimd/ && /sha1/ && /aes/ && /atomics/ && /lrcpc/')
+        if [ "${HAS_ARMV82}" ]
+        then
+            DIR="aarch64"
+        else
+            DIR="aarch64v80compat"
+        fi
+    elif [ "${ARCH}" = "powerpc64le" -o "${ARCH}" = "ppc64le" ]
     then
         DIR="powerpc64le"
+    elif [ "${ARCH}" = "riscv64" ]
+    then
+        DIR="riscv64"
+    elif [ "${ARCH}" = "s390x" ]
+    then
+        DIR="s390x"
     fi
 elif [ "${OS}" = "FreeBSD" ]
 then
-    if [ "${ARCH}" = "x86_64" ]
+    if [ "${ARCH}" = "x86_64" -o "${ARCH}" = "amd64" ]
     then
         DIR="freebsd"
-    elif [ "${ARCH}" = "aarch64" ]
-    then
-        DIR="freebsd-aarch64"
-    elif [ "${ARCH}" = "powerpc64le" ]
-    then
-        DIR="freebsd-powerpc64le"
     fi
 elif [ "${OS}" = "Darwin" ]
 then
-    if [ "${ARCH}" = "x86_64" ]
+    if [ "${ARCH}" = "x86_64" -o "${ARCH}" = "amd64" ]
     then
         DIR="macos"
     elif [ "${ARCH}" = "aarch64" -o "${ARCH}" = "arm64" ]
@@ -42,22 +64,127 @@ fi
 
 if [ -z "${DIR}" ]
 then
-    echo "The '${OS}' operating system with the '${ARCH}' architecture is not supported."
+    echo "Operating system '${OS}' / architecture '${ARCH}' is unsupported."
     exit 1
 fi
 
-URL="https://builds.clickhouse.com/master/${DIR}/clickhouse"
+clickhouse_download_filename_prefix="clickhouse"
+clickhouse="$clickhouse_download_filename_prefix"
+
+# If something already exists at this path, pick a non-clashing name (clickhouse.0, clickhouse.1, ...).
+# Do not prompt interactively here: this script is commonly run as `curl https://clickhouse.com/ | sh`,
+# where the script itself is delivered on stdin. A `read` would consume bytes from that same pipe,
+# desyncing the shell parser and producing spurious syntax errors.
+# Use `-e` together with `-L` so that directories and broken symlinks are also treated as occupied
+# (a dangling symlink is invisible to `-e` alone, and `curl -o` would then fail on it).
+i=0
+while [ -e "$clickhouse" ] || [ -L "$clickhouse" ]
+do
+    clickhouse="${clickhouse_download_filename_prefix}.${i}"
+    i=$(($i+1))
+done
+
+# The `master` build by default. `CLICKHOUSE_BRANCH=latest` selects the newest release branch,
+# any other value names a folder on builds.clickhouse.com, such as `26.10`.
+CLICKHOUSE_BRANCH="${CLICKHOUSE_BRANCH:-master}"
+if [ "${CLICKHOUSE_BRANCH}" = "latest" ]
+then
+    CLICKHOUSE_BRANCH=$(curl -fsSL https://clickhouse.com/data/version_date.tsv | sed -n 's/^v\([0-9]*\.[0-9]*\)\..*/\1/p' | sort -uV | tail -n 1)
+    [ -n "${CLICKHOUSE_BRANCH}" ] || { echo "Cannot find the latest release branch in version_date.tsv."; exit 1; }
+fi
+
+URL="https://builds.clickhouse.com/${CLICKHOUSE_BRANCH}/${DIR}/clickhouse"
 echo
-echo "Will download ${URL}"
+echo "Will download ${URL} into ${clickhouse}"
 echo
-curl -O "${URL}" && chmod a+x clickhouse || exit 1
+curl "${URL}" -o "${clickhouse}" && chmod a+x "${clickhouse}" || exit 1
+
+# Highlight the commands with increased intensity when the output is a terminal,
+# in the same style as `clickhouse install` does.
+if [ -t 1 ]
+then
+    HILITE="$(printf '\033[1m')"
+    END_HILITE="$(printf '\033[0m')"
+else
+    HILITE=""
+    END_HILITE=""
+fi
+
 echo
 echo "Successfully downloaded the ClickHouse binary, you can run it as:
-    ./clickhouse"
+    ${HILITE}./${clickhouse}${END_HILITE}"
 
-if [ "${OS}" = "Linux" ]
+echo
+echo "You can also install it:
+${HILITE}sudo ./${clickhouse} install${END_HILITE}"
+
+# Also install clickhousectl, the CLI for ClickHouse local and Cloud.
+# Set CLICKHOUSE_ONLY=1 to skip.
+if [ -z "${CLICKHOUSE_ONLY}" ]
 then
-    echo
-    echo "You can also install it:
-    sudo ./clickhouse install"
+    chctl_target=
+    if [ "${OS}" = "Linux" ]
+    then
+        if [ "${ARCH}" = "x86_64" -o "${ARCH}" = "amd64" ]
+        then
+            chctl_target="x86_64-unknown-linux-musl"
+        elif [ "${ARCH}" = "aarch64" -o "${ARCH}" = "arm64" ]
+        then
+            chctl_target="aarch64-unknown-linux-musl"
+        fi
+    elif [ "${OS}" = "Darwin" ]
+    then
+        if [ "${ARCH}" = "x86_64" -o "${ARCH}" = "amd64" ]
+        then
+            chctl_target="x86_64-apple-darwin"
+        elif [ "${ARCH}" = "aarch64" -o "${ARCH}" = "arm64" ]
+        then
+            chctl_target="aarch64-apple-darwin"
+        fi
+    fi
+
+    if [ -n "${chctl_target}" ]
+    then
+        echo
+        echo "Fetching the latest clickhousectl release..."
+        chctl_tag=$(curl -fsSL "https://api.github.com/repos/ClickHouse/clickhousectl/releases/latest" \
+            | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+
+        if [ -n "${chctl_tag}" ]
+        then
+            chctl_install_dir="${HOME}/.local/bin"
+            chctl_archive="clickhousectl-${chctl_target}-${chctl_tag}.tar.gz"
+            chctl_url="https://builds.clickhouse.com/clickhousectl/${chctl_archive}"
+            echo "Will download ${chctl_url} into ${chctl_install_dir}/clickhousectl"
+            chctl_tmp=$(mktemp -d)
+            if mkdir -p "${chctl_install_dir}" \
+                && curl -fsSL "${chctl_url}" -o "${chctl_tmp}/${chctl_archive}" \
+                && tar -xzf "${chctl_tmp}/${chctl_archive}" -C "${chctl_tmp}" \
+                && mv -f "${chctl_tmp}/clickhousectl-${chctl_target}-${chctl_tag}/clickhousectl" "${chctl_install_dir}/clickhousectl"
+            then
+                chmod a+x "${chctl_install_dir}/clickhousectl"
+                ln -sf "${chctl_install_dir}/clickhousectl" "${chctl_install_dir}/chctl"
+                echo
+                echo "Successfully installed clickhousectl to ${chctl_install_dir}/clickhousectl"
+                echo "Created alias: chctl -> clickhousectl"
+                case ":$PATH:" in
+                    *":${chctl_install_dir}:"*) ;;
+                    *)
+                        echo
+                        echo "NOTE: ${chctl_install_dir} is not in your PATH."
+                        echo "Add it by running:"
+                        echo
+                        echo "  export PATH=\"${chctl_install_dir}:\$PATH\""
+                        echo
+                        echo "You may want to add that line to your shell profile (~/.bashrc, ~/.zshrc, etc.)"
+                        ;;
+                esac
+            else
+                echo "Warning: failed to download clickhousectl. Continuing."
+            fi
+            rm -rf "${chctl_tmp}"
+        else
+            echo "Warning: could not determine the latest clickhousectl release. Continuing."
+        fi
+    fi
 fi

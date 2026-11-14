@@ -4,10 +4,22 @@
 
 #include <Interpreters/Set.h>
 #include <Interpreters/IJoin.h>
+#include <Interpreters/Context.h>
 #include <Storages/IStorage.h>
 
-#include <iomanip>
+#include <Common/CurrentThread.h>
+#include <Common/Exception.h>
+#include <Common/FailPoint.h>
+#include <Common/ProfileEvents.h>
+#include <Common/logger_useful.h>
 
+#include <exception>
+
+
+namespace ProfileEvents
+{
+    extern const Event SetsBuiltFromSubquery;
+}
 
 namespace DB
 {
@@ -16,47 +28,174 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int SET_SIZE_LIMIT_EXCEEDED;
+    extern const int UNKNOWN_EXCEPTION;
 }
 
-CreatingSetsTransform::~CreatingSetsTransform() = default;
+namespace FailPoints
+{
+    extern const char prepared_sets_build_ordered_set_inplace_fail[];
+}
+
+CreatingSetsTransform::~CreatingSetsTransform()
+{
+    if (promise_to_build)
+    {
+        /// An unfulfilled promise means the build was abandoned, not that it failed: publish the
+        /// retryable "no set" outcome. `work` resets the promise after storing a real error.
+        try
+        {
+            promise_to_build->set_value(nullptr);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "Failed to set_value for promise");
+        }
+    }
+
+    if (executor)
+    {
+        try
+        {
+            executor->cancel();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "Failed to cancel PushingPipelineExecutor");
+        }
+    }
+}
 
 CreatingSetsTransform::CreatingSetsTransform(
-    Block in_header_,
-    Block out_header_,
-    SubqueryForSet subquery_for_set_,
+    SharedHeader in_header_,
+    SharedHeader out_header_,
+    SetAndKeyPtr set_and_key_,
     SizeLimits network_transfer_limits_,
-    ContextPtr context_)
+    PreparedSetsCachePtr prepared_sets_cache_,
+    SetSpillSettings spill_settings_,
+    bool recoverable_build_)
     : IAccumulatingTransform(std::move(in_header_), std::move(out_header_))
-    , WithContext(context_)
-    , subquery(std::move(subquery_for_set_))
+    , set_and_key(std::move(set_and_key_))
     , network_transfer_limits(std::move(network_transfer_limits_))
+    , prepared_sets_cache(std::move(prepared_sets_cache_))
+    , spill_settings(std::move(spill_settings_))
+    , recoverable_build(recoverable_build_)
 {
+    set_spillables.add(set_and_key->spill_state);
+}
+
+IProcessor::Status CreatingSetsTransform::prepare()
+{
+    /// work() runs without the executor's graph lock, so it must not change port state; that happens here.
+    /// The base class closes the input only on the path that still expects to generate output.
+    if (finished_input)
+        input.close();
+
+    return IAccumulatingTransform::prepare();
 }
 
 void CreatingSetsTransform::work()
 {
-    if (!is_initialized)
-        init();
+    try
+    {
+        if (!is_initialized)
+            init();
 
-    IAccumulatingTransform::work();
+        if (done_with_set && done_with_table)
+            finishConsume();
+
+        IAccumulatingTransform::work();
+    }
+    catch (...)
+    {
+        if (promise_to_build)
+        {
+            /// set_exception can also throw
+            try
+            {
+                promise_to_build->set_exception(std::current_exception());
+                promise_to_build.reset();
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log, "Failed to set_exception for promise");
+            }
+        }
+        throw;
+    }
 }
 
 void CreatingSetsTransform::startSubquery()
 {
-    if (subquery.set)
-        LOG_TRACE(log, "Creating set.");
-    if (subquery.table)
+    /// Lookup the set in the cache if we don't need to build table.
+    if (prepared_sets_cache && !set_and_key->external_table)
+    {
+        /// Try to find the set in the cache and wait for it to be built.
+        /// Retry if the set from cache fails to be built.
+        while (true)
+        {
+            try
+            {
+                auto from_cache = prepared_sets_cache->findOrPromiseToBuild(set_and_key->key);
+                if (from_cache.index() == 0)
+                {
+                    LOG_TRACE(log, "Building set, key: {}", set_and_key->key);
+                    promise_to_build = std::move(std::get<0>(from_cache));
+                }
+                else
+                {
+                    LOG_TRACE(log, "Waiting for set to be built by another thread, key: {}", set_and_key->key);
+                    SharedSet set_built_by_another_thread = std::move(std::get<1>(from_cache));
+                    const SetPtr & ready_set = set_built_by_another_thread.get();
+                    if (!ready_set)
+                    {
+                        LOG_TRACE(log, "Failed to use set from cache, key: {}", set_and_key->key);
+                        continue;
+                    }
+
+                    set_and_key->set = ready_set;
+                    done_with_set = true;
+                    set_from_cache = true;
+                }
+                break;
+            }
+            /// Exception that is thrown by the shared_future::get() is shared across all waiters and cannot be modified from multiple threads.
+            /// Re-create exception to allow later concurrent modify (i.e. addMessage() during pipeline execution)
+            ///
+            /// Note, that findOrPromiseToBuild() can also call shared_future::get()
+            catch (const Exception & e)
+            {
+                throw Exception(e);
+            }
+            catch (...)
+            {
+                throw Exception::createRuntime(ErrorCodes::UNKNOWN_EXCEPTION, getExceptionMessage(std::current_exception(), /* with_stacktrace= */ false));
+            }
+        }
+    }
+
+    if (set_and_key->set && !set_from_cache)
+        LOG_TRACE(log, "Creating set, key: {}", set_and_key->key);
+    if (set_and_key->external_table)
         LOG_TRACE(log, "Filling temporary table.");
 
-    if (subquery.table)
+    if (set_and_key->external_table)
+    {
         /// TODO: make via port
-        table_out = QueryPipeline(subquery.table->write({}, subquery.table->getInMemoryMetadataPtr(), getContext()));
+        const auto metadata_snapshot = set_and_key->external_table->getInMemoryMetadataPtr(CurrentThread::tryGetQueryContext(), false);
+        table_out = QueryPipeline(set_and_key->external_table->write({}, metadata_snapshot, nullptr, /*async_insert=*/false));
+    }
 
-    done_with_set = !subquery.set;
-    done_with_table = !subquery.table;
+    done_with_set = !set_and_key->set || set_from_cache;
+    done_with_table = !set_and_key->external_table;
 
-    if (done_with_set /*&& done_with_join*/ && done_with_table)
-        throw Exception("Logical error: nothing to do with subquery", ErrorCodes::LOGICAL_ERROR);
+    if ((done_with_set && !set_from_cache) && done_with_table)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Nothing to do with subquery");
+
+    if (!done_with_set)
+    {
+        set_and_key->set->setSpillSettings(std::move(spill_settings));
+        set_and_key->spill_state->bind(set_and_key->set);
+    }
 
     if (table_out.initialized())
     {
@@ -67,14 +206,18 @@ void CreatingSetsTransform::startSubquery()
 
 void CreatingSetsTransform::finishSubquery()
 {
-    if (read_rows != 0)
-    {
-        auto seconds = watch.elapsedNanoseconds() / 1e9;
+    auto seconds = static_cast<double>(watch.elapsedNanoseconds()) / 1e9;
 
-        if (subquery.set)
-            LOG_DEBUG(log, "Created Set with {} entries from {} rows in {} sec.", subquery.set->getTotalRowCount(), read_rows, seconds);
-        if (subquery.table)
-            LOG_DEBUG(log, "Created Table with {} rows in {} sec.", read_rows, seconds);
+    if (set_from_cache)
+    {
+        LOG_DEBUG(log, "Got set from cache in {:.3f} sec.", seconds);
+    }
+    else if (read_rows != 0)
+    {
+        if (set_and_key->set)
+            LOG_DEBUG(log, "Created Set with {} entries from {} rows in {:.3f} sec.", set_and_key->set->getTotalRowCount(), read_rows, seconds);
+        if (set_and_key->external_table)
+            LOG_DEBUG(log, "Created Table with {} rows in {:.3f} sec.", read_rows, seconds);
     }
     else
     {
@@ -85,9 +228,6 @@ void CreatingSetsTransform::finishSubquery()
 void CreatingSetsTransform::init()
 {
     is_initialized = true;
-
-    if (subquery.set)
-        subquery.set->setHeader(getInputPort().getHeader().getColumnsWithTypeAndName());
 
     watch.restart();
     startSubquery();
@@ -100,7 +240,7 @@ void CreatingSetsTransform::consume(Chunk chunk)
 
     if (!done_with_set)
     {
-        if (!subquery.set->insertFromBlock(block.getColumnsWithTypeAndName()))
+        if (!set_and_key->set->insertFromBlock(block.getColumnsWithTypeAndName()))
             done_with_set = true;
     }
 
@@ -123,8 +263,27 @@ void CreatingSetsTransform::consume(Chunk chunk)
 
 Chunk CreatingSetsTransform::generate()
 {
-    if (subquery.set)
-        subquery.set->finishInsert();
+    if (set_and_key->set && !set_from_cache)
+    {
+        /// Simulate a silent in-place build failure: stop as if the pipeline never reached `generate`, leaving the set
+        /// not created (as a subquery timeout with `overflow_mode = 'break'` does). Only a recoverable build may be
+        /// abandoned, and the check precedes the injection so another build cannot spend the one shot.
+        if (recoverable_build)
+        {
+            fiu_do_on(FailPoints::prepared_sets_build_ordered_set_inplace_fail,
+            {
+                return {};
+            });
+        }
+
+        set_and_key->set->finishInsert();
+        ProfileEvents::increment(ProfileEvents::SetsBuiltFromSubquery);
+        if (promise_to_build)
+        {
+            promise_to_build->set_value(set_and_key->set);
+            promise_to_build.reset();
+        }
+    }
 
     if (table_out.initialized())
     {

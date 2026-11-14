@@ -1,51 +1,180 @@
-#include <Storages/MergeTree/MergeTreeWhereOptimizer.h>
-#include <Storages/MergeTree/MergeTreeData.h>
-#include <Storages/MergeTree/KeyCondition.h>
+#include <algorithm>
+#include <Common/ListWithMemoryTracking.h>
+#include <Common/UnorderedMapWithMemoryTracking.h>
+#include <Common/UnorderedSetWithMemoryTracking.h>
+#include <Core/Settings.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/IDataType.h>
+#include <DataTypes/NestedUtils.h>
+#include <DataTypes/TypeTree.h>
+#include <Functions/FunctionFactory.h>
+#include <Functions/FunctionsMiscellaneous.h>
+#include <Functions/IFunction.h>
+#include <Functions/UserDefined/UserDefinedExecutableFunctionFactory.h>
+#include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
+#include <Interpreters/ActionsDAG.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/IdentifierSemantic.h>
-#include <Parsers/ASTSelectQuery.h>
-#include <Parsers/ASTFunction.h>
+#include <Interpreters/extractStringValueFilters.h>
+#include <Interpreters/misc.h>
+#include <Parsers/ASTCreateWasmFunctionQuery.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
-#include <Parsers/ASTExpressionList.h>
+#include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSubquery.h>
-#include <Parsers/formatAST.h>
-#include <Interpreters/misc.h>
+#include <Processors/QueryPlan/FilterStep.h>
+#include <Storages/ColumnsDescription.h>
+#include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeWhereOptimizer.h>
+#include <Storages/Statistics/ConditionSelectivityEstimator.h>
 #include <Common/typeid_cast.h>
-#include <DataTypes/NestedUtils.h>
-#include <base/map.h>
+#include <base/defines.h>
 
 namespace DB
 {
-
-namespace ErrorCodes
+namespace Setting
 {
+    extern const SettingsBool move_all_conditions_to_prewhere;
+    extern const SettingsBool move_primary_key_columns_to_end_of_prewhere;
+    extern const SettingsBool allow_reorder_prewhere_conditions;
+    extern const SettingsBool use_statistics;
+    extern const SettingsBool apply_string_filters_during_scan;
 }
+
+namespace
+{
 
 /// Conditions like "x = N" are considered good if abs(N) > threshold.
 /// This is used to assume that condition is likely to have good selectivity.
-static constexpr auto threshold = 2;
+constexpr auto threshold = 2;
 
+NameToIndexMap fillNamesPositions(const Names & names)
+{
+    NameToIndexMap names_positions;
+
+    for (size_t position = 0; position < names.size(); ++position)
+    {
+        const auto & name = names[position];
+        names_positions[name] = position;
+    }
+
+    return names_positions;
+}
+
+constexpr double default_bytes_per_string_value = 64;
+constexpr double default_bytes_per_complex_value = 128;
+
+/// Uncompressed, unlike the stored column sizes, so it over-charges - the safe direction for a
+/// column whose real cost is unknown.
+double approximateBytesPerValueForType(const IDataType & type)
+{
+    if (type.haveMaximumSizeOfValue())
+        return static_cast<double>(type.getMaximumSizeOfValueInMemory());
+    if (WhichDataType(type).isString())
+        return default_bytes_per_string_value;
+    return default_bytes_per_complex_value;
+}
+
+/// Find minimal position of any of the column in primary key.
+Int64 findMinPosition(const NameSet & condition_table_columns, const NameToIndexMap & primary_key_positions)
+{
+    Int64 min_position = std::numeric_limits<Int64>::max() - 1;
+
+    for (const auto & column : condition_table_columns)
+    {
+        auto it = primary_key_positions.find(column);
+        if (it != primary_key_positions.end())
+            min_position = std::min(min_position, static_cast<Int64>(it->second));
+    }
+
+    return min_position;
+}
+
+NameSet getTableColumns(const StorageSnapshotPtr & storage_snapshot, const Names & queried_columns)
+{
+    GetColumnsOptions options(GetColumnsOptions::All);
+    options.withVirtuals(VirtualsKind::All, VirtualsMaterializationPlace::Reader);
+    options.withSubcolumns();
+
+    auto columns_list = storage_snapshot->getColumns(options);
+    NameSet table_columns;
+
+    for (const auto & column : columns_list)
+        table_columns.insert(column.name);
+
+    const auto & storage_columns = storage_snapshot->metadata->getColumns();
+    /// Add also requested subcolumns to known table columns.
+    for (const auto & column : queried_columns)
+    {
+        if (storage_columns.hasSubcolumn(options.kind, column))
+            table_columns.insert(column);
+    }
+
+    return table_columns;
+}
+
+bool typeContainsFloat(const DataTypePtr & type)
+{
+    return anyInTypeTree(*type, [](const IDataType & node) { return isFloat(node); });
+}
+
+}
+
+/// -0.0 compares equal to 0.0 and NaN payloads compare equal to each other, so a condition
+/// over a float sorting key column can tell apart rows of one dedup group and drop its winner
+NameSet getSortingKeyNamesSafeBeforeFinal(const StorageSnapshotPtr & storage_snapshot)
+{
+    const auto & sorting_key = storage_snapshot->metadata->getSortingKey();
+
+    /// `Graphite` merges adjacent rows of one path into one row with a rounded time.
+    /// A path filter can make rows adjacent unless the path is the first sorting key column.
+    const auto * data = dynamic_cast<const MergeTreeData *>(&storage_snapshot->storage);
+    if (data && data->merging_params.mode == MergeTreeData::MergingParams::Graphite)
+    {
+        const auto & path = data->merging_params.graphite_params.path_column_name;
+        if (sorting_key.column_names.empty() || sorting_key.column_names.front() != path)
+            return {};
+        return {path};
+    }
+
+    NameSet names;
+    for (size_t i = 0; i < sorting_key.column_names.size(); ++i)
+        if (!typeContainsFloat(sorting_key.data_types[i]))
+            names.insert(sorting_key.column_names[i]);
+    return names;
+}
+
+namespace
+{
+
+bool isReadByTopKFilterOnly(const RPNBuilderTreeNode & conjunct, const NameSet & columns, const String & top_k_filter_column)
+{
+    return !top_k_filter_column.empty() && columns.size() == 1 && *columns.begin() == top_k_filter_column
+        && conjunct.getDAGNode() && canBeMovedToTheFrontOfAndChain(conjunct.getDAGNode());
+}
+
+}
 
 MergeTreeWhereOptimizer::MergeTreeWhereOptimizer(
-    SelectQueryInfo & query_info,
-    ContextPtr context,
-    std::unordered_map<std::string, UInt64> column_sizes_,
-    const StorageMetadataPtr & metadata_snapshot,
+    UnorderedMapWithMemoryTracking<std::string, UInt64> column_sizes_,
+    const StorageSnapshotPtr & storage_snapshot,
+    ConditionSelectivityEstimatorPtr estimator_,
     const Names & queried_columns_,
-    Poco::Logger * log_)
-    : table_columns{collections::map<std::unordered_set>(
-        metadata_snapshot->getColumns().getAllPhysical(), [](const NameAndTypePair & col) { return col.name; })}
+    const std::optional<NameSet> & supported_columns_,
+    bool supported_columns_include_subcolumns_,
+    LoggerPtr log_)
+    : estimator(estimator_)
+    , table_columns(getTableColumns(storage_snapshot, queried_columns_))
     , queried_columns{queried_columns_}
-    , sorting_key_names{NameSet(
-          metadata_snapshot->getSortingKey().column_names.begin(), metadata_snapshot->getSortingKey().column_names.end())}
-    , block_with_constants{KeyCondition::getBlockWithConstants(query_info.query->clone(), query_info.syntax_analyzer_result, context)}
+    , supported_columns{supported_columns_}
+    , supported_columns_include_subcolumns{supported_columns_include_subcolumns_}
+    , sorting_key_names{getSortingKeyNamesSafeBeforeFinal(storage_snapshot)}
+    , primary_key_names_positions(fillNamesPositions(storage_snapshot->metadata->getPrimaryKey().column_names))
+    , storage_metadata(storage_snapshot->metadata)
     , log{log_}
     , column_sizes{std::move(column_sizes_)}
 {
-    const auto & primary_key = metadata_snapshot->getPrimaryKey();
-    if (!primary_key.column_names.empty())
-        first_primary_key_column = primary_key.column_names[0];
-
     for (const auto & name : queried_columns)
     {
         auto it = column_sizes.find(name);
@@ -53,215 +182,607 @@ MergeTreeWhereOptimizer::MergeTreeWhereOptimizer(
             total_size_of_queried_columns += it->second;
     }
 
-    determineArrayJoinedNames(query_info.query->as<ASTSelectQuery &>());
-    optimize(query_info.query->as<ASTSelectQuery &>());
+    if (estimator)
+        total_rows = estimator->getTotalRows();
 }
 
-
-static void collectIdentifiersNoSubqueries(const ASTPtr & ast, NameSet & set)
+MergeTreeWhereOptimizer::FilterActionsOptimizeResult MergeTreeWhereOptimizer::optimize(const ActionsDAG & filter_dag,
+    const std::string & filter_column_name,
+    const ContextPtr & context,
+    bool is_final,
+    const NameSet & columns_read_before_filter,
+    const String & top_k_filter_column)
 {
-    if (auto opt_name = tryGetIdentifierName(ast))
-        return (void)set.insert(*opt_name);
+    const auto & settings = context->getSettingsRef();
+    WhereOptimizerContext where_optimizer_context;
+    where_optimizer_context.context = context;
+    where_optimizer_context.array_joined_names = {};
+    where_optimizer_context.move_all_conditions_to_prewhere = context->getSettingsRef()[Setting::move_all_conditions_to_prewhere];
+    where_optimizer_context.move_primary_key_columns_to_end_of_prewhere
+        = context->getSettingsRef()[Setting::move_primary_key_columns_to_end_of_prewhere];
+    where_optimizer_context.allow_reorder_prewhere_conditions = context->getSettingsRef()[Setting::allow_reorder_prewhere_conditions];
+    where_optimizer_context.is_final = is_final;
+    where_optimizer_context.use_statistics = context->getSettingsRef()[Setting::use_statistics] && estimator != nullptr;
+    /// The decision does not depend on the columns cache: whether a column is served from the cache, written to it
+    /// or read as usual is known only to the reader. The reader does not apply the string filter to a column it writes
+    /// to the cache (the cache must not keep the substituted values), but the condition is still worth moving to PREWHERE:
+    /// a column served from the cache is filtered by the reader then, and the next read is likely to be served from it.
+    where_optimizer_context.apply_string_filters_during_scan = settings[Setting::apply_string_filters_during_scan];
+    /// Resolve the columns to their storage columns: the reader disables the scan filter for a storage column
+    /// when anything reads it before the filter, including its subcolumns (e.g. `payload.size0` for `payload`).
+    NameSet storage_columns_read_before_filter;
+    const auto & columns_description = storage_metadata->getColumns();
+    for (const auto & column_name : columns_read_before_filter)
+    {
+        if (auto column = columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::AllPhysical, column_name))
+            storage_columns_read_before_filter.insert(column->getNameInStorage());
+        else
+            storage_columns_read_before_filter.insert(column_name);
+    }
+    where_optimizer_context.columns_read_before_filter = &storage_columns_read_before_filter;
+    where_optimizer_context.top_k_filter_column = top_k_filter_column;
 
-    if (ast->as<ASTSubquery>())
+    RPNBuilderTreeNode node(&filter_dag.findInOutputs(filter_column_name), context);
+
+    auto optimize_result = optimizeImpl(node, where_optimizer_context);
+    if (!optimize_result)
+        return {};
+
+    UnorderedSetWithMemoryTracking<const ActionsDAG::Node *> prewhere_conditions;
+    ListWithMemoryTracking<const ActionsDAG::Node *> prewhere_conditions_list;
+    for (const auto & condition : optimize_result->prewhere_conditions)
+    {
+        for (const auto & n : condition.nodes)
+        {
+            const ActionsDAG::Node * condition_node = n.getDAGNode();
+
+            /// FINAL merges by physical name, so unwrap an analyzer alias to its input column
+            /// before moving it to PREWHERE (otherwise the alias reaches the merge as a measure).
+            if (is_final)
+            {
+                const ActionsDAG::Node * unwrapped = condition_node;
+                while (unwrapped->type == ActionsDAG::ActionType::ALIAS)
+                    unwrapped = unwrapped->children.front();
+                if (unwrapped->type == ActionsDAG::ActionType::INPUT)
+                    condition_node = unwrapped;
+            }
+
+            if (prewhere_conditions.insert(condition_node).second)
+                prewhere_conditions_list.push_back(condition_node);
+        }
+    }
+
+    return {
+        .prewhere_nodes = std::move(prewhere_conditions),
+        .prewhere_nodes_list = std::move(prewhere_conditions_list),
+        .fully_moved_to_prewhere = optimize_result->where_conditions.empty()};
+}
+
+static void collectColumns(
+    const RPNBuilderTreeNode & node,
+    const RPNBuilderTreeNode * parent,
+    const NameSet & columns_names,
+    NameSet & result_set,
+    bool & has_invalid_column,
+    bool & may_use_primary_index)
+{
+    if (node.isConstant())
         return;
 
-    for (const auto & child : ast->children)
-        collectIdentifiersNoSubqueries(child, set);
-}
+    if (node.isSubqueryOrSet())
+        return;
 
-static bool isConditionGood(const ASTPtr & condition)
-{
-    const auto * function = condition->as<ASTFunction>();
-    if (!function)
-        return false;
-
-    /** we are only considering conditions of form `equals(one, another)` or `one = another`,
-        * especially if either `one` or `another` is ASTIdentifier */
-    if (function->name != "equals")
-        return false;
-
-    auto * left_arg = function->arguments->children.front().get();
-    auto * right_arg = function->arguments->children.back().get();
-
-    /// try to ensure left_arg points to ASTIdentifier
-    if (!left_arg->as<ASTIdentifier>() && right_arg->as<ASTIdentifier>())
-        std::swap(left_arg, right_arg);
-
-    if (left_arg->as<ASTIdentifier>())
+    if (!node.isFunction())
     {
-        /// condition may be "good" if only right_arg is a constant and its value is outside the threshold
-        if (const auto * literal = right_arg->as<ASTLiteral>())
+        auto column_name = node.getColumnName();
+        if (!columns_names.contains(column_name))
         {
-            const auto & field = literal->value;
-            const auto type = field.getType();
+            has_invalid_column = true;
+            return;
+        }
 
-            /// check the value with respect to threshold
-            if (type == Field::Types::UInt64)
+        result_set.insert(column_name);
+        return;
+    }
+
+    auto function_node = node.toFunctionNode();
+    size_t arguments_size = function_node.getArgumentsSize();
+
+    /// Do not account arguments of function "indexHint"
+    /// because they won't be read from table.
+    const auto function_name = function_node.getFunctionName();
+    if (function_name == "indexHint")
+        return;
+
+    if (!KeyCondition::atom_map.contains(function_name))
+    {
+        if (!parent)
+        {
+            /// Root function node must be contained in atom_map if we want to utilize primary index.
+            may_use_primary_index = false;
+        }
+        else
+        {
+            /// Non-root function node must be monotonic and deterministic in scope of query if we want to utilize primary index.
+            auto function_base = function_node.getFunctionBase();
+            if (arguments_size > 2 || arguments_size == 0
+                || (function_base
+                    && (!function_base->isDeterministicInScopeOfQuery() || !function_base->hasInformationAboutMonotonicity())))
             {
-                const auto value = field.get<UInt64>();
-                return value > threshold;
-            }
-            else if (type == Field::Types::Int64)
-            {
-                const auto value = field.get<Int64>();
-                return value < -threshold || threshold < value;
-            }
-            else if (type == Field::Types::Float64)
-            {
-                const auto value = field.get<Float64>();
-                return value < threshold || threshold < value;
+                may_use_primary_index = false;
             }
         }
     }
 
+
+    for (size_t i = 0; i < arguments_size; ++i)
+    {
+        auto function_argument = function_node.getArgumentAt(i);
+        collectColumns(function_argument, &node, columns_names, result_set, has_invalid_column, may_use_primary_index);
+    }
+}
+
+static bool isConditionGood(const RPNBuilderTreeNode & condition, const NameSet & columns_names)
+{
+    if (!condition.isFunction())
+        return false;
+
+    auto function_node = condition.toFunctionNode();
+
+    /** We are only considering conditions of form `equals(one, another)` or `one = another`,
+      * especially if either `one` or `another` is ASTIdentifier
+      */
+    if (function_node.getFunctionName() != "equals" || function_node.getArgumentsSize() != 2)
+        return false;
+
+    auto lhs_argument = function_node.getArgumentAt(0);
+    auto rhs_argument = function_node.getArgumentAt(1);
+
+    auto lhs_argument_column_name = lhs_argument.getColumnName();
+    auto rhs_argument_column_name = rhs_argument.getColumnName();
+
+    bool lhs_argument_is_column = columns_names.contains(lhs_argument_column_name);
+    bool rhs_argument_is_column = columns_names.contains(rhs_argument_column_name);
+
+    bool lhs_argument_is_constant = lhs_argument.isConstant();
+    bool rhs_argument_is_constant = rhs_argument.isConstant();
+
+    RPNBuilderTreeNode * constant_node = nullptr;
+
+    if (lhs_argument_is_column && rhs_argument_is_constant)
+        constant_node = &rhs_argument;
+    else if (lhs_argument_is_constant && rhs_argument_is_column)
+        constant_node = &lhs_argument;
+    else
+        return false;
+
+    Field output_value;
+    DataTypePtr output_type;
+    if (!constant_node->tryGetConstant(output_value, output_type))
+        return false;
+
+    const auto type = output_value.getType();
+
+    /// check the value with respect to threshold
+    if (type == Field::Types::UInt64)
+    {
+        const auto value = output_value.safeGet<UInt64>();
+        return value > threshold;
+    }
+    if (type == Field::Types::Int64)
+    {
+        const auto value = output_value.safeGet<Int64>();
+        return value < -threshold || threshold < value;
+    }
+    if (type == Field::Types::Float64)
+    {
+        const auto value = output_value.safeGet<Float64>();
+        return value < -threshold || threshold < value;
+    }
+
     return false;
 }
 
-static const ASTFunction * getAsTuple(const ASTPtr & node)
+/// A join runtime filter, alone or in the `OR isNull(key)` that an ANTI join adds.
+static bool isJoinRuntimeFilter(const RPNBuilderTreeNode & node)
 {
-    if (const auto * func = node->as<ASTFunction>(); func && func->name == "tuple")
-        return func;
-    return {};
-};
-
-static bool getAsTupleLiteral(const ASTPtr & node, Tuple & tuple)
-{
-    if (const auto * value_tuple = node->as<ASTLiteral>())
-        return value_tuple && value_tuple->value.tryGet<Tuple>(tuple);
-    return false;
-};
-
-bool MergeTreeWhereOptimizer::tryAnalyzeTuple(Conditions & res, const ASTFunction * func, bool is_final) const
-{
-    if (!func || func->name != "equals" || func->arguments->children.size() != 2)
+    auto function_node = node.toFunctionNodeOrNull();
+    if (!function_node)
         return false;
 
-    Tuple tuple_lit;
-    const ASTFunction * tuple_other = nullptr;
-    if (getAsTupleLiteral(func->arguments->children[0], tuple_lit))
-        tuple_other = getAsTuple(func->arguments->children[1]);
-    else if (getAsTupleLiteral(func->arguments->children[1], tuple_lit))
-        tuple_other = getAsTuple(func->arguments->children[0]);
+    const auto function_name = function_node->getFunctionName();
+    if (function_name == "__applyFilter")
+        return true;
 
-    if (!tuple_other || tuple_lit.size() != tuple_other->arguments->children.size())
-        return false;
-
-    for (size_t i = 0; i < tuple_lit.size(); ++i)
+    if (function_name == "or")
     {
-        const auto & child = tuple_other->arguments->children[i];
-        std::shared_ptr<IAST> fetch_sign_column = nullptr;
-        /// tuple in tuple like (a, (b, c)) = (1, (2, 3))
-        if (const auto * child_func = getAsTuple(child))
-            fetch_sign_column = std::make_shared<ASTFunction>(*child_func);
-        else if (const auto * child_ident = child->as<ASTIdentifier>())
-            fetch_sign_column = std::make_shared<ASTIdentifier>(child_ident->name());
-        else
-            return false;
-
-        ASTPtr fetch_sign_value = std::make_shared<ASTLiteral>(tuple_lit.at(i));
-        ASTPtr func_node = makeASTFunction("equals", fetch_sign_column, fetch_sign_value);
-        analyzeImpl(res, func_node, is_final);
+        for (size_t i = 0; i < function_node->getArgumentsSize(); ++i)
+            if (isJoinRuntimeFilter(function_node->getArgumentAt(i)))
+                return true;
     }
 
-    return true;
+    return false;
 }
 
-void MergeTreeWhereOptimizer::analyzeImpl(Conditions & res, const ASTPtr & node, bool is_final) const
+static void collectConjuncts(const RPNBuilderTreeNode & node, std::vector<RPNBuilderTreeNode> & conjuncts)
 {
-    const auto * func = node->as<ASTFunction>();
-
-    if (func && func->name == "and")
+    auto fn = node.toFunctionNodeOrNull();
+    if (fn.has_value() && fn->getFunctionName() == "and")
     {
-        for (const auto & elem : func->arguments->children)
-            analyzeImpl(res, elem, is_final);
-    }
-    else if (tryAnalyzeTuple(res, func, is_final))
-    {
-        /// analyzed
+        for (size_t i = 0; i < fn->getArgumentsSize(); ++i)
+            collectConjuncts(fn->getArgumentAt(i), conjuncts);
     }
     else
+        conjuncts.push_back(node);
+}
+
+/// True if evaluating the condition may throw on rows that a preceding condition rejects.
+/// Uses the same predicate as `tryBuildPrewhereSteps` (MergeTreeSplitPrewhereIntoReadSteps.cpp),
+/// which splits such a condition into a step that runs on the rows filtered by the previous step.
+static bool conditionMayThrow(const ActionsDAG::Node * node)
+{
+    if (node->type == ActionsDAG::ActionType::FUNCTION && node->function_base)
     {
-        Condition cond;
-        cond.node = node;
+        DataTypesWithConstInfo argument_types;
+        argument_types.reserve(node->children.size());
+        for (const auto * child : node->children)
+            argument_types.push_back({child->result_type, child->column != nullptr});
+        if (node->function_base->isSuitableForShortCircuitArgumentsExecution(argument_types))
+            return true;
+    }
 
-        collectIdentifiersNoSubqueries(node, cond.identifiers);
+    return std::ranges::any_of(node->children, [](const auto * child) { return conditionMayThrow(child); });
+}
 
-        cond.columns_size = getIdentifiersColumnSize(cond.identifiers);
+/// Analyze the WHERE expression and populate `res` with one `Condition` per conjunct group.
+/// Algorithm:
+///   1. Flatten the top-level AND chain into individual conjuncts with `collectConjuncts`.
+///   2. Build a temporary `ConjunctInfo` for each conjunct: collect referenced columns,
+///      check primary-index usability, and determine whether the conjunct is viable
+///      (i.e., eligible to be moved to PREWHERE).
+///   3. Group viable conjuncts by their exact `NameSet` of referenced columns and by whether they can use
+///      the primary key, so that conditions on the same column set are scored together (better selectivity estimate).
+///      Conjuncts over physical columns where a condition that may throw follows another condition
+///      are grouped by these physical columns instead, so that the throwing one is not moved ahead.
+///   4. Emit non-viable conjuncts individually as single-node `Condition` objects (viable=false).
+///   5. Emit each viable group as a single multi-node `Condition`, computing `good`,
+///      `estimated_row_count`, and `min_position_in_primary_key` for the whole group;
+///      `pk_positions` gets the key position of each member that can use the primary key.
+void MergeTreeWhereOptimizer::analyzeImpl(Conditions & res, const RPNBuilderTreeNode & node, const WhereOptimizerContext & where_optimizer_context, std::set<Int64> & pk_positions) const
+{
+    /// Flatten the top-level AND chain into individual conjuncts.
+    std::vector<RPNBuilderTreeNode> conjuncts;
+    collectConjuncts(node, conjuncts);
 
-        cond.viable =
-            /// Condition depend on some column. Constant expressions are not moved.
-            !cond.identifiers.empty()
-            && !cannotBeMoved(node, is_final)
-            /// Do not take into consideration the conditions consisting only of the first primary key column
-            && !hasPrimaryKeyAtoms(node)
-            /// Only table columns are considered. Not array joined columns. NOTE We're assuming that aliases was expanded.
-            && isSubsetOfTableColumns(cond.identifiers)
-            /// Do not move conditions involving all queried columns.
-            && cond.identifiers.size() < queried_columns.size();
+    struct ConjunctInfo
+    {
+        RPNBuilderTreeNode node;
+        NameSet columns;
+        /// `columns` resolved to the physical columns they are read from (subcolumn suffix stripped).
+        NameSet storage_columns;
+        bool has_invalid_column = false;
+        bool may_use_primary_index = true;
+        bool viable = false;
+        bool expensive = false;
+    };
 
-        if (cond.viable)
-            cond.good = isConditionGood(node);
+    std::vector<ConjunctInfo> infos;
+    infos.reserve(conjuncts.size());
 
-        res.emplace_back(std::move(cond));
+    const auto & storage_columns_description = storage_metadata->getColumns();
+    for (const auto & conjunct : conjuncts)
+    {
+        ConjunctInfo info{conjunct, {}, {}, false, true, false, false};
+        collectColumns(conjunct, nullptr, table_columns, info.columns, info.has_invalid_column, info.may_use_primary_index);
+
+        for (const auto & column : info.columns)
+        {
+            if (auto resolved = storage_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::AllPhysical, column))
+                info.storage_columns.insert(resolved->getNameInStorage());
+            else
+                info.storage_columns.insert(column);
+        }
+
+        /// Is it possible to use primary index for this condition? For conditions like `lower(country) = 'xx'`, may_use_primary_index will be false.
+        info.viable =
+            !info.has_invalid_column
+            /// Condition depends on some column. Constant expressions are not moved.
+            && !info.columns.empty()
+            && !cannotBeMoved(conjunct, where_optimizer_context)
+            /// When use final, do not take into consideration the conditions with non-sorting keys. Because final select
+            /// need to use all sorting keys, it will cause correctness issues if we filter other columns before final merge.
+            && (!where_optimizer_context.is_final || isDeterministicExpressionOverSortingKey(conjunct, where_optimizer_context.context))
+            /// Some identifiers can unable to support PREWHERE (usually because of different types in Merge engine)
+            && columnsSupportPrewhere(info.columns)
+            /// Do not move conditions involving all queried columns,
+            /// unless the condition can be used as a string filter during the scan:
+            /// then it is beneficial on its own, because the reader skips copying the non-matching values,
+            /// or `__topKFilter` reads its only column in PREWHERE anyway, where the query condition cache records each emptied granule.
+            && (info.columns.size() < queried_columns.size()
+                || isReadByTopKFilterOnly(conjunct, info.columns, where_optimizer_context.top_k_filter_column)
+                || (where_optimizer_context.apply_string_filters_during_scan && isConditionSuitableForStringValueFilter(conjunct, where_optimizer_context)));
+
+        info.expensive = isExpensiveExpression(conjunct);
+
+        infos.push_back(std::move(info));
+    }
+
+    /// Group viable conjuncts by their required column set so same-column conditions
+    /// are treated as a single unit and their combined selectivity can be estimated.
+    /// Non-viable conjuncts stay as individual Conditions.
+    /// 'expensive' conjuncts each get their own group.
+    ///
+    /// A condition that may throw is guarded by the conditions written before it (`and` evaluates it only on
+    /// the rows they pass), but separate groups are reordered by cost. So when such a condition reads the same
+    /// physical columns as an earlier condition, e.g. `t.safe != '' AND toUInt64(t.val) > 50` on subcolumns
+    /// of one `Tuple`, all conditions over these physical columns are grouped by them instead of by the
+    /// exact columns. The group keeps the written order, and `tryBuildPrewhereSteps` splits it into steps
+    /// so that the throwing condition runs only on the rows the guard passes.
+    ///
+    /// We use a simple linear search to find groups (WHERE clauses are short).
+    std::vector<NameSet> storage_columns_guarding_throwing_condition;
+    for (size_t i = 0; i < infos.size(); ++i)
+    {
+        if (!infos[i].viable || infos[i].expensive || !conditionMayThrow(infos[i].node.getDAGNode()))
+            continue;
+        for (size_t j = 0; j < i; ++j)
+        {
+            if (infos[j].viable && !infos[j].expensive && infos[j].storage_columns == infos[i].storage_columns)
+            {
+                storage_columns_guarding_throwing_condition.push_back(infos[i].storage_columns);
+                break;
+            }
+        }
+    }
+
+    auto is_guarded = [&](const ConjunctInfo & info)
+    {
+        return std::ranges::find(storage_columns_guarding_throwing_condition, info.storage_columns)
+            != storage_columns_guarding_throwing_condition.end();
+    };
+
+    auto group_key = [&](const ConjunctInfo & info) -> const NameSet &
+    {
+        if (is_guarded(info))
+            return info.storage_columns;
+        return info.columns;
+    };
+
+    /// The end of PREWHERE is chosen per group, so a conjunct that cannot use the primary key must not share a group with one that can.
+    auto uses_primary_key = [&](const ConjunctInfo & info)
+    {
+        return where_optimizer_context.move_primary_key_columns_to_end_of_prewhere && !is_guarded(info) && info.may_use_primary_index
+            && findMinPosition(info.columns, primary_key_names_positions) != std::numeric_limits<Int64>::max() - 1;
+    };
+
+    struct Group
+    {
+        NameSet columns;
+        bool uses_primary_key = false;
+        std::vector<size_t> indices;
+    };
+    std::vector<Group> groups;
+
+    auto find_group_idx = [&](const NameSet & cols, bool uses_pk) -> std::optional<size_t>
+    {
+        for (size_t g = 0; g < groups.size(); ++g)
+            if (groups[g].columns == cols && groups[g].uses_primary_key == uses_pk && !infos[groups[g].indices.front()].expensive)
+                return g;
+        return std::nullopt;
+    };
+
+    /// Index of the group of each viable conjunct.
+    std::vector<size_t> group_of(infos.size());
+
+    for (size_t i = 0; i < infos.size(); ++i)
+    {
+        if (!infos[i].viable)
+            continue;
+        const auto & key = group_key(infos[i]);
+        const bool uses_pk = uses_primary_key(infos[i]);
+        auto g = infos[i].expensive ? std::nullopt : find_group_idx(key, uses_pk);
+        if (!g.has_value())
+        {
+            group_of[i] = groups.size();
+            groups.push_back({key, uses_pk, {i}});
+        }
+        else
+        {
+            group_of[i] = *g;
+            groups[*g].indices.push_back(i);
+        }
+    }
+
+    /// Emit Conditions in the original AND-chain order:
+    ///   - non-viable conjuncts are emitted individually at their original position
+    ///   - viable column-set groups are emitted at the position of their first conjunct
+    std::vector<bool> emitted(infos.size(), false);
+
+    for (size_t i = 0; i < infos.size(); ++i)
+    {
+        if (emitted[i])
+            continue;
+
+        const auto & info = infos[i];
+
+        if (!info.viable)
+        {
+            /// Non-viable conditions cannot be moved to PREWHERE; just record them as-is.
+            Condition cond({info.node});
+            cond.table_columns = info.columns;
+            cond.columns_size = getColumnsSize(info.columns);
+            cond.viable = false;
+            cond.good = false;
+            emitted[i] = true;
+            res.emplace_back(std::move(cond));
+        }
+        else
+        {
+            /// Emit the whole column-set group at the position of the first conjunct.
+            const auto & group = groups[group_of[i]];
+
+            for (size_t idx : group.indices)
+                emitted[idx] = true;
+
+            std::vector<RPNBuilderTreeNode> group_nodes;
+            NameSet group_columns;
+            bool group_may_use_primary_index = true;
+            bool group_good = false;
+            bool group_is_runtime_filter = true;
+
+            for (size_t idx : group.indices)
+            {
+                group_nodes.push_back(infos[idx].node);
+                group_columns.insert(infos[idx].columns.begin(), infos[idx].columns.end());
+                group_may_use_primary_index = group_may_use_primary_index && infos[idx].may_use_primary_index;
+                if (!where_optimizer_context.use_statistics && !where_optimizer_context.move_primary_key_columns_to_end_of_prewhere)
+                    group_good = group_good || isConditionGood(infos[idx].node, table_columns);
+                group_is_runtime_filter = group_is_runtime_filter && isJoinRuntimeFilter(infos[idx].node);
+            }
+
+            Condition cond(std::move(group_nodes));
+            cond.table_columns = group_columns;
+            cond.columns_size = getColumnsSize(group_columns);
+            cond.viable = true;
+            cond.good = group_good;
+            cond.expensive = info.expensive;
+            cond.is_runtime_filter = group_is_runtime_filter;
+
+            if (where_optimizer_context.use_statistics)
+            {
+                cond.good = true;
+                cond.estimated_row_count = estimator->estimateRelationProfile(storage_metadata, cond.nodes).rows;
+                LOG_DEBUG(log, "Condition group ({}) has estimated row count {}", cond.toString(), cond.estimated_row_count);
+            }
+
+            if (where_optimizer_context.move_primary_key_columns_to_end_of_prewhere)
+            {
+                cond.good = true;
+                cond.min_position_in_primary_key = findMinPosition(group_columns, primary_key_names_positions);
+                if (!group_may_use_primary_index)
+                    cond.min_position_in_primary_key = std::numeric_limits<Int64>::max() - 1;
+                /// A guard group cannot be split by key usability, so the prefix of the key counts each of its members that can use the key.
+                for (size_t idx : group.indices)
+                    if (infos[idx].may_use_primary_index)
+                        pk_positions.emplace(findMinPosition(infos[idx].columns, primary_key_names_positions));
+            }
+
+            /// Combine I/O cost with selectivity using the classic conjunctive filter ordering rule:
+            /// sort by cost / (1 - selectivity), i.e. cost per rejected row.
+            const double rejected_rows = static_cast<double>(total_rows) - static_cast<double>(cond.estimated_row_count);
+            if (total_rows == 0)
+                /// No statistics: fall back to pure I/O cost.
+                cond.bytes_per_rejected_row = static_cast<double>(cond.columns_size);
+            else if (rejected_rows <= 0)
+                /// Rejects no rows, so it is useless in PREWHERE regardless of its cost: schedule it last.
+                cond.bytes_per_rejected_row = std::numeric_limits<double>::infinity();
+            else if (total_size_of_queried_columns == 0)
+                /// Nothing measured (compact parts): the type estimate is too coarse to outrank
+                /// selectivity, e.g. `Nullable(Int64)` would beat `Int64` on the null byte.
+                cond.bytes_per_rejected_row = static_cast<double>(cond.estimated_row_count);
+            else
+                cond.bytes_per_rejected_row = approximateBytesPerRow(cond.table_columns) * static_cast<double>(total_rows) / rejected_rows;
+
+            res.emplace_back(std::move(cond));
+        }
     }
 }
 
 /// Transform conjunctions chain in WHERE expression to Conditions list.
-MergeTreeWhereOptimizer::Conditions MergeTreeWhereOptimizer::analyze(const ASTPtr & expression, bool is_final) const
+MergeTreeWhereOptimizer::Conditions MergeTreeWhereOptimizer::analyze(const RPNBuilderTreeNode & node,
+    const WhereOptimizerContext & where_optimizer_context) const
 {
     Conditions res;
-    analyzeImpl(res, expression, is_final);
+
+    if (!where_optimizer_context.allow_reorder_prewhere_conditions)
+    {
+        std::vector<RPNBuilderTreeNode> conjuncts;
+        collectConjuncts(node, conjuncts);
+        for (const auto & conjunct : conjuncts)
+        {
+            NameSet columns;
+            bool has_invalid_column = false;
+            bool may_use_primary_index = true;
+            collectColumns(conjunct, nullptr, table_columns, columns, has_invalid_column, may_use_primary_index);
+
+            Condition cond({conjunct});
+            cond.table_columns = columns;
+            cond.columns_size = getColumnsSize(columns);
+            cond.bytes_per_rejected_row = static_cast<double>(cond.columns_size);
+            cond.is_runtime_filter = isJoinRuntimeFilter(conjunct);
+            cond.viable =
+                !has_invalid_column
+                && !columns.empty()
+                && !cannotBeMoved(conjunct, where_optimizer_context)
+                && (!where_optimizer_context.is_final || isDeterministicExpressionOverSortingKey(conjunct, where_optimizer_context.context))
+                && columnsSupportPrewhere(columns)
+                && (columns.size() < queried_columns.size()
+                    || isReadByTopKFilterOnly(conjunct, columns, where_optimizer_context.top_k_filter_column)
+                    || (where_optimizer_context.apply_string_filters_during_scan && isConditionSuitableForStringValueFilter(conjunct, where_optimizer_context)));
+            res.emplace_back(std::move(cond));
+        }
+        return res;
+    }
+
+    std::set<Int64> pk_positions;
+    analyzeImpl(res, node, where_optimizer_context, pk_positions);
+
+    /// E.g., if the primary key is (a, b, c) but the condition is a = 1 and c = 1,
+    /// we should only put (a = 1) to the tail of PREWHERE,
+    /// and treat (c = 1) as a normal column.
+    if (where_optimizer_context.move_primary_key_columns_to_end_of_prewhere)
+    {
+        Int64 min_valid_pk_pos = -1;
+        for (auto pk_pos : pk_positions)
+        {
+            if (pk_pos != min_valid_pk_pos + 1)
+                break;
+            min_valid_pk_pos = pk_pos;
+        }
+        for (auto & cond : res)
+        {
+            if (cond.min_position_in_primary_key > min_valid_pk_pos)
+                cond.min_position_in_primary_key = std::numeric_limits<Int64>::max() - 1;
+        }
+        LOG_TRACE(log, "The min valid primary key position for moving to the tail of PREWHERE is {}", min_valid_pk_pos);
+    }
+
     return res;
 }
 
-/// Transform Conditions list to WHERE or PREWHERE expression.
-ASTPtr MergeTreeWhereOptimizer::reconstruct(const Conditions & conditions)
+std::optional<MergeTreeWhereOptimizer::OptimizeResult> MergeTreeWhereOptimizer::optimizeImpl(const RPNBuilderTreeNode & node,
+    const WhereOptimizerContext & where_optimizer_context) const
 {
-    if (conditions.empty())
-        return {};
-
-    if (conditions.size() == 1)
-        return conditions.front().node;
-
-    const auto function = std::make_shared<ASTFunction>();
-
-    function->name = "and";
-    function->arguments = std::make_shared<ASTExpressionList>();
-    function->children.push_back(function->arguments);
-
-    for (const auto & elem : conditions)
-        function->arguments->children.push_back(elem.node);
-
-    return function;
-}
-
-
-void MergeTreeWhereOptimizer::optimize(ASTSelectQuery & select) const
-{
-    if (!select.where() || select.prewhere())
-        return;
-
-    Conditions where_conditions = analyze(select.where(), select.final());
+    Conditions where_conditions = analyze(node, where_optimizer_context);
     Conditions prewhere_conditions;
 
     UInt64 total_size_of_moved_conditions = 0;
     UInt64 total_number_of_moved_columns = 0;
 
-    /// Move condition and all other conditions depend on the same set of columns.
-    auto move_condition = [&](Conditions::iterator cond_it)
-    {
-        prewhere_conditions.splice(prewhere_conditions.end(), where_conditions, cond_it);
-        total_size_of_moved_conditions += cond_it->columns_size;
-        total_number_of_moved_columns += cond_it->identifiers.size();
+    /// Remember positions of conditions in where_conditions list
+    /// to keep original order of conditions in prewhere_conditions while moving.
+    std::unordered_map<const Condition *, size_t> condition_positions;
+    size_t position= 0;
+    for (const auto & condition : where_conditions)
+        condition_positions[&condition] = position++;
 
-        /// Move all other viable conditions that depend on the same set of columns.
-        for (auto jt = where_conditions.begin(); jt != where_conditions.end();)
+    size_t moved_conditions_count = 0;
+    auto move_to_prewhere_conditions = [&](Conditions::iterator cond_it)
+    {
+        moved_conditions_count++;
+        LOG_TEST(log, "Condition {} moved to PREWHERE", cond_it->toString());
+        if (where_optimizer_context.allow_reorder_prewhere_conditions)
         {
-            if (jt->viable && jt->columns_size == cond_it->columns_size && jt->identifiers == cond_it->identifiers)
-                prewhere_conditions.splice(prewhere_conditions.end(), where_conditions, jt++);
-            else
-                ++jt;
+            prewhere_conditions.splice(prewhere_conditions.end(), where_conditions, cond_it);
+        }
+        else
+        {
+            /// Keep the original order of conditions in prewhere_conditions.
+            position = condition_positions[&(*cond_it)];
+            auto prewhere_it = prewhere_conditions.begin();
+            while (prewhere_it != prewhere_conditions.end() && condition_positions[&(*prewhere_it)] < position)
+                ++prewhere_it;
+            prewhere_conditions.splice(prewhere_it, where_conditions, cond_it);
         }
     };
 
@@ -269,171 +790,360 @@ void MergeTreeWhereOptimizer::optimize(ASTSelectQuery & select) const
     while (!where_conditions.empty())
     {
         /// Move the best condition to PREWHERE if it is viable.
-
         auto it = std::min_element(where_conditions.begin(), where_conditions.end());
 
         if (!it->viable)
             break;
 
-        bool moved_enough = false;
-        if (total_size_of_queried_columns > 0)
-        {
-            /// If we know size of queried columns use it as threshold. 10% ratio is just a guess.
-            moved_enough = total_size_of_moved_conditions > 0
-                && (total_size_of_moved_conditions + it->columns_size) * 10 > total_size_of_queried_columns;
-        }
-        else
-        {
-            /// Otherwise, use number of moved columns as a fallback.
-            /// It can happen, if table has only compact parts. 25% ratio is just a guess.
-            moved_enough = total_number_of_moved_columns > 0
-                && (total_number_of_moved_columns + it->identifiers.size()) * 4 > queried_columns.size();
-        }
-
-        if (moved_enough)
+        /// If any non-expensive conditions stay in WHERE then don't move expensive conditions to PREWHERE
+        if (it->expensive && std::ranges::any_of(where_conditions, [](const Condition & cond) { return !cond.expensive; }))
             break;
 
-        move_condition(it);
+        if (!where_optimizer_context.move_all_conditions_to_prewhere)
+        {
+            bool moved_enough = false;
+            if (total_size_of_queried_columns > 0)
+            {
+                /// If we know size of queried columns use it as threshold. 10% ratio is just a guess.
+                moved_enough = total_size_of_moved_conditions > 0
+                    && (total_size_of_moved_conditions + it->columns_size) * 10 > total_size_of_queried_columns;
+            }
+            else
+            {
+                /// Otherwise, use number of moved columns as a fallback.
+                /// It can happen, if table has only compact parts. 25% ratio is just a guess.
+                moved_enough = total_number_of_moved_columns > 0
+                    && (total_number_of_moved_columns + it->table_columns.size()) * 4 > queried_columns.size();
+            }
+
+            if (moved_enough)
+                break;
+        }
+
+        total_size_of_moved_conditions += it->columns_size;
+        total_number_of_moved_columns += it->table_columns.size();
+        move_to_prewhere_conditions(it);
     }
 
     /// Nothing was moved.
     if (prewhere_conditions.empty())
-        return;
+        return {};
+    LOG_TRACE(log, "Moved {} conditions to PREWHERE", moved_conditions_count);
 
-    /// Rewrite the SELECT query.
-
-    select.setExpression(ASTSelectQuery::Expression::WHERE, reconstruct(where_conditions));
-    select.setExpression(ASTSelectQuery::Expression::PREWHERE, reconstruct(prewhere_conditions));
-
-    LOG_DEBUG(log, "MergeTreeWhereOptimizer: condition \"{}\" moved to PREWHERE", select.prewhere());
+    OptimizeResult result = {std::move(where_conditions), std::move(prewhere_conditions)};
+    return result;
 }
 
 
-UInt64 MergeTreeWhereOptimizer::getIdentifiersColumnSize(const NameSet & identifiers) const
+UInt64 MergeTreeWhereOptimizer::getColumnsSize(const NameSet & columns) const
 {
     UInt64 size = 0;
 
-    for (const auto & identifier : identifiers)
-        if (column_sizes.count(identifier))
-            size += column_sizes.at(identifier);
+    for (const auto & column : columns)
+        if (column_sizes.contains(column))
+            size += column_sizes.at(column);
 
     return size;
 }
 
-
-bool MergeTreeWhereOptimizer::hasPrimaryKeyAtoms(const ASTPtr & ast) const
+double MergeTreeWhereOptimizer::approximateBytesPerRow(const NameSet & columns) const
 {
-    if (const auto * func = ast->as<ASTFunction>())
-    {
-        const auto & args = func->arguments->children;
+    double bytes_per_row = 0;
 
-        if ((func->name == "not" && 1 == args.size()) || func->name == "and" || func->name == "or")
-        {
-            for (const auto & arg : args)
-                if (hasPrimaryKeyAtoms(arg))
-                    return true;
+    for (const auto & column : columns)
+        bytes_per_row += approximateBytesPerRowAndColumn(column);
 
-            return false;
-        }
-    }
-
-    return isPrimaryKeyAtom(ast);
+    return bytes_per_row;
 }
 
-
-bool MergeTreeWhereOptimizer::isPrimaryKeyAtom(const ASTPtr & ast) const
+double MergeTreeWhereOptimizer::approximateBytesPerRowAndColumn(const String & column) const
 {
-    if (const auto * func = ast->as<ASTFunction>())
-    {
-        if (!KeyCondition::atom_map.count(func->name))
-            return false;
+    chassert(total_rows > 0);
 
-        const auto & args = func->arguments->children;
-        if (args.size() != 2)
-            return false;
+    if (auto it = column_sizes.find(column); it != column_sizes.end() && it->second != 0)
+        return static_cast<double>(it->second) / static_cast<double>(total_rows);
 
-        const auto & first_arg_name = args.front()->getColumnName();
-        const auto & second_arg_name = args.back()->getColumnName();
+    const auto * virtual_column
+        = storage_metadata->virtuals.tryGetDescription(column, VirtualsKind::All, VirtualsMaterializationPlace::All);
 
-        if ((first_primary_key_column == first_arg_name && isConstant(args[1]))
-            || (first_primary_key_column == second_arg_name && isConstant(args[0]))
-            || (first_primary_key_column == first_arg_name && functionIsInOrGlobalInOperator(func->name)))
-            return true;
-    }
+    /// `_part`, `_partition_id` and the like come from part metadata, so nothing is read for them.
+    /// A virtual column with a default expression (`__text_index_*`) may have to be computed.
+    if (virtual_column && virtual_column->isEphemeral() && !virtual_column->default_desc.expression)
+        return 0;
 
-    return false;
+    if (virtual_column)
+        return approximateBytesPerValueForType(*virtual_column->type);
+
+    if (auto column_in_storage = storage_metadata->getColumns().tryGetColumnOrSubcolumn(GetColumnsOptions::All, column))
+        return approximateBytesPerValueForType(*column_in_storage->type);
+
+    /// Not resolvable through the metadata. Charge the widest estimate rather than 0, which would
+    /// schedule it first.
+    return default_bytes_per_complex_value;
 }
 
-
-bool MergeTreeWhereOptimizer::isSortingKey(const String & column_name) const
+bool MergeTreeWhereOptimizer::columnsSupportPrewhere(const NameSet & columns) const
 {
-    return sorting_key_names.count(column_name);
-}
+    if (!supported_columns.has_value())
+        return true;
 
-
-bool MergeTreeWhereOptimizer::isConstant(const ASTPtr & expr) const
-{
-    const auto column_name = expr->getColumnName();
-
-    return expr->as<ASTLiteral>()
-        || (block_with_constants.has(column_name) && isColumnConst(*block_with_constants.getByName(column_name).column));
-}
-
-
-bool MergeTreeWhereOptimizer::isSubsetOfTableColumns(const NameSet & identifiers) const
-{
-    for (const auto & identifier : identifiers)
-        if (table_columns.count(identifier) == 0)
+    /// The contract lists top-level names; a subcolumn is admitted through its origin column.
+    const auto & columns_description = storage_metadata->getColumns();
+    for (const auto & column : columns)
+        if (!prewhereSupportedColumnsContain(*supported_columns, supported_columns_include_subcolumns, columns_description, column))
             return false;
 
     return true;
 }
 
-
-bool MergeTreeWhereOptimizer::cannotBeMoved(const ASTPtr & ptr, bool is_final) const
+bool MergeTreeWhereOptimizer::isConditionSuitableForStringValueFilter(
+    const RPNBuilderTreeNode & node, const WhereOptimizerContext & where_optimizer_context) const
 {
-    if (const auto * function_ptr = ptr->as<ASTFunction>())
+    if (!node.isFunction())
+        return false;
+
+    auto function_node = node.toFunctionNode();
+    auto function_name = function_node.getFunctionName();
+
+    if (function_node.getArgumentsSize() != 2)
+        return false;
+
+    /// A full String or Nullable(String) column (the scan filter does not support subcolumns),
+    /// which is not read by the existing PREWHERE or the row policy (then the scan filter is not applied).
+    auto is_string_column = [&](const RPNBuilderTreeNode & argument)
     {
-        /// disallow arrayJoin expressions to be moved to PREWHERE for now
-        if ("arrayJoin" == function_ptr->name)
-            return true;
+        if (argument.isFunction() || argument.isConstant() || argument.isSubqueryOrSet())
+            return false;
 
-        /// disallow GLOBAL IN, GLOBAL NOT IN
-        if ("globalIn" == function_ptr->name
-            || "globalNotIn" == function_ptr->name)
-            return true;
+        auto column = storage_metadata->getColumns().tryGetColumnOrSubcolumn(GetColumnsOptions::AllPhysical, argument.getColumnName());
+        if (!column || column->isSubcolumn() || !isString(removeNullable(column->type)))
+            return false;
 
-        /// indexHint is a special function that it does not make sense to transfer to PREWHERE
-        if ("indexHint" == function_ptr->name)
-            return true;
-    }
-    else if (auto opt_name = IdentifierSemantic::getColumnName(ptr))
+        return !where_optimizer_context.columns_read_before_filter
+            || !where_optimizer_context.columns_read_before_filter->contains(column->getNameInStorage());
+    };
+
+    auto get_constant_string = [](const RPNBuilderTreeNode & argument) -> std::optional<String>
     {
-        /// disallow moving result of ARRAY JOIN to PREWHERE
-        if (array_joined_names.count(*opt_name) ||
-            array_joined_names.count(Nested::extractTableName(*opt_name)) ||
-            (is_final && !isSortingKey(*opt_name)))
-            return true;
+        Field value;
+        DataTypePtr type;
+        if (!argument.tryGetConstant(value, type) || value.getType() != Field::Types::String)
+            return {};
+        /// Only a `String` constant, the same restriction as in `extractStringValueFilters`:
+        /// a `FixedString` one carries its zero padding in the `Field`, so no filter is extracted for it.
+        if (!isString(removeLowCardinality(removeNullable(type))))
+            return {};
+        return value.safeGet<String>();
+    };
+
+    /// `position(column, 'needle')` with a non-empty needle.
+    auto is_position = [&](const RPNBuilderTreeNode & argument)
+    {
+        if (!argument.isFunction())
+            return false;
+
+        auto position_node = argument.toFunctionNode();
+        if (position_node.getFunctionName() != "position" || position_node.getArgumentsSize() != 2)
+            return false;
+
+        auto needle = get_constant_string(position_node.getArgumentAt(1));
+        return needle && !needle->empty() && is_string_column(position_node.getArgumentAt(0));
+    };
+
+    if (function_name == "like")
+    {
+        auto pattern = get_constant_string(function_node.getArgumentAt(1));
+        return pattern && likePatternHasStringValueFilterConditions(*pattern) && is_string_column(function_node.getArgumentAt(0));
     }
 
-    for (const auto & child : ptr->children)
-        if (cannotBeMoved(child, is_final))
-            return true;
+    if (function_name == "startsWith" || function_name == "endsWith")
+    {
+        auto needle = get_constant_string(function_node.getArgumentAt(1));
+        return needle && !needle->empty() && is_string_column(function_node.getArgumentAt(0));
+    }
+
+    /// Note: equality with a constant string is not accepted here on purpose, although the scan
+    /// filter supports it. Plain equality is too common: relaxing the rule for it would change
+    /// the plans of too many queries where the primary key index does the job anyway.
+
+    if (function_name == "equals" || function_name == "notEquals" || function_name == "greater" || function_name == "less"
+        || function_name == "greaterOrEquals" || function_name == "lessOrEquals")
+    {
+        /// A comparison of `position(column, 'needle')` with a constant that rejects the zero result.
+        for (size_t position_position : {0, 1})
+        {
+            if (!is_position(function_node.getArgumentAt(position_position)))
+                continue;
+
+            Field constant;
+            DataTypePtr type;
+            if (!function_node.getArgumentAt(1 - position_position).tryGetConstant(constant, type))
+                return false;
+
+            auto result_at_zero = evaluatePositionComparisonAtZero(function_name, constant, position_position == 0);
+            return result_at_zero && !*result_at_zero;
+        }
+
+        return false;
+    }
+
+    /// A `position` result used directly as a condition means it must be non-zero.
+    if (function_name == "position")
+        return is_position(node);
 
     return false;
 }
 
-
-void MergeTreeWhereOptimizer::determineArrayJoinedNames(ASTSelectQuery & select)
+/// Constant folding turns a lambda whose captured columns are all constants into a constant
+/// ColumnFunction: a function object, not a value, so its body still has to be checked
+static bool isConstantDeterministicInScopeOfQuery(const RPNBuilderTreeNode & node)
 {
-    auto [array_join_expression_list, _] = select.arrayJoinExpressionList();
+    const auto * dag_node = node.getDAGNode();
+    if (!dag_node)
+        return true; /// AST constants are scalar literals, lambdas are not folded into them
 
-    /// much simplified code from ExpressionAnalyzer::getArrayJoinedColumns()
-    if (!array_join_expression_list)
-        return;
+    while (dag_node->type == ActionsDAG::ActionType::ALIAS)
+        dag_node = dag_node->children.front();
 
-    for (const auto & ast : array_join_expression_list->children)
-        array_joined_names.emplace(ast->getAliasOrColumnName());
+    if (!dag_node->column)
+        return true;
+
+    return allColumnFunctions(*dag_node->column, [](const IFunctionBase & function) { return function.isDeterministicInScopeOfQuery(); });
+}
+
+static bool isFunctionDeterministicInScopeOfQuery(const RPNBuilderFunctionTreeNode & function_node, const ContextPtr & context)
+{
+    if (auto function_base = function_node.getFunctionBase())
+        return function_base->isDeterministicInScopeOfQuery();
+
+    /// For an AST-based tree there is no resolved function, mirror the legacy analyzer's lookup order
+    const auto function_name = function_node.getFunctionName();
+
+    /// executable UDFs are never stable within a query
+    if (UserDefinedExecutableFunctionFactory::has(function_name, context))
+        return false;
+
+    /// WASM UDFs are stable only when declared deterministic, plain SQL UDFs are inlined before this point
+    if (auto create_function_query = UserDefinedSQLFunctionFactory::instance().tryGet(function_name))
+    {
+        const auto * create_wasm_function_query = create_function_query->as<ASTCreateWasmFunctionQuery>();
+        return create_wasm_function_query && create_wasm_function_query->is_deterministic;
+    }
+
+    auto function_resolver = FunctionFactory::instance().tryGet(function_name, context);
+    return function_resolver && function_resolver->isDeterministicInScopeOfQuery();
+}
+
+bool MergeTreeWhereOptimizer::isDeterministicExpressionOverSortingKey(const RPNBuilderTreeNode & node, const ContextPtr & context) const
+{
+    if (node.isFunction())
+    {
+        auto function_node = node.toFunctionNode();
+
+        /// functions like rand can give different results for row versions of the same key,
+        /// query-scoped-stable ones (e.g. runtime filters) are fine to evaluate before the merge
+        if (!isFunctionDeterministicInScopeOfQuery(function_node, context))
+            return false;
+
+        size_t arguments_size = function_node.getArgumentsSize();
+
+        for (size_t i = 0; i < arguments_size; ++i)
+        {
+            auto argument = function_node.getArgumentAt(i);
+            auto argument_column_name = argument.getColumnName();
+
+            if (argument.isConstant())
+            {
+                /// a folded lambda hides its body behind a constant
+                if (!isConstantDeterministicInScopeOfQuery(argument))
+                    return false;
+                continue;
+            }
+
+            if (sorting_key_names.contains(argument_column_name))
+                continue;
+
+            if (!isDeterministicExpressionOverSortingKey(argument, context))
+                return false;
+        }
+
+        return true;
+    }
+
+    return node.isConstant() || sorting_key_names.contains(node.getColumnName());
+}
+
+bool MergeTreeWhereOptimizer::isSortingKey(const String & column_name) const
+{
+    return sorting_key_names.contains(column_name);
+}
+
+bool MergeTreeWhereOptimizer::isSubsetOfTableColumns(const NameSet & columns) const
+{
+    for (const auto & column : columns)
+        if (!table_columns.contains(column))
+            return false;
+
+    return true;
+}
+
+bool MergeTreeWhereOptimizer::cannotBeMoved(const RPNBuilderTreeNode & node, const WhereOptimizerContext & where_optimizer_context) const
+{
+    if (node.isFunction())
+    {
+        auto function_node = node.toFunctionNode();
+        auto function_name = function_node.getFunctionName();
+
+        /// disallow arrayJoin expressions to be moved to PREWHERE for now
+        if (function_name == "arrayJoin")
+            return true;
+
+        /// Disallow GLOBAL IN conditions from being moved to PREWHERE.
+        /// GLOBAL IN sets are populated via external tables attached by `ReadFromRemote`;
+        /// they cannot be built synchronously during PREWHERE evaluation, which runs
+        /// before the pipeline-level `CreatingSetsStep` has a chance to execute.
+        if (functionIsGlobalInOperator(function_name))
+            return true;
+
+        size_t arguments_size = function_node.getArgumentsSize();
+        for (size_t i = 0; i < arguments_size; ++i)
+        {
+            auto argument = function_node.getArgumentAt(i);
+            if (cannotBeMoved(argument, where_optimizer_context))
+                return true;
+        }
+    }
+    else
+    {
+        auto column_name = node.getColumnName();
+
+        /// disallow moving result of ARRAY JOIN to PREWHERE
+        if (where_optimizer_context.array_joined_names.contains(column_name) ||
+            where_optimizer_context.array_joined_names.contains(Nested::extractTableName(column_name)) ||
+            (table_columns.contains(column_name) && where_optimizer_context.is_final && !isSortingKey(column_name)))
+            return true;
+    }
+
+    return false;
+}
+
+bool MergeTreeWhereOptimizer::isExpensiveExpression(const RPNBuilderTreeNode & node)
+{
+    if (!node.isFunction())
+        return false;
+
+    auto function_node = node.toFunctionNode();
+    if (auto function_base = function_node.getFunctionBase(); function_base && function_base->isExpensive())
+        return true;
+
+    size_t arguments_size = function_node.getArgumentsSize();
+    for (size_t i = 0; i < arguments_size; ++i)
+    {
+        if (isExpensiveExpression(function_node.getArgumentAt(i)))
+            return true;
+    }
+
+    return false;
 }
 
 }

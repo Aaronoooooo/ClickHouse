@@ -2,8 +2,13 @@
 #include <type_traits>
 #include <vector>
 #include <IO/WriteBuffer.h>
-#include <Formats/FormatSettings.h>
 #include <IO/WriteHelpers.h>
+#include <IO/writeJSONNumber.h>
+
+namespace DB
+{
+struct FormatSettings;
+}
 
 namespace DB::JSONBuilder
 {
@@ -13,7 +18,16 @@ struct FormatSettings
     const DB::FormatSettings & settings;
     size_t indent = 2;
     bool print_simple_arrays_in_single_row = true;
+    bool solid = false; // the output will not contain spaces and line breaks
+    /// Write the keys of maps in camelCase (see `toCamelCaseKey`): `Node Type` as `nodeType`. Values are written as is.
+    bool camel_case_keys = false;
 };
+
+/// `Node Type` -> `nodeType`, `HAVING Pre-filter` -> `havingPreFilter`, `TopN Filter Column` -> `topNFilterColumn`. The key
+/// is split into words at every character that is not an ASCII letter or digit. The first word is lowercased, the
+/// following words get an uppercase first letter, and a word in capitals only is treated as a regular word (`FINAL`
+/// -> `final` or `Final`).
+std::string toCamelCaseKey(std::string_view key);
 
 struct FormatContext
 {
@@ -33,7 +47,7 @@ using ItemPtr = std::unique_ptr<IItem>;
 class JSONString : public IItem
 {
 public:
-    JSONString(std::string_view value_) : value(value_) {}
+    explicit JSONString(std::string_view value_) : value(value_) {}
     void format(const FormatSettings & settings, FormatContext & context) override;
 
 private:
@@ -61,7 +75,7 @@ private:
 class JSONBool : public IItem
 {
 public:
-    explicit JSONBool(bool value_) : value(std::move(value_)) {}
+    explicit JSONBool(bool value_) : value(value_) {}
     void format(const FormatSettings & settings, FormatContext & context) override;
 
 private:
@@ -74,9 +88,10 @@ public:
     void add(ItemPtr value) { values.push_back(std::move(value)); }
     void add(std::string value) { add(std::make_unique<JSONString>(std::move(value))); }
     void add(const char * value) { add(std::make_unique<JSONString>(value)); }
-    void add(bool value) { add(std::make_unique<JSONBool>(std::move(value))); }
+    void add(bool value) { add(std::make_unique<JSONBool>(value)); }
 
-    template <typename T, std::enable_if_t<std::is_arithmetic<T>::value, bool> = true>
+    template <typename T>
+    requires std::is_arithmetic_v<T>
     void add(T value) { add(std::make_unique<JSONNumber<T>>(value)); }
 
     void format(const FormatSettings & settings, FormatContext & context) override;
@@ -94,19 +109,26 @@ class JSONMap : public IItem
     };
 
 public:
-    void add(std::string key, ItemPtr value) { values.emplace_back(Pair{.key = std::move(key), .value = std::move(value)}); } //-V1030
+    void add(std::string key, ItemPtr value) { values.emplace_back(Pair{.key = std::move(key), .value = std::move(value)}); }
     void add(std::string key, std::string value) { add(std::move(key), std::make_unique<JSONString>(std::move(value))); }
     void add(std::string key, const char * value) { add(std::move(key), std::make_unique<JSONString>(value)); }
     void add(std::string key, std::string_view value) { add(std::move(key), std::make_unique<JSONString>(value)); }
-    void add(std::string key, bool value) { add(std::move(key), std::make_unique<JSONBool>(std::move(value))); }
+    void add(std::string key, bool value) { add(std::move(key), std::make_unique<JSONBool>(value)); }
 
-    template <typename T, std::enable_if_t<std::is_arithmetic<T>::value, bool> = true>
+    template <typename T>
+    requires std::is_arithmetic_v<T>
     void add(std::string key, T value) { add(std::move(key), std::make_unique<JSONNumber<T>>(value)); }
 
     void format(const FormatSettings & settings, FormatContext & context) override;
 
 private:
     std::vector<Pair> values;
+};
+
+class JSONNull : public IItem
+{
+public:
+    void format(const FormatSettings & settings, FormatContext & context) override;
 };
 
 }

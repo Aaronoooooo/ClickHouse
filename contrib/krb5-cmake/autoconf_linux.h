@@ -440,7 +440,9 @@
 #define HAVE_STRERROR 1
 
 /* Define to 1 if you have the `strerror_r' function. */
+#ifndef USE_MUSL
 #define HAVE_STRERROR_R 1
+#endif
 
 /* Define to 1 if you have the <strings.h> header file. */
 #define HAVE_STRINGS_H 1
@@ -635,7 +637,7 @@
 #define PACKAGE_NAME "Kerberos 5"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "Kerberos 5 1.17.1"
+#define PACKAGE_STRING "Kerberos 5 1.22.1"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "krb5"
@@ -644,7 +646,7 @@
 #define PACKAGE_URL ""
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "1.17.1"
+#define PACKAGE_VERSION "1.22.1"
 
 /* Define if setjmp indicates POSIX interface */
 /* #undef POSIX_SETJMP */

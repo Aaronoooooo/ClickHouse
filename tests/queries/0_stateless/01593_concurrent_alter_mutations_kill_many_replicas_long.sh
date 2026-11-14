@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Tags: long, replica, no-parallel
+# Tags: long, replica, no-parallel, no-msan
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CURDIR"/../shell_config.sh
 # shellcheck source=./replication.lib
 . "$CURDIR"/replication.lib
+
+SHARD=$($CLICKHOUSE_CLIENT --query "Select getMacro('shard')")
+REPLICA=$($CLICKHOUSE_CLIENT --query "Select getMacro('replica')")
 
 REPLICAS=5
 
@@ -29,7 +32,9 @@ done
 
 function alter_thread
 {
-    while true; do
+    local TIMELIMIT=$((SECONDS+TIMEOUT))
+    while [ $SECONDS -lt "$TIMELIMIT" ]
+    do
         REPLICA=$(($RANDOM % 5 + 1))
         TYPE=$($CLICKHOUSE_CLIENT --query "SELECT type FROM system.columns WHERE table='concurrent_kill_$REPLICA' and database='${CLICKHOUSE_DATABASE}' and name='value'")
         if [ "$TYPE" == "String" ]; then
@@ -42,30 +47,29 @@ function alter_thread
 
 function kill_mutation_thread
 {
-    while true; do
+    local TIMELIMIT=$((SECONDS+TIMEOUT))
+    while [ $SECONDS -lt "$TIMELIMIT" ]
+    do
         # find any mutation and kill it
         mutation_id=$($CLICKHOUSE_CLIENT --query "SELECT mutation_id FROM system.mutations WHERE is_done = 0 and table like 'concurrent_kill_%' and database='${CLICKHOUSE_DATABASE}' LIMIT 1")
         if [ ! -z "$mutation_id" ]; then
-            $CLICKHOUSE_CLIENT --query "KILL MUTATION WHERE mutation_id='$mutation_id' and table like 'concurrent_kill_%' and database='${CLICKHOUSE_DATABASE}'" 1> /dev/null
+            $CLICKHOUSE_CLIENT --query "KILL MUTATION WHERE mutation_id='$mutation_id' and table like 'concurrent_kill_%' and database='${CLICKHOUSE_DATABASE}' SETTINGS kill_throw_if_noop = false" 1> /dev/null
             sleep 1
         fi
     done
 }
 
-export -f alter_thread;
-export -f kill_mutation_thread;
-
 TIMEOUT=30
 
-timeout $TIMEOUT bash -c alter_thread 2> /dev/null &
-timeout $TIMEOUT bash -c kill_mutation_thread 2> /dev/null &
+alter_thread 2> /dev/null &
+kill_mutation_thread 2> /dev/null &
 
 wait
 
 # with timeout alter query can be not finished yet, so to execute new alter
 # we use retries
 counter=0
-while true; do
+while clickhouse_test_time_left; do
     if $CLICKHOUSE_CLIENT --query "ALTER TABLE concurrent_kill_1 MODIFY COLUMN value Int64 SETTINGS replication_alter_partitions_sync=2" 2> /dev/null ; then
         break
     fi
@@ -79,9 +83,9 @@ while true; do
 done
 
 
-metadata_version=$($CLICKHOUSE_CLIENT --query "SELECT value FROM system.zookeeper WHERE path = '/clickhouse/tables/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/s1/replicas/r11/' and name = 'metadata_version'")
+metadata_version=$($CLICKHOUSE_CLIENT --query "SELECT value FROM system.zookeeper WHERE path = '/clickhouse/tables/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/$SHARD/replicas/${REPLICA}1/' and name = 'metadata_version'")
 for i in $(seq $REPLICAS); do
-    replica_metadata_version=$($CLICKHOUSE_CLIENT --query "SELECT value FROM system.zookeeper WHERE path = '/clickhouse/tables/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/s1/replicas/r1$i/' and name = 'metadata_version'")
+    replica_metadata_version=$($CLICKHOUSE_CLIENT --query "SELECT value FROM system.zookeeper WHERE path = '/clickhouse/tables/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/$SHARD/replicas/${REPLICA}$i/' and name = 'metadata_version'")
 
     if [ "$metadata_version" != "$replica_metadata_version" ]; then
         echo "Metadata version on replica $i differs from the first replica, FAIL"

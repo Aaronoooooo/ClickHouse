@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <type_traits>
@@ -7,13 +8,14 @@
 #include <IO/WriteHelpers.h>
 #include <IO/ReadHelpers.h>
 
-#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <Columns/ColumnVector.h>
 
 #include <AggregateFunctions/IAggregateFunction.h>
 
-#include <Common/config.h>
+#include "config.h"
+#include <Common/TargetSpecific.h>
+#include <base/wide_integer_impl.h>
 
 #if USE_EMBEDDED_COMPILER
 #    include <llvm/IR/IRBuilder.h>
@@ -23,6 +25,28 @@
 namespace DB
 {
 struct Settings;
+
+/// Maps wide integer types to native builtin integer types for better performance in accumulation
+template <typename T>
+struct AccumulateResultType
+{
+    using type = T;
+};
+
+#if defined(__x86_64__)
+/// Use Clang's builtin _BitInt(256) for Int256 accumulation on x86_64
+template <>
+struct AccumulateResultType<wide::integer<256, signed>>
+{
+    using type = wide::BitInt256;
+};
+
+template <>
+struct AccumulateResultType<wide::integer<256, unsigned>>
+{
+    using type = wide::BitUInt256;
+};
+#endif
 
 /// Uses addOverflow method (if available) to avoid UB for sumWithOverflow()
 ///
@@ -49,35 +73,119 @@ struct AggregateFunctionSumAddOverflowImpl<Decimal<DecimalNativeType>>
 template <typename T>
 struct AggregateFunctionSumData
 {
-    using Impl = AggregateFunctionSumAddOverflowImpl<T>;
-    T sum{};
+    using AccumulateResult = typename AccumulateResultType<T>::type;
+    using Impl = AggregateFunctionSumAddOverflowImpl<AccumulateResult>;
+    AccumulateResult sum{};
+
+    static constexpr AccumulateResult ALWAYS_INLINE toAccumulateResult(const T & value)
+    {
+#if defined(__x86_64__)
+        if constexpr (std::is_same_v<T, wide::integer<256, signed>> || std::is_same_v<T, wide::integer<256, unsigned>>)
+            return wide::toBitInt256(value);
+        else
+#endif
+            return static_cast<AccumulateResult>(value);
+    }
 
     void NO_SANITIZE_UNDEFINED ALWAYS_INLINE add(T value)
     {
-        Impl::add(sum, value);
+        Impl::add(sum, toAccumulateResult(value));
+    }
+
+    /// `sum` and `sumIf` over Decimal32 and Decimal64 accumulate into Decimal128, and sumWithOverflow over them into the
+    /// same type. The generic loop widens each row to the total's type and adds it as one value. Instead, sum the raw
+    /// integers in 64-bit arithmetic, which vectorizes, and add the total once. The total is exact, or wraps modulo 2^N,
+    /// so the result is the same bit for bit, including on overflow.
+    template <typename Value>
+    static constexpr bool sum_narrow_decimals = (std::is_same_v<Value, Decimal32> || std::is_same_v<Value, Decimal64>)
+        && (std::is_same_v<T, Value> || std::is_same_v<T, Decimal128>);
+
+    /// A row counts when `bool(condition)` differs from `add_if_zero`, as in the generic loop. Null maps may hold any
+    /// nonzero byte for a NULL, so the byte must be converted to `bool` before the comparison.
+    template <typename Value, bool conditional, bool add_if_zero>
+    static ALWAYS_INLINE NativeType<T> sumNarrowDecimals(const Value * __restrict ptr, const UInt8 * __restrict condition_map, size_t count)
+    {
+        using Native = NativeType<Value>;
+        /// Unsigned arithmetic wraps modulo 2^N without undefined behaviour.
+        using Total = make_unsigned_t<NativeType<T>>;
+        /// At most 2^31 rows per chunk keeps the 64-bit partial sums below 2^63.
+        constexpr size_t max_chunk = size_t(1) << 31;
+
+        Total total = 0;
+        while (count > 0)
+        {
+            const size_t chunk = std::min(count, max_chunk);
+            if constexpr (sizeof(Native) == 4 || std::is_same_v<T, Value>)
+            {
+                /// Decimal32 aggregated into Decimal128. |value| <= 2^31, so a chunk sums to at most 2^62.
+                /// Or Decimal32 or Decimal64 aggregated into a total of its own type, where the sum may wrap.
+                using Partial = std::conditional_t<std::is_same_v<T, Value>, make_unsigned_t<Native>, Int64>;
+                Partial partial = 0;
+                for (size_t i = 0; i < chunk; ++i)
+                {
+                    Partial value = static_cast<Partial>(ptr[i].value);
+                    if constexpr (conditional)
+                        value &= -static_cast<Partial>(static_cast<bool>(condition_map[i]) != add_if_zero);
+                    partial += value;
+                }
+                total += static_cast<Total>(partial);
+            }
+            else
+            {
+                /// Decimal64 aggregated into Decimal128. A chunk sums to at most 2^62 in `high` and below 2^63 in `low`.
+                Int64 high = 0;
+                UInt64 low = 0;
+                for (size_t i = 0; i < chunk; ++i)
+                {
+                    Int64 value = ptr[i].value;
+                    if constexpr (conditional)
+                        value &= -static_cast<Int64>(static_cast<bool>(condition_map[i]) != add_if_zero);
+                    high += value >> 32;
+                    low += static_cast<UInt64>(value) & 0xFFFFFFFF;
+                }
+                total += (static_cast<Total>(high) << 32) + static_cast<Total>(low);
+            }
+
+            ptr += chunk;
+            count -= chunk;
+            if constexpr (conditional)
+                condition_map += chunk;
+        }
+        return static_cast<NativeType<T>>(total);
     }
 
     /// Vectorized version
+    MULTITARGET_FUNCTION_X86_V4(
+    MULTITARGET_FUNCTION_HEADER(
     template <typename Value>
-    void NO_SANITIZE_UNDEFINED NO_INLINE addMany(const Value * __restrict ptr, size_t count)
+    void NO_SANITIZE_UNDEFINED NO_INLINE
+    ), addManyImpl, MULTITARGET_FUNCTION_BODY((const Value * __restrict ptr, size_t start, size_t end) /// NOLINT
     {
-        const auto * end = ptr + count;
+        ptr += start;
+        size_t count = end - start;
+        const auto * end_ptr = ptr + count;
 
-        if constexpr (std::is_floating_point_v<T>)
+        if constexpr (sum_narrow_decimals<Value>)
+        {
+            Impl::add(sum, T(sumNarrowDecimals<Value, false, false>(ptr, nullptr, count)));
+            return;
+        }
+
+        if constexpr (is_floating_point<T>)
         {
             /// Compiler cannot unroll this loop, do it manually.
             /// (at least for floats, most likely due to the lack of -fassociative-math)
 
             /// Something around the number of SSE registers * the number of elements fit in register.
             constexpr size_t unroll_count = 128 / sizeof(T);
-            T partial_sums[unroll_count]{};
+            AccumulateResult partial_sums[unroll_count]{};
 
             const auto * unrolled_end = ptr + (count / unroll_count * unroll_count);
 
             while (ptr < unrolled_end)
             {
                 for (size_t i = 0; i < unroll_count; ++i)
-                    Impl::add(partial_sums[i], ptr[i]);
+                    Impl::add(partial_sums[i], toAccumulateResult(static_cast<T>(ptr[i])));
                 ptr += unroll_count;
             }
 
@@ -86,47 +194,87 @@ struct AggregateFunctionSumData
         }
 
         /// clang cannot vectorize the loop if accumulator is class member instead of local variable.
-        T local_sum{};
-        while (ptr < end)
+        AccumulateResult local_sum{};
+        while (ptr < end_ptr)
         {
-            Impl::add(local_sum, *ptr);
+            Impl::add(local_sum, toAccumulateResult(static_cast<T>(*ptr)));
             ++ptr;
         }
         Impl::add(sum, local_sum);
+    })
+    )
+
+    /// Vectorized version
+    template <typename Value>
+    void NO_INLINE addMany(const Value * __restrict ptr, size_t start, size_t end)
+    {
+#if USE_X86_64_MULTITARGET_CODE
+        if (isArchSupported(TargetArch::x86_64_v4))
+        {
+            addManyImpl_x86_64_v4(ptr, start, end);
+            return;
+        }
+#endif
+
+        addManyImpl(ptr, start, end);
     }
 
+    MULTITARGET_FUNCTION_X86_V4(
+    MULTITARGET_FUNCTION_HEADER(
     template <typename Value, bool add_if_zero>
     void NO_SANITIZE_UNDEFINED NO_INLINE
-    addManyConditional_internal(const Value * __restrict ptr, const UInt8 * __restrict condition_map, size_t count)
+    ), addManyConditionalInternalImpl, MULTITARGET_FUNCTION_BODY((const Value * __restrict ptr, const UInt8 * __restrict condition_map, size_t start, size_t end) /// NOLINT
     {
-        const auto * end = ptr + count;
+        ptr += start;
+        condition_map += start;
+        size_t count = end - start;
+        const auto * end_ptr = ptr + count;
 
-        if constexpr (
-            (is_integer<T> && !is_big_int_v<T>)
-            || (is_decimal<T> && !std::is_same_v<T, Decimal256> && !std::is_same_v<T, Decimal128>))
+        if constexpr (sum_narrow_decimals<Value>)
+        {
+            Impl::add(sum, T(sumNarrowDecimals<Value, true, add_if_zero>(ptr, condition_map, count)));
+            return;
+        }
+
+        if constexpr ((is_integer<T> || is_decimal<T>) && !is_over_big_int<T>)
         {
             /// For integers we can vectorize the operation if we replace the null check using a multiplication (by 0 for null, 1 for not null)
             /// https://quick-bench.com/q/MLTnfTvwC2qZFVeWHfOBR3U7a8I
-            T local_sum{};
-            while (ptr < end)
+            AccumulateResult local_sum{};
+            while (ptr < end_ptr)
             {
-                T multiplier = !*condition_map == add_if_zero;
-                Impl::add(local_sum, *ptr * multiplier);
+                AccumulateResult multiplier = !*condition_map == add_if_zero;
+                Impl::add(local_sum, toAccumulateResult(static_cast<T>(*ptr)) * multiplier);
                 ++ptr;
                 ++condition_map;
             }
             Impl::add(sum, local_sum);
             return;
         }
-
-        if constexpr (std::is_floating_point_v<T>)
+        else if constexpr (is_over_big_int<T>)
         {
-            /// For floating point we use a similar trick as above, except that now we  reinterpret the floating point number as an unsigned
+            const uint64_t masks[2] = {0, ~0ULL};
+            AccumulateResult local_sum{};
+            for (size_t i = 0; i < count; ++i)
+            {
+                uint8_t flag = (condition_map[i] != add_if_zero);
+
+                AccumulateResult mask{};
+                std::memset(&mask, static_cast<int>(masks[flag]), sizeof(AccumulateResult));
+
+                Impl::add(local_sum, toAccumulateResult(static_cast<T>(ptr[i])) & mask);
+            }
+            Impl::add(sum, local_sum);
+            return;
+        }
+        else if constexpr (is_floating_point<T> && (sizeof(Value) == 4 || sizeof(Value) == 8))
+        {
+            /// For floating point we use a similar trick as above, except that now we reinterpret the floating point number as an unsigned
             /// integer of the same size and use a mask instead (0 to discard, 0xFF..FF to keep)
-            static_assert(sizeof(Value) == 4 || sizeof(Value) == 8);
-            typedef typename std::conditional<sizeof(Value) == 4, UInt32, UInt64>::type equivalent_integer;
+            using EquivalentInteger = typename std::conditional_t<sizeof(Value) == 4, UInt32, UInt64>;
+
             constexpr size_t unroll_count = 128 / sizeof(T);
-            T partial_sums[unroll_count]{};
+            AccumulateResult partial_sums[unroll_count]{};
 
             const auto * unrolled_end = ptr + (count / unroll_count * unroll_count);
 
@@ -134,12 +282,12 @@ struct AggregateFunctionSumData
             {
                 for (size_t i = 0; i < unroll_count; ++i)
                 {
-                    equivalent_integer value;
-                    std::memcpy(&value, &ptr[i], sizeof(Value));
+                    EquivalentInteger value;
+                    memcpy(&value, &ptr[i], sizeof(Value));
                     value &= (!condition_map[i] != add_if_zero) - 1;
                     Value d;
-                    std::memcpy(&d, &value, sizeof(Value));
-                    Impl::add(partial_sums[i], d);
+                    memcpy(&d, &value, sizeof(Value));
+                    Impl::add(partial_sums[i], toAccumulateResult(static_cast<T>(d)));
                 }
                 ptr += unroll_count;
                 condition_map += unroll_count;
@@ -149,27 +297,43 @@ struct AggregateFunctionSumData
                 Impl::add(sum, partial_sums[i]);
         }
 
-        T local_sum{};
-        while (ptr < end)
+        AccumulateResult local_sum{};
+        while (ptr < end_ptr)
         {
             if (!*condition_map == add_if_zero)
-                Impl::add(local_sum, *ptr);
+                Impl::add(local_sum, toAccumulateResult(static_cast<T>(*ptr)));
             ++ptr;
             ++condition_map;
         }
         Impl::add(sum, local_sum);
+    })
+    )
+
+    /// Vectorized version
+    template <typename Value, bool add_if_zero>
+    void NO_INLINE addManyConditionalInternal(const Value * __restrict ptr, const UInt8 * __restrict condition_map, size_t start, size_t end)
+    {
+#if USE_X86_64_MULTITARGET_CODE
+        if (isArchSupported(TargetArch::x86_64_v4))
+        {
+            addManyConditionalInternalImpl_x86_64_v4<Value, add_if_zero>(ptr, condition_map, start, end);
+            return;
+        }
+#endif
+
+        addManyConditionalInternalImpl<Value, add_if_zero>(ptr, condition_map, start, end);
     }
 
     template <typename Value>
-    void ALWAYS_INLINE addManyNotNull(const Value * __restrict ptr, const UInt8 * __restrict null_map, size_t count)
+    void ALWAYS_INLINE addManyNotNull(const Value * __restrict ptr, const UInt8 * __restrict null_map, size_t start, size_t end)
     {
-        return addManyConditional_internal<Value, true>(ptr, null_map, count);
+        return addManyConditionalInternal<Value, true>(ptr, null_map, start, end);
     }
 
     template <typename Value>
-    void ALWAYS_INLINE addManyConditional(const Value * __restrict ptr, const UInt8 * __restrict cond_map, size_t count)
+    void ALWAYS_INLINE addManyConditional(const Value * __restrict ptr, const UInt8 * __restrict cond_map, size_t start, size_t end)
     {
-        return addManyConditional_internal<Value, false>(ptr, cond_map, count);
+        return addManyConditionalInternal<Value, false>(ptr, cond_map, start, end);
     }
 
     void NO_SANITIZE_UNDEFINED merge(const AggregateFunctionSumData & rhs)
@@ -177,19 +341,31 @@ struct AggregateFunctionSumData
         Impl::add(sum, rhs.sum);
     }
 
-    void write(WriteBuffer & buf) const
+    static constexpr size_t serialized_size_bound = sizeof(AccumulateResult);
+
+    /// `out` is either a WriteBuffer or a raw `char *` cursor; both are advanced past the state.
+    template <typename Out>
+    void write(Out & out) const
     {
-        writeBinary(sum, buf);
+        writeBinaryLittleEndian(sum, out);
     }
 
     void read(ReadBuffer & buf)
     {
-        readBinary(sum, buf);
+        readBinaryLittleEndian(sum, buf);
     }
 
     T get() const
     {
-        return sum;
+#if defined(__x86_64__)
+        if constexpr (std::is_same_v<AccumulateResult, wide::BitInt256> || std::is_same_v<AccumulateResult, wide::BitUInt256>)
+            return wide::fromBitInt256(sum);
+        else
+#endif
+        if constexpr (std::is_same_v<AccumulateResult, __int128>|| std::is_same_v<AccumulateResult, unsigned __int128>)
+            return *reinterpret_cast<const T*>(&sum);
+        else
+            return static_cast<T>(sum);
     }
 
 };
@@ -197,7 +373,7 @@ struct AggregateFunctionSumData
 template <typename T>
 struct AggregateFunctionSumKahanData
 {
-    static_assert(std::is_floating_point_v<T>,
+    static_assert(is_floating_point<T>,
         "It doesn't make sense to use Kahan Summation algorithm for non floating point types");
 
     T sum{};
@@ -219,7 +395,7 @@ struct AggregateFunctionSumKahanData
 
     /// Vectorized version
     template <typename Value>
-    void NO_INLINE addMany(const Value * __restrict ptr, size_t count)
+    void NO_INLINE addMany(const Value * __restrict ptr, size_t start, size_t end)
     {
         /// Less than in ordinary sum, because the algorithm is more complicated and too large loop unrolling is questionable.
         /// But this is just a guess.
@@ -227,7 +403,10 @@ struct AggregateFunctionSumKahanData
         T partial_sums[unroll_count]{};
         T partial_compensations[unroll_count]{};
 
-        const auto * end = ptr + count;
+        ptr += start;
+        size_t count = end - start;
+
+        const auto * end_ptr = ptr + count;
         const auto * unrolled_end = ptr + (count / unroll_count * unroll_count);
 
         while (ptr < unrolled_end)
@@ -240,7 +419,7 @@ struct AggregateFunctionSumKahanData
         for (size_t i = 0; i < unroll_count; ++i)
             mergeImpl(sum, compensation, partial_sums[i], partial_compensations[i]);
 
-        while (ptr < end)
+        while (ptr < end_ptr)
         {
             addImpl(*ptr, sum, compensation);
             ++ptr;
@@ -248,13 +427,17 @@ struct AggregateFunctionSumKahanData
     }
 
     template <typename Value, bool add_if_zero>
-    void NO_INLINE addManyConditional_internal(const Value * __restrict ptr, const UInt8 * __restrict condition_map, size_t count)
+    void NO_INLINE addManyConditionalInternal(const Value * __restrict ptr, const UInt8 * __restrict condition_map, size_t start, size_t end)
     {
         constexpr size_t unroll_count = 4;
         T partial_sums[unroll_count]{};
         T partial_compensations[unroll_count]{};
 
-        const auto * end = ptr + count;
+        ptr += start;
+        condition_map += start;
+        size_t count = end - start;
+
+        const auto * end_ptr = ptr + count;
         const auto * unrolled_end = ptr + (count / unroll_count * unroll_count);
 
         while (ptr < unrolled_end)
@@ -269,7 +452,7 @@ struct AggregateFunctionSumKahanData
         for (size_t i = 0; i < unroll_count; ++i)
             mergeImpl(sum, compensation, partial_sums[i], partial_compensations[i]);
 
-        while (ptr < end)
+        while (ptr < end_ptr)
         {
             if ((!*condition_map) == add_if_zero)
                 addImpl(*ptr, sum, compensation);
@@ -279,15 +462,15 @@ struct AggregateFunctionSumKahanData
     }
 
     template <typename Value>
-    void ALWAYS_INLINE addManyNotNull(const Value * __restrict ptr, const UInt8 * __restrict null_map, size_t count)
+    void ALWAYS_INLINE addManyNotNull(const Value * __restrict ptr, const UInt8 * __restrict null_map, size_t start, size_t end)
     {
-        return addManyConditional_internal<Value, true>(ptr, null_map, count);
+        return addManyConditionalInternal<Value, true>(ptr, null_map, start, end);
     }
 
     template <typename Value>
-    void ALWAYS_INLINE addManyConditional(const Value * __restrict ptr, const UInt8 * __restrict cond_map, size_t count)
+    void ALWAYS_INLINE addManyConditional(const Value * __restrict ptr, const UInt8 * __restrict cond_map, size_t start, size_t end)
     {
-        return addManyConditional_internal<Value, false>(ptr, cond_map, count);
+        return addManyConditionalInternal<Value, false>(ptr, cond_map, start, end);
     }
 
     void ALWAYS_INLINE mergeImpl(T & to_sum, T & to_compensation, T from_sum, T from_compensation)
@@ -306,10 +489,14 @@ struct AggregateFunctionSumKahanData
         mergeImpl(sum, compensation, rhs.sum, rhs.compensation);
     }
 
-    void write(WriteBuffer & buf) const
+    static constexpr size_t serialized_size_bound = sizeof(T) * 2;
+
+    /// `out` is either a WriteBuffer or a raw `char *` cursor; both are advanced past the state.
+    template <typename Out>
+    void write(Out & out) const
     {
-        writeBinary(sum, buf);
-        writeBinary(compensation, buf);
+        writeBinary(sum, out);
+        writeBinary(compensation, out);
     }
 
     void read(ReadBuffer & buf)
@@ -339,6 +526,7 @@ public:
     static constexpr bool DateTime64Supported = false;
 
     using ColVecType = ColumnVectorOrDecimal<T>;
+    using ResultType = TResult;
 
     String getName() const override
     {
@@ -348,58 +536,81 @@ public:
             return "sumWithOverflow";
         else if constexpr (Type == AggregateFunctionTypeSumKahan)
             return "sumKahan";
-        __builtin_unreachable();
     }
 
-    AggregateFunctionSum(const DataTypes & argument_types_)
-        : IAggregateFunctionDataHelper<Data, AggregateFunctionSum<T, TResult, Data, Type>>(argument_types_, {})
-        , scale(0)
+    explicit AggregateFunctionSum(const DataTypes & argument_types_)
+        : IAggregateFunctionDataHelper<Data, AggregateFunctionSum<T, TResult, Data, Type>>(argument_types_, {}, createResultType(0))
     {}
 
     AggregateFunctionSum(const IDataType & data_type, const DataTypes & argument_types_)
-        : IAggregateFunctionDataHelper<Data, AggregateFunctionSum<T, TResult, Data, Type>>(argument_types_, {})
-        , scale(getDecimalScale(data_type))
+        : IAggregateFunctionDataHelper<Data, AggregateFunctionSum<T, TResult, Data, Type>>(argument_types_, {}, createResultType(getDecimalScale(data_type)))
     {}
 
-    DataTypePtr getReturnType() const override
+    /// For result types that are backed by `TResult` but are not `TResult` itself, such as the
+    /// `Interval` data types, which are backed by `Int64`.
+    AggregateFunctionSum(const DataTypes & argument_types_, const DataTypePtr & result_type_)
+        : IAggregateFunctionDataHelper<Data, AggregateFunctionSum<T, TResult, Data, Type>>(argument_types_, {}, result_type_)
+    {}
+
+    static DataTypePtr createResultType(UInt32 scale_)
     {
         if constexpr (!is_decimal<T>)
             return std::make_shared<DataTypeNumber<TResult>>();
         else
         {
             using DataType = DataTypeDecimal<TResult>;
-            return std::make_shared<DataType>(DataType::maxPrecision(), scale);
+            return std::make_shared<DataType>(DataType::maxPrecision(), scale_);
         }
     }
 
     bool allocatesMemoryInArena() const override { return false; }
 
+    /// The sum of unsigned integers qualifies for the `Subadditive` bound: the merged value is
+    /// the modular sum of the partial values, which never exceeds their saturating sum - even
+    /// when the accumulator wraps around. Signed and floating-point sums do not qualify
+    /// (negative addends break the bound), and neither do the decimal and wide-integer results
+    /// (the bound's arithmetic works on `UInt64` values).
+    MergedValueBound getMergedValueBound() const override
+    {
+        if constexpr (is_unsigned_v<T> && std::is_same_v<TResult, UInt64>)
+            return MergedValueBound::Subadditive;
+        return MergedValueBound::Unknown;
+    }
+
     void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena *) const override
     {
         const auto & column = assert_cast<const ColVecType &>(*columns[0]);
-        if constexpr (is_big_int_v<T>)
-            this->data(place).add(static_cast<TResult>(column.getData()[row_num]));
-        else
-            this->data(place).add(column.getData()[row_num]);
+        this->data(place).add(static_cast<TResult>(column.getData()[row_num]));
     }
 
     void addBatchSinglePlace(
-        size_t batch_size, AggregateDataPtr place, const IColumn ** columns, Arena *, ssize_t if_argument_pos) const override
+        size_t row_begin,
+        size_t row_end,
+        AggregateDataPtr __restrict place,
+        const IColumn ** columns,
+        Arena *,
+        ssize_t if_argument_pos) const override
     {
         const auto & column = assert_cast<const ColVecType &>(*columns[0]);
         if (if_argument_pos >= 0)
         {
             const auto & flags = assert_cast<const ColumnUInt8 &>(*columns[if_argument_pos]).getData();
-            this->data(place).addManyConditional(column.getData().data(), flags.data(), batch_size);
+            this->data(place).addManyConditional(column.getData().data(), flags.data(), row_begin, row_end);
         }
         else
         {
-            this->data(place).addMany(column.getData().data(), batch_size);
+            this->data(place).addMany(column.getData().data(), row_begin, row_end);
         }
     }
 
     void addBatchSinglePlaceNotNull(
-        size_t batch_size, AggregateDataPtr place, const IColumn ** columns, const UInt8 * null_map, Arena *, ssize_t if_argument_pos)
+        size_t row_begin,
+        size_t row_end,
+        AggregateDataPtr __restrict place,
+        const IColumn ** columns,
+        const UInt8 * null_map,
+        Arena *,
+        ssize_t if_argument_pos)
         const override
     {
         const auto & column = assert_cast<const ColVecType &>(*columns[0]);
@@ -407,31 +618,79 @@ public:
         {
             /// Merge the 2 sets of flags (null and if) into a single one. This allows us to use parallelizable sums when available
             const auto * if_flags = assert_cast<const ColumnUInt8 &>(*columns[if_argument_pos]).getData().data();
-            auto final_flags = std::make_unique<UInt8[]>(batch_size);
-            for (size_t i = 0; i < batch_size; ++i)
-                final_flags[i] = (!null_map[i]) & if_flags[i];
+            const size_t span = row_end - row_begin;
+            auto final_flags = std::make_unique_for_overwrite<UInt8[]>(span);
+            for (size_t i = row_begin; i < row_end; ++i)
+                final_flags[i - row_begin] = (!null_map[i]) & !!if_flags[i];
 
-            this->data(place).addManyConditional(column.getData().data(), final_flags.get(), batch_size);
+            this->data(place).addManyConditional(column.getData().data() + row_begin, final_flags.get(), 0, span);
         }
         else
         {
-            this->data(place).addManyNotNull(column.getData().data(), null_map, batch_size);
+            this->data(place).addManyNotNull(column.getData().data(), null_map, row_begin, row_end);
         }
     }
 
-    void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
+    void addManyDefaults(
+        AggregateDataPtr __restrict /*place*/,
+        const IColumn ** /*columns*/,
+        size_t /*length*/,
+        Arena * /*arena*/) const override
+    {
+    }
+
+    void addBatchSparse(
+        size_t row_begin,
+        size_t row_end,
+        AggregateDataPtr * places,
+        size_t place_offset,
+        const IColumn ** columns,
+        Arena * arena) const override
+    {
+        const auto & column_sparse = assert_cast<const ColumnSparse &>(*columns[0]);
+        const auto * values = &column_sparse.getValuesColumn();
+        const auto & offsets = column_sparse.getOffsetsData();
+
+        size_t from = std::lower_bound(offsets.begin(), offsets.end(), row_begin) - offsets.begin();
+        size_t to = std::lower_bound(offsets.begin(), offsets.end(), row_end) - offsets.begin();
+
+        for (size_t i = from; i < to; ++i)
+            if (places[offsets[i]])
+                add(places[offsets[i]] + place_offset, &values, i + 1, arena);
+    }
+
+    void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
     {
         this->data(place).merge(this->data(rhs));
     }
 
-    void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf) const override
+    void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> /* version */) const override
     {
         this->data(place).write(buf);
     }
 
-    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, Arena *) const override
+    std::optional<size_t> getSerializedSizeBound(std::optional<size_t> /* version */) const override
+    {
+        return Data::serialized_size_bound;
+    }
+
+    char * serializeToMemory(ConstAggregateDataPtr __restrict place, char * dst, std::optional<size_t> /* version */) const override
+    {
+        this->data(place).write(dst);
+        return dst;
+    }
+
+    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /* version */, Arena *) const override
     {
         this->data(place).read(buf);
+    }
+
+    void setSumAndCount(AggregateDataPtr __restrict place, const Field & sum, UInt64 /*count*/) const override
+    {
+        if constexpr (is_decimal<TResult>)
+            this->data(place).add(sum.safeGet<DecimalField<TResult>>().getValue());
+        else
+            this->data(place).add(static_cast<TResult>(sum.safeGet<NearestFieldType<TResult>>()));
     }
 
     void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena *) const override
@@ -451,7 +710,7 @@ public:
         for (const auto & argument_type : this->argument_types)
             can_be_compiled &= canBeNativeType(*argument_type);
 
-        auto return_type = getReturnType();
+        auto return_type = this->getResultType();
         can_be_compiled &= canBeNativeType(*return_type);
 
         return can_be_compiled;
@@ -461,61 +720,61 @@ public:
     {
         llvm::IRBuilder<> & b = static_cast<llvm::IRBuilder<> &>(builder);
 
-        auto * return_type = toNativeType(b, getReturnType());
-        auto * aggregate_sum_ptr = b.CreatePointerCast(aggregate_data_ptr, return_type->getPointerTo());
+        auto * return_type = toNativeType(b, this->getResultType());
+        auto * aggregate_sum_ptr = aggregate_data_ptr;
 
-        b.CreateStore(llvm::Constant::getNullValue(return_type), aggregate_sum_ptr);
+        b.CreateStore(llvm::Constant::getNullValue(return_type), aggregate_sum_ptr)->setAlignment(llvm::Align(this->alignOfData()));
     }
 
-    void compileAdd(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr, const DataTypes & arguments_types, const std::vector<llvm::Value *> & argument_values) const override
+    void compileAdd(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr, const ValuesWithType & arguments) const override
     {
         llvm::IRBuilder<> & b = static_cast<llvm::IRBuilder<> &>(builder);
 
-        auto * return_type = toNativeType(b, getReturnType());
+        auto * return_type = toNativeType(b, this->getResultType());
 
-        auto * sum_value_ptr = b.CreatePointerCast(aggregate_data_ptr, return_type->getPointerTo());
+        auto * sum_value_ptr = aggregate_data_ptr;
         auto * sum_value = b.CreateLoad(return_type, sum_value_ptr);
+        sum_value->setAlignment(llvm::Align(this->alignOfData()));
 
-        const auto & argument_type = arguments_types[0];
-        const auto & argument_value = argument_values[0];
-
-        auto * value_cast_to_result = nativeCast(b, argument_type, argument_value, return_type);
+        auto * value_cast_to_result = nativeCast(b, arguments[0], this->getResultType());
         auto * sum_result_value = sum_value->getType()->isIntegerTy() ? b.CreateAdd(sum_value, value_cast_to_result) : b.CreateFAdd(sum_value, value_cast_to_result);
 
-        b.CreateStore(sum_result_value, sum_value_ptr);
+        b.CreateStore(sum_result_value, sum_value_ptr)->setAlignment(llvm::Align(this->alignOfData()));
     }
 
     void compileMerge(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_dst_ptr, llvm::Value * aggregate_data_src_ptr) const override
     {
         llvm::IRBuilder<> & b = static_cast<llvm::IRBuilder<> &>(builder);
 
-        auto * return_type = toNativeType(b, getReturnType());
+        auto * return_type = toNativeType(b, this->getResultType());
 
-        auto * sum_value_dst_ptr = b.CreatePointerCast(aggregate_data_dst_ptr, return_type->getPointerTo());
+        auto * sum_value_dst_ptr = aggregate_data_dst_ptr;
         auto * sum_value_dst = b.CreateLoad(return_type, sum_value_dst_ptr);
+        sum_value_dst->setAlignment(llvm::Align(this->alignOfData()));
 
-        auto * sum_value_src_ptr = b.CreatePointerCast(aggregate_data_src_ptr, return_type->getPointerTo());
+        auto * sum_value_src_ptr = aggregate_data_src_ptr;
         auto * sum_value_src = b.CreateLoad(return_type, sum_value_src_ptr);
+        sum_value_src->setAlignment(llvm::Align(this->alignOfData()));
 
         auto * sum_return_value = sum_value_dst->getType()->isIntegerTy() ? b.CreateAdd(sum_value_dst, sum_value_src) : b.CreateFAdd(sum_value_dst, sum_value_src);
-        b.CreateStore(sum_return_value, sum_value_dst_ptr);
+        b.CreateStore(sum_return_value, sum_value_dst_ptr)->setAlignment(llvm::Align(this->alignOfData()));
     }
 
     llvm::Value * compileGetResult(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr) const override
     {
         llvm::IRBuilder<> & b = static_cast<llvm::IRBuilder<> &>(builder);
 
-        auto * return_type = toNativeType(b, getReturnType());
-        auto * sum_value_ptr = b.CreatePointerCast(aggregate_data_ptr, return_type->getPointerTo());
+        auto * return_type = toNativeType(b, this->getResultType());
+        auto * sum_value_ptr = aggregate_data_ptr;
 
-        return b.CreateLoad(return_type, sum_value_ptr);
+        auto * res = b.CreateLoad(return_type, sum_value_ptr);
+        res->setAlignment(llvm::Align(this->alignOfData()));
+        return res;
     }
 
 #endif
 
 private:
-    UInt32 scale;
-
     static constexpr auto & castColumnToResult(IColumn & to)
     {
         if constexpr (is_decimal<T>)

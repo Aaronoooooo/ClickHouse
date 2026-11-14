@@ -1,17 +1,19 @@
 #include <Common/Exception.h>
 #include <Common/TerminalSize.h>
+#include <Common/re2.h>
 
 #include <IO/ReadHelpers.h>
 #include <IO/ReadBufferFromFile.h>
+#include <IO/ReadSettings.h>
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferFromHTTP.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/copyData.h>
-#include <IO/createReadBufferFromFileBase.h>
+#include <Disks/IO/createReadBufferFromFileBase.h>
 
 #include <boost/program_options.hpp>
-#include <re2/re2.h>
 #include <filesystem>
+#include <iostream>
 
 namespace fs = std::filesystem;
 
@@ -31,7 +33,7 @@ namespace ErrorCodes
  * If test-mode option is added, files will be put by given url via PUT request.
  */
 
-void processFile(const fs::path & file_path, const fs::path & dst_path, bool test_mode, WriteBuffer & metadata_buf)
+static void processFile(const fs::path & file_path, const fs::path & dst_path, bool test_mode, bool link, WriteBuffer & metadata_buf)
 {
     String remote_path;
     RE2::FullMatch(file_path.string(), EXTRACT_PATH_PATTERN, &remote_path);
@@ -52,22 +54,36 @@ void processFile(const fs::path & file_path, const fs::path & dst_path, bool tes
 
     auto dst_file_path = fs::path(dst_path) / remote_path;
 
-    auto src_buf = createReadBufferFromFileBase(file_path, {}, fs::file_size(file_path));
-    std::shared_ptr<WriteBuffer> dst_buf;
-
-    /// test mode for integration tests.
-    if (test_mode)
-        dst_buf = std::make_shared<WriteBufferFromHTTP>(Poco::URI(dst_file_path), Poco::Net::HTTPRequest::HTTP_PUT);
+    if (link)
+    {
+        fs::create_symlink(file_path, dst_file_path);
+    }
     else
-        dst_buf = std::make_shared<WriteBufferFromFile>(dst_file_path);
+    {
+        ReadSettings read_settings{};
+        read_settings.local_fs_settings.method = LocalFSReadMethod::pread;
+        auto src_buf = createReadBufferFromFileBase(file_path, read_settings, fs::file_size(file_path));
+        std::shared_ptr<WriteBuffer> dst_buf;
 
-    copyData(*src_buf, *dst_buf);
-    dst_buf->next();
-    dst_buf->finalize();
-};
+        /// test mode for integration tests.
+        if (test_mode)
+        {
+            dst_buf = BuilderWriteBufferFromHTTP(Poco::URI(dst_file_path))
+                          .withConnectionGroup(HTTPConnectionGroupType::HTTP)
+                          .withMethod(Poco::Net::HTTPRequest::HTTP_PUT)
+                          .create();
+        }
+        else
+            dst_buf = std::make_shared<WriteBufferFromFile>(dst_file_path);
+
+        copyData(*src_buf, *dst_buf);
+        dst_buf->next();
+        dst_buf->finalize();
+    }
+}
 
 
-void processTableFiles(const fs::path & data_path, fs::path dst_path, bool test_mode)
+static void processTableFiles(const fs::path & data_path, fs::path dst_path, bool test_mode, bool link)
 {
     std::cerr << "Data path: " << data_path << ", destination path: " << dst_path << std::endl;
 
@@ -79,7 +95,10 @@ void processTableFiles(const fs::path & data_path, fs::path dst_path, bool test_
     {
         dst_path /= "store";
         auto files_root = dst_path / prefix;
-        root_meta = std::make_shared<WriteBufferFromHTTP>(Poco::URI(files_root / ".index"), Poco::Net::HTTPRequest::HTTP_PUT);
+        root_meta = BuilderWriteBufferFromHTTP(Poco::URI(files_root / ".index"))
+                      .withConnectionGroup(HTTPConnectionGroupType::HTTP)
+                      .withMethod(Poco::Net::HTTPRequest::HTTP_PUT)
+                      .create();
     }
     else
     {
@@ -94,7 +113,7 @@ void processTableFiles(const fs::path & data_path, fs::path dst_path, bool test_
     {
         if (dir_it->is_directory())
         {
-            processFile(dir_it->path(), dst_path, test_mode, *root_meta);
+            processFile(dir_it->path(), dst_path, test_mode, link, *root_meta);
 
             String directory_prefix;
             RE2::FullMatch(dir_it->path().string(), EXTRACT_PATH_PATTERN, &directory_prefix);
@@ -102,27 +121,28 @@ void processTableFiles(const fs::path & data_path, fs::path dst_path, bool test_
             std::shared_ptr<WriteBuffer> directory_meta;
             if (test_mode)
             {
-                auto files_root = dst_path / prefix;
-                directory_meta = std::make_shared<WriteBufferFromHTTP>(Poco::URI(dst_path / directory_prefix / ".index"), Poco::Net::HTTPRequest::HTTP_PUT);
+                directory_meta = BuilderWriteBufferFromHTTP(Poco::URI(dst_path / directory_prefix / ".index"))
+                                    .withConnectionGroup(HTTPConnectionGroupType::HTTP)
+                                    .withMethod(Poco::Net::HTTPRequest::HTTP_PUT)
+                                    .create();
             }
             else
             {
                 dst_path = fs::canonical(dst_path);
-                auto files_root = dst_path / prefix;
                 fs::create_directories(dst_path / directory_prefix);
                 directory_meta = std::make_shared<WriteBufferFromFile>(dst_path / directory_prefix / ".index");
             }
 
             fs::directory_iterator files_end;
             for (fs::directory_iterator file_it(dir_it->path()); file_it != files_end; ++file_it)
-                processFile(file_it->path(), dst_path, test_mode, *directory_meta);
+                processFile(file_it->path(), dst_path, test_mode, link, *directory_meta);
 
             directory_meta->next();
             directory_meta->finalize();
         }
         else
         {
-            processFile(dir_it->path(), dst_path, test_mode, *root_meta);
+            processFile(dir_it->path(), dst_path, test_mode, link, *root_meta);
         }
     }
     root_meta->next();
@@ -130,17 +150,19 @@ void processTableFiles(const fs::path & data_path, fs::path dst_path, bool test_
 }
 }
 
+int mainEntryClickHouseStaticFilesDiskUploader(int argc, char ** argv);
 int mainEntryClickHouseStaticFilesDiskUploader(int argc, char ** argv)
 try
 {
     using namespace DB;
     namespace po = boost::program_options;
 
-    po::options_description description("Allowed options", getTerminalWidth());
+    po::options_description description = createOptionsDescription("Allowed options", getTerminalWidth());
     description.add_options()
         ("help,h", "produce help message")
-        ("metadata-path", po::value<std::string>(), "Metadata path (select data_paths from system.tables where name='table_name'")
+        ("metadata-path", po::value<std::string>(), "Metadata path (SELECT data_paths FROM system.tables WHERE name = 'table_name' AND database = 'database_name')")
         ("test-mode", "Use test mode, which will put data on given url via PUT")
+        ("link", "Create symlinks instead of copying")
         ("url", po::value<std::string>(), "Web server url for test mode")
         ("output-dir", po::value<std::string>(), "Directory to put files in non-test mode");
 
@@ -149,15 +171,15 @@ try
     po::store(parsed, options);
     po::notify(options);
 
-    if (options.empty() || options.count("help"))
+    if (options.empty() || options.contains("help"))
     {
         std::cout << description << std::endl;
-        exit(0);
+        exit(0); // NOLINT(concurrency-mt-unsafe)
     }
 
     String metadata_path;
 
-    if (options.count("metadata-path"))
+    if (options.contains("metadata-path"))
         metadata_path = options["metadata-path"].as<std::string>();
     else
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "No metadata-path option passed");
@@ -173,25 +195,25 @@ try
     auto test_mode = options.contains("test-mode");
     if (test_mode)
     {
-        if (options.count("url"))
+        if (options.contains("url"))
             root_path = options["url"].as<std::string>();
         else
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "No url option passed for test mode");
     }
     else
     {
-        if (options.count("output-dir"))
+        if (options.contains("output-dir"))
             root_path = options["output-dir"].as<std::string>();
         else
             root_path = fs::current_path();
     }
 
-    processTableFiles(fs_path, root_path, test_mode);
+    processTableFiles(fs_path, root_path, test_mode, options.contains("link"));
 
     return 0;
 }
 catch (...)
 {
-    std::cerr << DB::getCurrentExceptionMessage(false);
+    std::cerr << DB::getCurrentExceptionMessage(false) << '\n';
     return 1;
 }

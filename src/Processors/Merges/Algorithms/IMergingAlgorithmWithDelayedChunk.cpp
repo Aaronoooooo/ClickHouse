@@ -1,15 +1,16 @@
 #include <Processors/Merges/Algorithms/IMergingAlgorithmWithDelayedChunk.h>
+#include <Processors/Merges/Algorithms/MergeTreeReadInfo.h>
 
 
 namespace DB
 {
 
-IMergingAlgorithmWithDelayedChunk::IMergingAlgorithmWithDelayedChunk(
-    size_t num_inputs,
-    SortDescription description_)
+IMergingAlgorithmWithDelayedChunk::IMergingAlgorithmWithDelayedChunk(SharedHeader header_, size_t num_inputs, SortDescription description_)
     : description(std::move(description_))
+    , header(std::move(header_))
     , current_inputs(num_inputs)
     , cursors(num_inputs)
+    , inputs_origin_merge_tree_part_level(num_inputs)
 {
 }
 
@@ -22,10 +23,23 @@ void IMergingAlgorithmWithDelayedChunk::initializeQueue(Inputs inputs)
         if (!current_inputs[source_num].chunk)
             continue;
 
-        cursors[source_num] = SortCursorImpl(current_inputs[source_num].chunk.getColumns(), description, source_num, current_inputs[source_num].permutation);
+        cursors[source_num] = SortCursorImpl(
+            *header,
+            current_inputs[source_num].chunk.getColumns(),
+            current_inputs[source_num].chunk.getNumRows(),
+            description,
+            source_num,
+            current_inputs[source_num].permutation);
+
+        inputs_origin_merge_tree_part_level[source_num] = getPartLevelFromChunk(current_inputs[source_num].chunk);
     }
 
-    queue = SortingHeap<SortCursor>(cursors);
+    /// A single-column key without a collation compares cheaply even through the generic
+    /// `SortCursor`, so it keeps the heap container (see `sortDescriptionCompareIsExpensive`).
+    /// The algorithms consume rows one by one, so the batches only pay off by saving
+    /// comparisons: with a cheap comparator the detection is skipped altogether.
+    bool compare_is_expensive = sortDescriptionCompareIsExpensive(description);
+    queue = SortingQueueForCursor<SortCursor, SortingQueueStrategy::Batch>(cursors, compare_is_expensive, compare_is_expensive);
 }
 
 void IMergingAlgorithmWithDelayedChunk::updateCursor(Input & input, size_t source_num)
@@ -37,7 +51,9 @@ void IMergingAlgorithmWithDelayedChunk::updateCursor(Input & input, size_t sourc
     last_chunk_sort_columns = std::move(cursors[source_num].sort_columns);
 
     current_input.swap(input);
-    cursors[source_num].reset(current_input.chunk.getColumns(), {}, current_input.permutation);
+    cursors[source_num].reset(current_input.chunk.getColumns(), *header, current_input.chunk.getNumRows(), current_input.permutation);
+
+    inputs_origin_merge_tree_part_level[source_num] = getPartLevelFromChunk(current_input.chunk);
 
     queue.push(cursors[source_num]);
 }

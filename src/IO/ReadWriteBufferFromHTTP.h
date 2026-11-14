@@ -1,535 +1,390 @@
 #pragma once
 
 #include <functional>
-#include <base/types.h>
-#include <base/sleep.h>
+#include <Core/Field.h>
 #include <IO/ConnectionTimeouts.h>
 #include <IO/HTTPCommon.h>
+#include <IO/ParallelReadBuffer.h>
 #include <IO/ReadBuffer.h>
-#include <IO/ReadBufferFromIStream.h>
+#include <IO/IReadBufferMetadataProvider.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
-#include <Poco/Any.h>
+#include <IO/WithFileName.h>
+#include <IO/HTTPHeaderEntries.h>
+#include <Common/logger_useful.h>
+#include <base/sleep.h>
+#include <base/types.h>
 #include <Poco/Net/HTTPBasicCredentials.h>
 #include <Poco/Net/HTTPClientSession.h>
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/URI.h>
-#include <Poco/Version.h>
-#include <Common/DNSResolver.h>
-#include <Common/RemoteHostFilter.h>
-#include <base/logger_useful.h>
 #include <Poco/URIStreamFactory.h>
+#include <Common/RemoteHostFilter.h>
+#include <Common/config_version.h>
 
-#include <Common/config.h>
-
+#include <condition_variable>
+#include <filesystem>
+#include <mutex>
 
 namespace DB
 {
-/** Perform HTTP POST request and provide response to read.
-  */
 
-namespace ErrorCodes
+class HTTPHeaderFilter;
+
+/// Identifies an exception produced by stopping one HTTP request after its owner was cancelled.
+/// This marker belongs to the request, not to every reader sharing its Cancellation.
+class ReadInterruptedException final : public Exception
 {
-    extern const int TOO_MANY_REDIRECTS;
-    extern const int HTTP_RANGE_NOT_SATISFIABLE;
-    extern const int BAD_ARGUMENTS;
-}
-
-template <typename SessionPtr>
-class UpdatableSessionBase
-{
-protected:
-    SessionPtr session;
-    UInt64 redirects { 0 };
-    Poco::URI initial_uri;
-    ConnectionTimeouts timeouts;
-    UInt64 max_redirects;
-
 public:
-    virtual void buildNewSession(const Poco::URI & uri) = 0;
+    explicit ReadInterruptedException(std::exception_ptr original_exception_ = nullptr);
 
-    explicit UpdatableSessionBase(const Poco::URI uri,
-        const ConnectionTimeouts & timeouts_,
-        UInt64 max_redirects_)
-        : initial_uri { uri }
-        , timeouts { timeouts_ }
-        , max_redirects { max_redirects_ }
-    {
-    }
-
-    SessionPtr getSession()
-    {
-        return session;
-    }
-
-    void updateSession(const Poco::URI & uri)
-    {
-        ++redirects;
-        if (redirects <= max_redirects)
-        {
-            buildNewSession(uri);
-        }
-        else
-        {
-            throw Exception(ErrorCodes::TOO_MANY_REDIRECTS, "Too many redirects while trying to access {}", initial_uri.toString());
-        }
-    }
-
-    virtual ~UpdatableSessionBase() = default;
-};
-
-
-namespace detail
-{
-    template <typename UpdatableSessionPtr>
-    class ReadWriteBufferFromHTTPBase : public ReadBuffer
-    {
-    public:
-        using HTTPHeaderEntry = std::tuple<std::string, std::string>;
-        using HTTPHeaderEntries = std::vector<HTTPHeaderEntry>;
-
-        /// HTTP range, including right bound [begin, end].
-        struct Range
-        {
-            size_t begin = 0;
-            std::optional<size_t> end;
-        };
-
-    protected:
-        Poco::URI uri;
-        std::string method;
-        std::string content_encoding;
-
-        UpdatableSessionPtr session;
-        std::istream * istr; /// owned by session
-        std::unique_ptr<ReadBuffer> impl;
-        std::function<void(std::ostream &)> out_stream_callback;
-        const Poco::Net::HTTPBasicCredentials & credentials;
-        std::vector<Poco::Net::HTTPCookie> cookies;
-        HTTPHeaderEntries http_header_entries;
-        RemoteHostFilter remote_host_filter;
-        std::function<void(size_t)> next_callback;
-
-        size_t buffer_size;
-        bool use_external_buffer;
-
-        size_t bytes_read = 0;
-        Range read_range;
-
-        /// Delayed exception in case retries with partial content are not satisfiable.
-        std::exception_ptr exception;
-        bool retry_with_range_header = false;
-        /// In case of redirects, save result uri to use it if we retry the request.
-        std::optional<Poco::URI> saved_uri_redirect;
-
-        ReadSettings settings;
-        Poco::Logger * log;
-
-        bool withPartialContent() const
-        {
-            /**
-             * Add range header if we have some passed range (for disk web)
-             * or if we want to retry GET request on purpose.
-             */
-            return read_range.begin || read_range.end || retry_with_range_header;
-        }
-
-        size_t getOffset() const
-        {
-            return read_range.begin + bytes_read;
-        }
-
-        std::istream * call(Poco::URI uri_, Poco::Net::HTTPResponse & response)
-        {
-            // With empty path poco will send "POST  HTTP/1.1" its bug.
-            if (uri_.getPath().empty())
-                uri_.setPath("/");
-
-            Poco::Net::HTTPRequest request(method, uri_.getPathAndQuery(), Poco::Net::HTTPRequest::HTTP_1_1);
-            request.setHost(uri_.getHost()); // use original, not resolved host name in header
-
-            if (out_stream_callback)
-                request.setChunkedTransferEncoding(true);
-
-            for (auto & http_header_entry: http_header_entries)
-                request.set(std::get<0>(http_header_entry), std::get<1>(http_header_entry));
-
-            if (withPartialContent())
-            {
-                String range_header_value;
-                if (read_range.end)
-                    range_header_value = fmt::format("bytes={}-{}", getOffset(), *read_range.end);
-                else
-                    range_header_value = fmt::format("bytes={}-", getOffset());
-                LOG_TEST(log, "Adding header: Range: {}", range_header_value);
-                request.set("Range", range_header_value);
-            }
-
-            if (!credentials.getUsername().empty())
-                credentials.authenticate(request);
-
-            LOG_TRACE(log, "Sending request to {}", uri_.toString());
-
-            auto sess = session->getSession();
-
-            try
-            {
-                auto & stream_out = sess->sendRequest(request);
-
-                if (out_stream_callback)
-                    out_stream_callback(stream_out);
-
-                istr = receiveResponse(*sess, request, response, true);
-                response.getCookies(cookies);
-
-                content_encoding = response.get("Content-Encoding", "");
-                return istr;
-            }
-            catch (const Poco::Exception & e)
-            {
-                /// We use session data storage as storage for exception text
-                /// Depend on it we can deduce to reconnect session or reresolve session host
-                sess->attachSessionData(e.message());
-                throw;
-            }
-        }
-
-    public:
-        using NextCallback = std::function<void(size_t)>;
-        using OutStreamCallback = std::function<void(std::ostream &)>;
-
-        explicit ReadWriteBufferFromHTTPBase(
-            UpdatableSessionPtr session_,
-            Poco::URI uri_,
-            const Poco::Net::HTTPBasicCredentials & credentials_,
-            const std::string & method_ = {},
-            OutStreamCallback out_stream_callback_ = {},
-            size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE,
-            const ReadSettings & settings_ = {},
-            HTTPHeaderEntries http_header_entries_ = {},
-            Range read_range_ = {},
-            const RemoteHostFilter & remote_host_filter_ = {},
-            bool delay_initialization = false,
-            bool use_external_buffer_ = false)
-            : ReadBuffer(nullptr, 0)
-            , uri {uri_}
-            , method {!method_.empty() ? method_ : out_stream_callback_ ? Poco::Net::HTTPRequest::HTTP_POST : Poco::Net::HTTPRequest::HTTP_GET}
-            , session {session_}
-            , out_stream_callback {out_stream_callback_}
-            , credentials {credentials_}
-            , http_header_entries {http_header_entries_}
-            , remote_host_filter {remote_host_filter_}
-            , buffer_size {buffer_size_}
-            , use_external_buffer {use_external_buffer_}
-            , read_range(read_range_)
-            , settings {settings_}
-            , log(&Poco::Logger::get("ReadWriteBufferFromHTTP"))
-        {
-            if (settings.http_max_tries <= 0 || settings.http_retry_initial_backoff_ms <= 0
-                || settings.http_retry_initial_backoff_ms >= settings.http_retry_max_backoff_ms)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                                "Invalid setting for http backoff, "
-                                "must be http_max_tries >= 1 (current is {}) and "
-                                "0 < http_retry_initial_backoff_ms < settings.http_retry_max_backoff_ms (now 0 < {} < {})",
-                                settings.http_max_tries, settings.http_retry_initial_backoff_ms, settings.http_retry_max_backoff_ms);
-
-            if (!delay_initialization)
-                initialize();
-        }
-
-        /**
-         * Note: In case of error return false if error is not retriable, otherwise throw.
-         */
-        bool initialize()
-        {
-            Poco::Net::HTTPResponse response;
-
-            istr = call(saved_uri_redirect ? *saved_uri_redirect : uri, response);
-
-            while (isRedirect(response.getStatus()))
-            {
-                Poco::URI uri_redirect(response.get("Location"));
-                remote_host_filter.checkURL(uri_redirect);
-
-                session->updateSession(uri_redirect);
-                istr = call(uri_redirect, response);
-                saved_uri_redirect = uri_redirect;
-            }
-
-            if (withPartialContent() && response.getStatus() != Poco::Net::HTTPResponse::HTTPStatus::HTTP_PARTIAL_CONTENT)
-            {
-                /// Having `200 OK` instead of `206 Partial Content` is acceptable in case we retried with range.begin == 0.
-                if (read_range.begin)
-                {
-                    if (!exception)
-                        exception = std::make_exception_ptr(
-                            Exception(ErrorCodes::HTTP_RANGE_NOT_SATISFIABLE,
-                                      "Cannot read with range: [{}, {}]", read_range.begin, read_range.end ? *read_range.end : '-'));
-
-                    return false;
-                }
-                else if (read_range.end)
-                {
-                    /// We could have range.begin == 0 and range.end != 0 in case of DiskWeb and failing to read with partial content
-                    /// will affect only performance, so a warning is enough.
-                    LOG_WARNING(log, "Unable to read with range header: [{}, {}]", read_range.begin, *read_range.end);
-                }
-            }
-
-            if (!bytes_read && !read_range.end && response.hasContentLength())
-                read_range.end = read_range.begin + response.getContentLength();
-
-            try
-            {
-                impl = std::make_unique<ReadBufferFromIStream>(*istr, buffer_size);
-
-                if (use_external_buffer)
-                {
-                    /**
-                    * See comment 30 lines below.
-                    */
-                    impl->set(internal_buffer.begin(), internal_buffer.size());
-                    assert(working_buffer.begin() != nullptr);
-                    assert(!internal_buffer.empty());
-                }
-            }
-            catch (const Poco::Exception & e)
-            {
-                /// We use session data storage as storage for exception text
-                /// Depend on it we can deduce to reconnect session or reresolve session host
-                auto sess = session->getSession();
-                sess->attachSessionData(e.message());
-                throw;
-            }
-
-            return true;
-        }
-
-        bool nextImpl() override
-        {
-            if (next_callback)
-                next_callback(count());
-
-            if (read_range.end && getOffset() == read_range.end.value())
-                return false;
-
-            if (impl)
-            {
-                if (use_external_buffer)
-                {
-                    /**
-                    * use_external_buffer -- means we read into the buffer which
-                    * was passed to us from somewhere else. We do not check whether
-                    * previously returned buffer was read or not (no hasPendingData() check is needed),
-                    * because this branch means we are prefetching data,
-                    * each nextImpl() call we can fill a different buffer.
-                    */
-                    impl->set(internal_buffer.begin(), internal_buffer.size());
-                    assert(working_buffer.begin() != nullptr);
-                    assert(!internal_buffer.empty());
-                }
-                else
-                {
-                    /**
-                    * impl was initialized before, pass position() to it to make
-                    * sure there is no pending data which was not read.
-                    */
-                    if (!working_buffer.empty())
-                        impl->position() = position();
-                }
-            }
-
-            bool result = false;
-            size_t milliseconds_to_wait = settings.http_retry_initial_backoff_ms;
-
-            for (size_t i = 0; i < settings.http_max_tries; ++i)
-            {
-                try
-                {
-                    if (!impl)
-                    {
-                        /// If error is not retriable -- false is returned and exception is set.
-                        /// Otherwise the error is thrown and retries continue.
-                        bool initialized = initialize();
-                        if (!initialized)
-                        {
-                            assert(exception);
-                            break;
-                        }
-
-                        if (use_external_buffer)
-                        {
-                            /// See comment 40 lines above.
-                            impl->set(internal_buffer.begin(), internal_buffer.size());
-                            assert(working_buffer.begin() != nullptr);
-                            assert(!internal_buffer.empty());
-                        }
-                    }
-
-                    result = impl->next();
-                    exception = nullptr;
-                    break;
-                }
-                catch (const Poco::Exception & e)
-                {
-                    /**
-                     * Retry request unconditionally if nothing has been read yet.
-                     * Otherwise if it is GET method retry with range header starting from bytes_read.
-                     */
-                    bool can_retry_request = !bytes_read || method == Poco::Net::HTTPRequest::HTTP_GET;
-                    if (!can_retry_request)
-                        throw;
-
-                    LOG_ERROR(log,
-                              "HTTP request to `{}` failed at try {}/{} with bytes read: {}/{}. "
-                              "Error: {}. (Current backoff wait is {}/{} ms)",
-                              uri.toString(), i, settings.http_max_tries,
-                              getOffset(), read_range.end ? toString(*read_range.end) : "unknown",
-                              e.displayText(),
-                              milliseconds_to_wait, settings.http_retry_max_backoff_ms);
-
-                    retry_with_range_header = true;
-                    exception = std::current_exception();
-                    impl.reset();
-                    auto http_session = session->getSession();
-                    http_session->reset();
-                    sleepForMilliseconds(milliseconds_to_wait);
-                }
-
-                milliseconds_to_wait = std::min(milliseconds_to_wait * 2, settings.http_retry_max_backoff_ms);
-            }
-
-            if (exception)
-                std::rethrow_exception(exception);
-
-            if (!result)
-                return false;
-
-            internal_buffer = impl->buffer();
-            working_buffer = internal_buffer;
-            bytes_read += working_buffer.size();
-            return true;
-        }
-
-        std::string getResponseCookie(const std::string & name, const std::string & def) const
-        {
-            for (const auto & cookie : cookies)
-                if (cookie.getName() == name)
-                    return cookie.getValue();
-            return def;
-        }
-
-        /// Set function to call on each nextImpl, useful when you need to track
-        /// progress.
-        /// NOTE: parameter on each call is not incremental -- it's all bytes count
-        /// passed through the buffer
-        void setNextCallback(NextCallback next_callback_)
-        {
-            next_callback = next_callback_;
-            /// Some data maybe already read
-            next_callback(count());
-        }
-
-        const std::string & getCompressionMethod() const
-        {
-            return content_encoding;
-        }
-    };
-}
-
-class UpdatableSession : public UpdatableSessionBase<HTTPSessionPtr>
-{
-    using Parent = UpdatableSessionBase<HTTPSessionPtr>;
-
-public:
-    explicit UpdatableSession(
-        const Poco::URI uri,
-        const ConnectionTimeouts & timeouts_,
-        const UInt64 max_redirects_)
-        : Parent(uri, timeouts_, max_redirects_)
-    {
-        session = makeHTTPSession(initial_uri, timeouts);
-    }
-
-    void buildNewSession(const Poco::URI & uri) override
-    {
-        session = makeHTTPSession(uri, timeouts);
-    }
-};
-
-class ReadWriteBufferFromHTTP : public detail::ReadWriteBufferFromHTTPBase<std::shared_ptr<UpdatableSession>>
-{
-    using Parent = detail::ReadWriteBufferFromHTTPBase<std::shared_ptr<UpdatableSession>>;
-
-public:
-    explicit ReadWriteBufferFromHTTP(
-        Poco::URI uri_,
-        const std::string & method_,
-        OutStreamCallback out_stream_callback_,
-        const ConnectionTimeouts & timeouts,
-        const Poco::Net::HTTPBasicCredentials & credentials_,
-        const UInt64 max_redirects = 0,
-        size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE,
-        const ReadSettings & settings_ = {},
-        const HTTPHeaderEntries & http_header_entries_ = {},
-        Range read_range_ = {},
-        const RemoteHostFilter & remote_host_filter_ = {},
-        bool delay_initialization_ = true,
-        bool use_external_buffer_ = false)
-        : Parent(std::make_shared<UpdatableSession>(uri_, timeouts, max_redirects),
-            uri_, credentials_, method_, out_stream_callback_, buffer_size_,
-            settings_, http_header_entries_, read_range_, remote_host_filter_,
-            delay_initialization_, use_external_buffer_)
-    {
-    }
-};
-
-class UpdatablePooledSession : public UpdatableSessionBase<PooledHTTPSessionPtr>
-{
-    using Parent = UpdatableSessionBase<PooledHTTPSessionPtr>;
+    /// Without these overrides `copyMutableException` slices the exception back to a plain
+    /// `Exception` (it rethrows through the virtual `Poco::Exception::rethrow`), and the callers
+    /// which recognize the interruption by its type, such as `StorageURLSource::generate`, stop
+    /// recognizing it. That happens on every path which hands an exception over between threads,
+    /// e.g. the background reads of the native `Parquet` reader.
+    ReadInterruptedException * clone() const override { return new ReadInterruptedException(*this); }
+    void rethrow() const override { throw *this; } /// NOLINT(bugprone-exception-copy-constructor-throws,cert-err60-cpp)
 
 private:
-    size_t per_endpoint_pool_size;
+    const char * name() const noexcept override { return "DB::ReadInterruptedException"; }
+    const char * className() const noexcept override { return "DB::ReadInterruptedException"; }
 
-public:
-    explicit UpdatablePooledSession(const Poco::URI uri,
-        const ConnectionTimeouts & timeouts_,
-        const UInt64 max_redirects_,
-        size_t per_endpoint_pool_size_)
-        : Parent(uri, timeouts_, max_redirects_)
-        , per_endpoint_pool_size { per_endpoint_pool_size_ }
-    {
-        session = makePooledHTTPSession(initial_uri, timeouts, per_endpoint_pool_size);
-    }
-
-    void buildNewSession(const Poco::URI & uri) override
-    {
-        session = makePooledHTTPSession(uri, timeouts, per_endpoint_pool_size);
-    }
+    std::exception_ptr original_exception;
 };
 
-class PooledReadWriteBufferFromHTTP : public detail::ReadWriteBufferFromHTTPBase<std::shared_ptr<UpdatablePooledSession>>
+class ReadWriteBufferFromHTTP : public SeekableReadBuffer, public WithFileName, public WithFileSize, public IReadBufferMetadataProvider
 {
-    using Parent = detail::ReadWriteBufferFromHTTPBase<std::shared_ptr<UpdatablePooledSession>>;
+    friend class BuilderRWBufferFromHTTP;
+public:
+    /// Information from HTTP response header.
+    struct HTTPFileInfo
+    {
+        // nullopt if the server doesn't report it.
+        std::optional<size_t> file_size;
+        std::optional<time_t> last_modified;
+        /// The `Date` of the response: the time by the clock of the server that reported `last_modified`.
+        std::optional<time_t> response_date;
+        bool seekable = false;
+    };
+
+    using OutStreamCallback = std::function<void(WriteBuffer &)>;
+    using NextCallback = std::function<void(size_t)>;
+    using RedirectCallback = std::function<void(const Poco::URI &, const Poco::URI &)>;
+
+    /** A one-shot flag which the code that reads from the buffer sets when it does not need the data
+      * anymore, for example when the query pipeline it reads for is being torn down. The buffer only
+      * uses it to stop retrying: unlike a predicate it can be waited on, which makes the backoff
+      * between the retry attempts interruptible, so a cancellation does not have to be waited out.
+      */
+    class Cancellation
+    {
+    public:
+        /// Called from a cancellation handler, which is not allowed to throw. `softly` means the
+        /// cancellation is one after which the query must still succeed with what it has already
+        /// read (see StorageURLSource::cancel): the code in between the requests may then report
+        /// the interruption with a cancellation error of its own, which the owner of this flag
+        /// discards. After a hard teardown - the query is killed, the pipeline has already failed
+        /// elsewhere, or the client has disconnected - a synthesized error could mask the failure
+        /// that really happened, so nothing is allowed to invent one, see
+        /// StorageURLSource::getFirstAvailableURIAndReadBuffer.
+        void cancel(bool softly) noexcept
+        {
+            {
+                std::lock_guard lock(mutex);
+                /// A hard cancellation is final even after a soft one: ExecutingGraph::cancel
+                /// upgrades PartialResult to the reason of a later hard cancellation and delivers
+                /// the upgrade here, after which the query fails and nothing may report the
+                /// interruption as a cancellation anymore. The opposite downgrade does not exist,
+                /// so the read stays soft only while every reason so far has been soft.
+                cancelled_softly = cancelled ? (cancelled_softly && softly) : softly;
+                cancelled = true;
+            }
+            changed.notify_all();
+        }
+
+        /// Returns true if the read has been cancelled, either already or before the time has passed.
+        bool waitForCancellation(std::chrono::milliseconds duration)
+        {
+            std::unique_lock lock(mutex);
+            return changed.wait_for(lock, duration, [this] { return cancelled; });
+        }
+
+        /// A non-blocking check for the code in between the requests, which must not go on making
+        /// more of them after the read has been cancelled.
+        bool isCancelled()
+        {
+            std::lock_guard lock(mutex);
+            return cancelled;
+        }
+
+        /// Whether the read has been cancelled softly, see cancel.
+        bool isCancelledSoftly()
+        {
+            std::lock_guard lock(mutex);
+            return cancelled_softly;
+        }
+
+    private:
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool cancelled = false;
+        bool cancelled_softly = false;
+    };
+
+    using CancellationPtr = std::shared_ptr<Cancellation>;
+
+    const Poco::URI & getCurrentURI() const { return current_uri; }
+
+private:
+    /// Byte range, including right bound [begin, end].
+    struct HTTPRange
+    {
+        std::optional<size_t> begin;
+        std::optional<size_t> end;
+    };
+
+    /// The body of the response, which keeps the session it reads from alive.
+    using CallResult = std::unique_ptr<HTTPResponseReadBuffer>;
+
+    const HTTPConnectionGroupType connection_group;
+    const Poco::URI initial_uri;
+    const std::string method;
+    const ProxyConfiguration proxy_config;
+    const ReadSettings read_settings;
+    const ConnectionTimeouts timeouts;
+
+    const Poco::Net::HTTPBasicCredentials & credentials;
+    const RemoteHostFilter * remote_host_filter;
+
+    const size_t buffer_size;
+    const size_t max_redirects;
+    const bool enable_url_encoding;
+
+    const bool use_external_buffer;
+    const bool http_skip_not_found_url;
+    bool has_not_found_url = false;
+
+    OutStreamCallback out_stream_callback;
+    /// When set, the request body produced by `out_stream_callback` is sent with a fixed
+    /// Content-Length instead of chunked transfer encoding. Some HTTP servers (e.g. the
+    /// Snowflake Horizon Iceberg REST catalog) reject chunked request bodies.
+    std::optional<size_t> out_stream_fixed_content_length;
+    RedirectCallback redirect_callback;
+
+    Poco::URI current_uri;
+    size_t redirects = 0;
+    /// Set when a `303 See Other` redirect has rewritten the request to `GET`: `current_uri` then points to a
+    /// resource that has to be requested with `GET` and without the original request body, also on retries.
+    bool rewritten_to_get_by_redirect = false;
+
+    std::string content_encoding;
+    std::unique_ptr<ReadBuffer> impl;
+
+    std::vector<Poco::Net::HTTPCookie> cookies; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+
+    std::map<String, String> response_headers; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+
+    HTTPHeaderEntries http_header_entries;
+    std::function<void(size_t)> next_callback;
+
+    size_t offset_from_begin_pos = 0;
+    HTTPRange read_range;
+    std::optional<HTTPFileInfo> file_info;
+
+    LoggerPtr log;
+
+    /// Set by the code that reads from this buffer when it does not need the data anymore. Retrying an
+    /// HTTP request stops as soon as it is set, see doWithRetries.
+    CancellationPtr cancellation;
+
+    bool withPartialContent() const;
+
+    void prepareRequest(Poco::Net::HTTPRequest & request, std::optional<HTTPRange> range, bool with_request_body) const;
+
+    void doWithRetries(
+        std::function<void()> && callable,
+        std::function<void()> on_retry = nullptr,
+        bool mute_logging = false,
+        bool stop_before_first_attempt_when_cancelled = true) const;
+
+    /// Waits before the next retry attempt. Returns true if the read has been cancelled while waiting.
+    bool waitBeforeRetry(size_t milliseconds) const;
+
+    /// Whether the code that reads from this buffer has cancelled the read, see doWithRetries.
+    bool isReadCancelled() const;
+
+    /// For the catch blocks of the helpers which treat the failure of a metadata request as an
+    /// answer: rethrows the exception being handled when it is the interruption of a request the
+    /// cancellation has abandoned - nothing may go on requesting after it. Must be called from a
+    /// catch block.
+    void rethrowIfReadInterrupted() const;
+
+    CallResult callImpl(
+        Poco::Net::HTTPResponse & response,
+        const std::string & method_,
+        const std::optional<HTTPRange> & range,
+        bool allow_redirects,
+        bool with_request_body = true) const;
+
+    CallResult callWithRedirects(
+        Poco::Net::HTTPResponse & response,
+        const String & method_,
+        const std::optional<HTTPRange> & range);
+
+    std::unique_ptr<ReadBuffer> initialize();
+
+    std::optional<size_t> tryGetFileSize() override;
+
+    bool supportsReadAt() override;
+
+    bool checkIfActuallySeekable() override;
+
+    String getFileName() const override;
+
+    void getHeadResponse(Poco::Net::HTTPResponse & response);
+
+    void setupExternalBuffer();
+
+    size_t getOffset() const;
+
+    // If true, if we destroy impl now, no work was wasted. Just for metrics.
+    bool atEndOfRequestedRangeGuess();
+
+    ReadWriteBufferFromHTTP(
+        const HTTPConnectionGroupType & connection_group_,
+        const Poco::URI & uri_,
+        const std::string & method_,
+        ProxyConfiguration proxy_config_,
+        ReadSettings read_settings_,
+        ConnectionTimeouts timeouts_,
+        const Poco::Net::HTTPBasicCredentials & credentials_,
+        const RemoteHostFilter * remote_host_filter_,
+        size_t buffer_size_,
+        size_t max_redirects_,
+        bool enable_url_encoding_,
+        OutStreamCallback out_stream_callback_,
+        CancellationPtr cancellation_,
+        std::optional<size_t> out_stream_fixed_content_length_,
+        bool use_external_buffer_,
+        bool http_skip_not_found_url_,
+        HTTPHeaderEntries http_header_entries_,
+        RedirectCallback redirect_callback_,
+        bool delay_initialization,
+        std::optional<HTTPFileInfo> file_info_);
 
 public:
-    explicit PooledReadWriteBufferFromHTTP(Poco::URI uri_,
-        const std::string & method_ = {},
-        OutStreamCallback out_stream_callback_ = {},
-        const ConnectionTimeouts & timeouts_ = {},
-        const Poco::Net::HTTPBasicCredentials & credentials_ = {},
-        size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE,
-        const UInt64 max_redirects = 0,
-        size_t max_connections_per_endpoint = DEFAULT_COUNT_OF_HTTP_CONNECTIONS_PER_ENDPOINT)
-        : Parent(std::make_shared<UpdatablePooledSession>(uri_, timeouts_, max_redirects, max_connections_per_endpoint),
-              uri_,
-              credentials_,
-              method_,
-              out_stream_callback_,
-              buffer_size_)
-    {
-    }
+    bool nextImpl() override;
+
+    size_t readBigAt(char * to, size_t n, size_t offset, const std::function<bool(size_t)> & progress_callback) const override;
+
+    off_t seek(off_t offset_, int whence) override;
+
+    void setReadUntilPosition(size_t until) override;
+
+    void setReadUntilEnd() override;
+
+    bool supportsRightBoundedReads() const override;
+
+    off_t getPosition() override;
+
+    std::string getResponseCookie(const std::string & name, const std::string & def) const;
+
+    /// Set function to call on each nextImpl, useful when you need to track
+    /// progress.
+    /// NOTE: parameter on each call is not incremental -- it's all bytes count
+    /// passed through the buffer
+    void setNextCallback(NextCallback next_callback_);
+
+    const std::string & getCompressionMethod() const;
+
+    std::optional<time_t> tryGetLastModificationTime();
+
+    /// The `Date` of the response which the file metadata came from, if the metadata is already known.
+    /// Does not send any request.
+    std::optional<time_t> tryGetResponseDateOfFileInfo() const { return file_info ? file_info->response_date : std::nullopt; }
+
+    bool hasNotFoundURL() const { return has_not_found_url; }
+
+    HTTPFileInfo getFileInfo();
+    static HTTPFileInfo parseFileInfo(const Poco::Net::HTTPResponse & response, size_t requested_range_begin);
+
+    Map getResponseHeaders() const;
+    std::optional<Field> getMetadata(const String & name) const override;
 };
+
+using ReadWriteBufferFromHTTPPtr = std::unique_ptr<ReadWriteBufferFromHTTP>;
+
+class BuilderRWBufferFromHTTP
+{
+    Poco::URI uri;
+    std::string method = Poco::Net::HTTPRequest::HTTP_GET;
+    HTTPConnectionGroupType connection_group = HTTPConnectionGroupType::HTTP;
+    bool bypass_proxy = false;
+    ReadSettings read_settings{};
+    ConnectionTimeouts timeouts{};
+    const RemoteHostFilter * remote_host_filter = nullptr;
+    size_t buffer_size = DBMS_DEFAULT_BUFFER_SIZE;
+    size_t max_redirects = 0;
+    bool enable_url_encoding = false;
+    ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback = nullptr;
+    std::optional<size_t> out_stream_fixed_content_length = std::nullopt;
+    ReadWriteBufferFromHTTP::RedirectCallback redirect_callback = nullptr;
+    bool use_external_buffer = false;
+    bool http_skip_not_found_url = false;
+    HTTPHeaderEntries http_header_entries{};
+    ReadWriteBufferFromHTTP::CancellationPtr cancellation;
+    bool delay_initialization = true;
+
+public:
+    explicit BuilderRWBufferFromHTTP(Poco::URI uri_)
+        : uri(uri_)
+    {}
+
+/// NOLINTBEGIN(bugprone-macro-parentheses)
+#define setterMember(name, member) \
+    BuilderRWBufferFromHTTP & name(decltype(BuilderRWBufferFromHTTP::member) arg_##member) \
+    { \
+        member = std::move(arg_##member); \
+        return *this; \
+    }
+
+    setterMember(withConnectionGroup, connection_group)
+    setterMember(withMethod, method)
+    setterMember(withBypassProxy, bypass_proxy)
+    setterMember(withSettings, read_settings)
+    setterMember(withTimeouts, timeouts)
+    setterMember(withHostFilter, remote_host_filter)
+    setterMember(withBufSize, buffer_size)
+    setterMember(withRedirects, max_redirects)
+    setterMember(withEnableUrlEncoding, enable_url_encoding)
+    setterMember(withOutCallback, out_stream_callback)
+    setterMember(withOutCallbackFixedContentLength, out_stream_fixed_content_length)
+    setterMember(withRedirectCallback, redirect_callback)
+    setterMember(withHeaders, http_header_entries)
+    setterMember(withCancellation, cancellation)
+    setterMember(withExternalBuf, use_external_buffer)
+    setterMember(withDelayInit, delay_initialization)
+    setterMember(withSkipNotFound, http_skip_not_found_url)
+#undef setterMember
+/// NOLINTEND(bugprone-macro-parentheses)
+
+    /// Authenticate with HTTP Basic credentials (no header is sent when they are empty).
+    ReadWriteBufferFromHTTPPtr create(const Poco::Net::HTTPBasicCredentials & credentials_);
+
+    /// Authenticate with a bearer token (`Authorization: Bearer <token>`; no header when empty).
+    ReadWriteBufferFromHTTPPtr createWithBearerToken(const std::string & bearer_token_);
+
+    /// Authenticate with the bearer token when it is non-empty, otherwise with the Basic
+    /// credentials: both occupy the `Authorization` header, so a request carries one or the
+    /// other, never both.
+    ReadWriteBufferFromHTTPPtr createWithBearerToken(
+        const std::string & bearer_token_, const Poco::Net::HTTPBasicCredentials & fallback_credentials_);
+};
+
+/// Fills `credentials` from the userinfo component of `uri` (e.g. `http://user:pass@host`).
+/// Throws if `header_filter` forbids the `Authorization` header, which sends them, and the userinfo has a username.
+void setCredentialsFromURL(Poco::Net::HTTPBasicCredentials & credentials, const Poco::URI & uri, const HTTPHeaderFilter & header_filter);
 
 }

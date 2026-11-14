@@ -1,27 +1,67 @@
-#include "OpenTelemetrySpanLog.h"
+#include <Interpreters/OpenTelemetrySpanLog.h>
 
+#include <base/getFQDNOrHostName.h>
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnLowCardinality.h>
+#include <Columns/ColumnMap.h>
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnTuple.h>
+#include <Columns/ColumnsNumber.h>
+#include <Common/config_version.h>
+#include <Common/DateLUTImpl.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime.h>
-#include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeUUID.h>
-
-#include <Common/hex.h>
+#include <DataTypes/DataTypeEnum.h>
 
 
 namespace DB
 {
 
-NamesAndTypesList OpenTelemetrySpanLogElement::getNamesAndTypes()
+ColumnsDescription OpenTelemetrySpanLogElement::getColumnsDescription()
 {
-    return {
-        {"trace_id", std::make_shared<DataTypeUUID>()},
-        {"span_id", std::make_shared<DataTypeUInt64>()},
-        {"parent_span_id", std::make_shared<DataTypeUInt64>()},
-        {"operation_name", std::make_shared<DataTypeString>()},
+    auto span_kind_type = std::make_shared<DataTypeEnum8>(
+        DataTypeEnum8::Values
+        {
+            {"INTERNAL",    static_cast<Int8>(OpenTelemetry::SpanKind::INTERNAL)},
+            {"SERVER",      static_cast<Int8>(OpenTelemetry::SpanKind::SERVER)},
+            {"CLIENT",      static_cast<Int8>(OpenTelemetry::SpanKind::CLIENT)},
+            {"PRODUCER",    static_cast<Int8>(OpenTelemetry::SpanKind::PRODUCER)},
+            {"CONSUMER",    static_cast<Int8>(OpenTelemetry::SpanKind::CONSUMER)}
+        }
+    );
+
+    auto status_code_type = std::make_shared<DataTypeEnum8>(
+        DataTypeEnum8::Values
+        {
+            {"UNSET",   static_cast<Int8>(OpenTelemetry::SpanStatus::UNSET)},
+            {"OK",      static_cast<Int8>(OpenTelemetry::SpanStatus::OK)},
+            {"ERROR",   static_cast<Int8>(OpenTelemetry::SpanStatus::ERROR)}
+        }
+    );
+
+    auto low_cardinality_string = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+
+    return ColumnsDescription
+    {
+        {"hostname", low_cardinality_string, "The hostname where this span was captured."},
+        {"clickhouse_version", low_cardinality_string, "Version of the ClickHouse server that produced the row."},
+        {"system_processor", low_cardinality_string, "CPU architecture of the ClickHouse server that produced the row."},
+        {"trace_id", std::make_shared<DataTypeUUID>(), "ID of the trace for executed query."},
+        {"span_id", std::make_shared<DataTypeUInt64>(), "ID of the trace span."},
+        {"parent_span_id", std::make_shared<DataTypeUInt64>(), "ID of the parent trace span."},
+        {"operation_name", low_cardinality_string, "The name of the operation."},
+        {"kind", std::move(span_kind_type), "The SpanKind of the span. "
+            "INTERNAL — Indicates that the span represents an internal operation within an application. "
+            "SERVER — Indicates that the span covers server-side handling of a synchronous RPC or other remote request. "
+            "CLIENT — Indicates that the span describes a request to some remote service. "
+            "PRODUCER — Indicates that the span describes the initiators of an asynchronous request. This parent span will often end before the corresponding child CONSUMER span, possibly even before the child span starts. "
+            "CONSUMER - Indicates that the span describes a child of an asynchronous PRODUCER request."},
         // DateTime64 is really unwieldy -- there is no "normal" way to convert
         // it to an UInt64 count of microseconds, except:
         // 1) reinterpretAsUInt64(reinterpretAsFixedString(date)), which just
@@ -32,19 +72,24 @@ NamesAndTypesList OpenTelemetrySpanLogElement::getNamesAndTypes()
         // Also subtraction of two DateTime64 points doesn't work, so you can't
         // get duration.
         // It is much less hassle to just use UInt64 of microseconds.
-        {"start_time_us", std::make_shared<DataTypeUInt64>()},
-        {"finish_time_us", std::make_shared<DataTypeUInt64>()},
-        {"finish_date", std::make_shared<DataTypeDate>()},
-        {"attribute", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeString>())},
+        {"start_time_us", std::make_shared<DataTypeUInt64>(), "The start time of the trace span (in microseconds)."},
+        {"finish_time_us", std::make_shared<DataTypeUInt64>(), "The finish time of the trace span (in microseconds)."},
+        {"event_date", std::make_shared<DataTypeDate>(), "The finish date of the trace span."},
+        {"status_code", std::move(status_code_type), "The status code of the span."},
+        {"status_message", low_cardinality_string, "Error message."},
+        {"attribute", std::make_shared<DataTypeMap>(low_cardinality_string, std::make_shared<DataTypeString>()), "Attribute depending on the trace span. They are filled in according to the recommendations in the OpenTelemetry standard."},
     };
 }
 
 NamesAndAliases OpenTelemetrySpanLogElement::getNamesAndAliases()
 {
+    auto low_cardinality_string = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+
     return
     {
-        {"attribute.names", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "mapKeys(attribute)"},
-        {"attribute.values", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "mapKeys(attribute)"}
+        {"attribute.names", std::make_shared<DataTypeArray>(low_cardinality_string), "mapKeys(attribute)"},
+        {"attribute.values", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "mapValues(attribute)"},
+        {"finish_date", std::make_shared<DataTypeDate>(), "event_date"},
     };
 }
 
@@ -52,190 +97,51 @@ void OpenTelemetrySpanLogElement::appendToBlock(MutableColumns & columns) const
 {
     size_t i = 0;
 
-    columns[i++]->insert(trace_id);
-    columns[i++]->insert(span_id);
-    columns[i++]->insert(parent_span_id);
-    columns[i++]->insert(operation_name);
-    columns[i++]->insert(start_time_us);
-    columns[i++]->insert(finish_time_us);
-    columns[i++]->insert(DateLUT::instance().toDayNum(finish_time_us / 1000000).toUnderType());
-    // The user might add some ints values, and we will have Int Field, and the
-    // insert will fail because the column requires Strings. Convert the fields
-    // here, because it's hard to remember to convert them in all other places.
+    /// Write into the columns directly instead of boxing every value into a `Field`.
+    /// `IColumn::insert(Field)` on a `LowCardinality` column reaches `ColumnUnique::uniqueInsert`,
+    /// which allocates a throw-away `ColumnString` per value, and the `attribute` map additionally
+    /// materializes a `Map` of `Tuple`s of `Field`s - about seven allocations per attribute.
+    /// This is the dominant cost of a span log flush: in a Memory Sanitizer CI run, where the
+    /// stateless tests are executed with `opentelemetry_start_trace_probability = 0.1`, building
+    /// the block for a batch of 325865 spans took 99 s while the `INSERT` itself took 2.3 s. Once
+    /// a flush is slower than the rate at which spans are produced the queue keeps growing, and
+    /// `SYSTEM FLUSH LOGS opentelemetry_span_log` starts to exceed its 180 s timeout.
+    const auto & hostname = getFQDNOrHostName();
+    typeid_cast<ColumnLowCardinality &>(*columns[i++]).insertData(hostname.data(), hostname.size());
+    const std::string_view clickhouse_version = VERSION_STRING;
+    typeid_cast<ColumnLowCardinality &>(*columns[i++]).insertData(clickhouse_version.data(), clickhouse_version.size());
+    const std::string_view system_processor = SYSTEM_PROCESSOR;
+    typeid_cast<ColumnLowCardinality &>(*columns[i++]).insertData(system_processor.data(), system_processor.size());
+    typeid_cast<ColumnUUID &>(*columns[i++]).getData().push_back(span.trace_id);
+    typeid_cast<ColumnUInt64 &>(*columns[i++]).getData().push_back(span.span_id);
+    typeid_cast<ColumnUInt64 &>(*columns[i++]).getData().push_back(span.parent_span_id);
+    typeid_cast<ColumnLowCardinality &>(*columns[i++]).insertData(span.operation_name.data(), span.operation_name.size());
+    typeid_cast<ColumnInt8 &>(*columns[i++]).getData().push_back(static_cast<Int8>(span.kind));
+    typeid_cast<ColumnUInt64 &>(*columns[i++]).getData().push_back(span.start_time_us);
+    typeid_cast<ColumnUInt64 &>(*columns[i++]).getData().push_back(span.finish_time_us);
+    typeid_cast<ColumnUInt16 &>(*columns[i++]).getData().push_back(
+        DateLUT::instance().toDayNum(span.finish_time_us / 1000000).toUnderType());
+    typeid_cast<ColumnInt8 &>(*columns[i++]).getData().push_back(static_cast<Int8>(span.status_code));
+    typeid_cast<ColumnLowCardinality &>(*columns[i++]).insertData(span.status_message.data(), span.status_message.size());
 
-    Map map(attribute_names.size());
-    for (size_t attr_idx = 0; attr_idx < map.size(); ++attr_idx)
     {
-        map[attr_idx] = Tuple{attribute_names[attr_idx], toString(attribute_values[attr_idx])};
-    }
-    columns[i++]->insert(map);
-}
+        auto & column_map = typeid_cast<ColumnMap &>(*columns[i++]);
+        auto & offsets = column_map.getNestedColumn().getOffsets();
+        auto & tuple_column = column_map.getNestedData();
+        auto & key_column = typeid_cast<ColumnLowCardinality &>(tuple_column.getColumn(0));
+        auto & value_column = typeid_cast<ColumnString &>(tuple_column.getColumn(1));
 
-
-OpenTelemetrySpanHolder::OpenTelemetrySpanHolder(const std::string & _operation_name)
-{
-    trace_id = 0;
-
-    if (!CurrentThread::isInitialized())
-    {
-        // There may be no thread context if we're running inside the
-        // clickhouse-client, e.g. reading an external table provided with the
-        // `--external` option.
-        return;
-    }
-
-    auto & thread = CurrentThread::get();
-
-    trace_id = thread.thread_trace_context.trace_id;
-    if (trace_id == UUID())
-        return;
-
-    parent_span_id = thread.thread_trace_context.span_id;
-    span_id = thread_local_rng();
-    operation_name = _operation_name;
-    start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-
-    thread.thread_trace_context.span_id = span_id;
-}
-
-
-OpenTelemetrySpanHolder::~OpenTelemetrySpanHolder()
-{
-    try
-    {
-        if (trace_id == UUID())
-            return;
-
-        // First of all, return old value of current span.
-        auto & thread = CurrentThread::get();
-        assert(thread.thread_trace_context.span_id == span_id);
-        thread.thread_trace_context.span_id = parent_span_id;
-
-        // Not sure what's the best way to access the log from here.
-        auto * thread_group = CurrentThread::getGroup().get();
-        // Not sure whether and when this can be null.
-        if (!thread_group)
+        for (const auto & attribute : span.attributes)
         {
-            return;
+            const auto & key = attribute.getKey();
+            key_column.insertData(key.data(), key.size());
+
+            const auto value = attribute.getValue();
+            value_column.insertData(value.data(), value.size());
         }
 
-        auto context = thread_group->query_context.lock();
-        if (!context)
-        {
-            // Both global and query contexts can be null when executing a
-            // background task, and global context can be null for some
-            // queries.
-            return;
-        }
-
-        auto log = context->getOpenTelemetrySpanLog();
-        if (!log)
-        {
-            // The log might be disabled.
-            return;
-        }
-
-        finish_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-
-        log->add(OpenTelemetrySpanLogElement(
-                     static_cast<OpenTelemetrySpan>(*this)));
-    }
-    catch (...)
-    {
-        tryLogCurrentException(__FUNCTION__);
+        offsets.push_back(offsets.back() + span.attributes.size());
     }
 }
 
-
-template <typename T>
-static T readHex(const char * data)
-{
-    T x{};
-
-    const char * end = data + sizeof(T) * 2;
-    while (data < end)
-    {
-        x *= 16;
-        x += unhex(*data);
-        ++data;
-    }
-
-    return x;
 }
-
-
-bool OpenTelemetryTraceContext::parseTraceparentHeader(const std::string & traceparent,
-    std::string & error)
-{
-    trace_id = 0;
-
-    // Version 00, which is the only one we can parse, is fixed width. Use this
-    // fact for an additional sanity check.
-    const int expected_length = strlen("xx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-xxxxxxxxxxxxxxxx-xx");
-    if (traceparent.length() != expected_length)
-    {
-        error = fmt::format("unexpected length {}, expected {}",
-            traceparent.length(), expected_length);
-        return false;
-    }
-
-    const char * data = traceparent.data();
-
-    uint8_t version = readHex<uint8_t>(data);
-    data += 2;
-
-    if (version != 0)
-    {
-        error = fmt::format("unexpected version {}, expected 00", version);
-        return false;
-    }
-
-    if (*data != '-')
-    {
-        error = fmt::format("Malformed traceparant header: {}", traceparent);
-        return false;
-    }
-
-    ++data;
-    UInt128 trace_id_128 = readHex<UInt128>(data);
-    trace_id = trace_id_128;
-    data += 32;
-
-    if (*data != '-')
-    {
-        error = fmt::format("Malformed traceparant header: {}", traceparent);
-        return false;
-    }
-
-    ++data;
-    span_id = readHex<UInt64>(data);
-    data += 16;
-
-    if (*data != '-')
-    {
-        error = fmt::format("Malformed traceparant header: {}", traceparent);
-        return false;
-    }
-
-    ++data;
-    trace_flags = readHex<UInt8>(data);
-    return true;
-}
-
-
-std::string OpenTelemetryTraceContext::composeTraceparentHeader() const
-{
-    // This span is a parent for its children, so we specify this span_id as a
-    // parent id.
-    return fmt::format("00-{:032x}-{:016x}-{:02x}", __uint128_t(trace_id.toUnderType()),
-        span_id,
-        // This cast is needed because fmt is being weird and complaining that
-        // "mixing character types is not allowed".
-        static_cast<uint8_t>(trace_flags));
-}
-
-
-}
-

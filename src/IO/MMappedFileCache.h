@@ -2,9 +2,9 @@
 
 #include <Core/Types.h>
 #include <Common/HashTable/Hash.h>
-#include <Common/LRUCache.h>
-#include <Common/SipHash.h>
+#include <Common/CacheBase.h>
 #include <Common/ProfileEvents.h>
+#include <Common/CurrentMetrics.h>
 #include <IO/MMappedFile.h>
 
 
@@ -14,6 +14,11 @@ namespace ProfileEvents
     extern const Event MMappedFileCacheMisses;
 }
 
+namespace CurrentMetrics
+{
+    extern const Metric MMapCacheCells;
+}
+
 namespace DB
 {
 
@@ -21,28 +26,19 @@ namespace DB
 /** Cache of opened and mmapped files for reading.
   * mmap/munmap is heavy operation and better to keep mapped file to subsequent use than to map/unmap every time.
   */
-class MMappedFileCache : public LRUCache<UInt128, MMappedFile, UInt128TrivialHash>
+class MMappedFileCache : public CacheBase<UInt128, MMappedFile, UInt128TrivialHash>
 {
 private:
-    using Base = LRUCache<UInt128, MMappedFile, UInt128TrivialHash>;
+    using Base = CacheBase<UInt128, MMappedFile, UInt128TrivialHash>;
 
 public:
-    MMappedFileCache(size_t max_size_in_bytes)
-        : Base(max_size_in_bytes) {}
+    explicit MMappedFileCache(size_t max_size_in_cells)
+        // Note, it is OK to use max_size_in_bytes=max_size_in_cells since default weight is 1
+        : Base(CurrentMetrics::end(), CurrentMetrics::MMapCacheCells, /*max_size_in_bytes=*/ max_size_in_cells)
+    {}
 
     /// Calculate key from path to file and offset.
-    static UInt128 hash(const String & path_to_file, size_t offset, ssize_t length = -1)
-    {
-        UInt128 key;
-
-        SipHash hash;
-        hash.update(path_to_file.data(), path_to_file.size() + 1);
-        hash.update(offset);
-        hash.update(length);
-
-        hash.get128(key);
-        return key;
-    }
+    static UInt128 hash(const String & path_to_file, size_t offset, ssize_t length = -1);
 
     template <typename LoadFunc>
     MappedPtr getOrSet(const Key & key, LoadFunc && load)

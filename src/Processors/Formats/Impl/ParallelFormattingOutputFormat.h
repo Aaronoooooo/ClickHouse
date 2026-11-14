@@ -1,22 +1,39 @@
 #pragma once
 
 #include <Processors/Formats/IOutputFormat.h>
+#include <Common/DequeWithMemoryTracking.h>
 
-#include <Common/Arena.h>
 #include <Common/ThreadPool.h>
-#include <base/logger_useful.h>
+#include <Common/logger_useful.h>
 #include <Common/Exception.h>
-#include "IO/WriteBufferFromString.h"
-#include <Formats/FormatFactory.h>
+#include <Common/CurrentMetrics.h>
+#include <Common/ThreadGroupSwitcher.h>
+#include <IO/WriteBufferFromString.h>
 #include <Poco/Event.h>
 #include <IO/BufferWithOwnMemory.h>
 #include <IO/WriteBuffer.h>
+#include <IO/NullWriteBuffer.h>
 
-#include <deque>
 #include <atomic>
+
+
+namespace CurrentMetrics
+{
+    extern const Metric ParallelFormattingOutputFormatThreads;
+    extern const Metric ParallelFormattingOutputFormatThreadsActive;
+    extern const Metric ParallelFormattingOutputFormatThreadsScheduled;
+}
 
 namespace DB
 {
+
+class IOutputFormat;
+using OutputFormatPtr = std::shared_ptr<IOutputFormat>;
+
+namespace ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+}
 
 /**
  * ORDER-PRESERVING parallel formatting of data formats.
@@ -26,13 +43,11 @@ namespace DB
  * Then, another thread add temporary buffers into a "real" WriteBuffer.
  *
  *                   Formatters
- *      |   |   |   |   |   |   |   |   |   |
- *      v   v   v   v   v   v   v   v   v   v
- *    |---|---|---|---|---|---|---|---|---|---|
- *    | 1 | 2 | 3 | 4 | 5 | . | . | . | . | N | <-- Processing units
- *    |---|---|---|---|---|---|---|---|---|---|
- *      ^               ^
- *      |               |
+ *      ↓   ↓   ↓   ↓   ↓   ↓   ↓   ↓   ↓   ↓
+ *    ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐
+ *    | 1 | 2 | 3 | 4 | 5 | . | . | . | . | N | ← Processing units
+ *    └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘
+ *      ↑               ↑
  *   Collector       addChunk
  *
  * There is a container of ProcessingUnits - internal entity, storing a Chunk to format,
@@ -49,7 +64,7 @@ namespace DB
  * To stop the execution, a fake Chunk is added (ProcessingUnitType = FINALIZE) and finalize()
  * function is blocked until the Collector thread is done.
 */
-class ParallelFormattingOutputFormat : public IOutputFormat
+class ParallelFormattingOutputFormat final : public IOutputFormat
 {
 public:
     /// Used to recreate formatter on every new data piece.
@@ -59,7 +74,7 @@ public:
     struct Params
     {
         WriteBuffer & out;
-        const Block & header;
+        SharedHeader header;
         InternalFormatterCreator internal_formatter_creator;
         const size_t max_threads_for_parallel_formatting;
     };
@@ -69,17 +84,29 @@ public:
     explicit ParallelFormattingOutputFormat(Params params)
         : IOutputFormat(params.header, params.out)
         , internal_formatter_creator(params.internal_formatter_creator)
-        , pool(params.max_threads_for_parallel_formatting)
+        , pool(CurrentMetrics::ParallelFormattingOutputFormatThreads, CurrentMetrics::ParallelFormattingOutputFormatThreadsActive, CurrentMetrics::ParallelFormattingOutputFormatThreadsScheduled, params.max_threads_for_parallel_formatting)
 
     {
+        LOG_TEST(getLogger("ParallelFormattingOutputFormat"), "Parallel formatting is being used");
+
+        NullWriteBuffer buf;
+        auto internal_formatter = internal_formatter_creator(buf);
+        save_totals_and_extremes_in_statistics = internal_formatter->areTotalsAndExtremesUsedInFinalize();
+        supports_non_default_serialization_kinds = internal_formatter->supportsSpecialSerializationKinds();
+        buf.finalize();
+
         /// Just heuristic. We need one thread for collecting, one thread for receiving chunks
         /// and n threads for formatting.
-        processing_units.resize(params.max_threads_for_parallel_formatting + 2);
-        collector_thread = ThreadFromGlobalPool([thread_group = CurrentThread::getGroup(), this]
+        processing_units.resize(std::min(params.max_threads_for_parallel_formatting + 2, size_t{1024}));
+
+        /// Do not put any code that could throw an exception under this line.
+        /// Because otherwise the destructor of this class won't be called and this thread won't be joined.
+        /// Also some race condition is possible, because collector_thread runs in parallel with
+        /// the destruction of the objects already created in this scope.
+        collector_thread = ThreadFromGlobalPool([thread_group = getCurrentThreadGroup(), this]
         {
             collectorThreadFunction(thread_group);
         });
-        LOG_TRACE(&Poco::Logger::get("ParallelFormattingOutputFormat"), "Parallel formatting is being used");
     }
 
     ~ParallelFormattingOutputFormat() override
@@ -89,47 +116,79 @@ public:
 
     String getName() const override { return "ParallelFormattingOutputFormat"; }
 
-    void flush() override
+    void flushImpl() override
     {
-        need_flush = true;
+        if (!auto_flush)
+            need_flush = true;
     }
 
     void writePrefix() override
     {
         addChunk(Chunk{}, ProcessingUnitType::START, /*can_throw_exception*/ true);
+        started_prefix = true;
     }
 
-    void onCancel() override
+    void onCancel() noexcept override
     {
         finishAndWait();
     }
 
-    /// There are no formats which support parallel formatting and progress writing at the same time
-    void onProgress(const Progress &) override {}
-
-    String getContentType() const override
+    void writeSuffix() override
     {
-        WriteBufferFromOwnString buffer;
-        return internal_formatter_creator(buffer)->getContentType();
+        addChunk(Chunk{}, ProcessingUnitType::PLAIN_FINISH, /*can_throw_exception*/ true);
+        started_suffix = true;
     }
 
+    bool supportsWritingException() const override
+    {
+        NullWriteBuffer buffer;
+        return internal_formatter_creator(buffer)->supportsWritingException();
+    }
+
+    void setException(const String & exception_message_) override { exception_message = exception_message_; }
+
+    bool supportsSpecialSerializationKinds() const override { return supports_non_default_serialization_kinds; }
+
 private:
-    void consume(Chunk chunk) override final
+    void consume(Chunk chunk) final
     {
         addChunk(std::move(chunk), ProcessingUnitType::PLAIN, /*can_throw_exception*/ true);
     }
 
     void consumeTotals(Chunk totals) override
     {
-        addChunk(std::move(totals), ProcessingUnitType::TOTALS, /*can_throw_exception*/ true);
+        if (save_totals_and_extremes_in_statistics)
+        {
+            std::lock_guard lock(statistics_mutex);
+            statistics.totals = std::move(totals);
+        }
+        else
+        {
+            addChunk(std::move(totals), ProcessingUnitType::TOTALS, /*can_throw_exception*/ true);
+            are_totals_written = true;
+        }
     }
 
     void consumeExtremes(Chunk extremes) override
     {
-        addChunk(std::move(extremes), ProcessingUnitType::EXTREMES, /*can_throw_exception*/ true);
+        if (save_totals_and_extremes_in_statistics)
+        {
+            std::lock_guard lock(statistics_mutex);
+            statistics.extremes = std::move(extremes);
+        }
+        else
+        {
+            addChunk(std::move(extremes), ProcessingUnitType::EXTREMES, /*can_throw_exception*/ true);
+        }
     }
 
     void finalizeImpl() override;
+
+    void resetFormatterImpl() override
+    {
+        /// Resetting parallel formatting is not obvious and it's not used anywhere
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method resetFormatterImpl is not implemented for parallel formatting");
+    }
 
     InternalFormatterCreator internal_formatter_creator;
 
@@ -142,13 +201,14 @@ private:
     };
 
     /// Some information about what methods to call from internal parser.
-    enum class ProcessingUnitType
+    enum class ProcessingUnitType : uint8_t
     {
         START,
         PLAIN,
+        PLAIN_FINISH,
         TOTALS,
         EXTREMES,
-        FINALIZE
+        FINALIZE,
     };
 
     void addChunk(Chunk chunk, ProcessingUnitType type, bool can_throw_exception);
@@ -160,6 +220,8 @@ private:
         Chunk chunk;
         Memory<> segment;
         size_t actual_memory_size{0};
+        Statistics statistics;
+        size_t rows_num{};
     };
 
     Poco::Event collector_finished{};
@@ -175,7 +237,7 @@ private:
     std::exception_ptr background_exception = nullptr;
 
     /// We use deque, because ProcessingUnit doesn't have move or copy constructor.
-    std::deque<ProcessingUnit> processing_units;
+    DequeWithMemoryTracking<ProcessingUnit> processing_units;
 
     std::mutex mutex;
     std::atomic_bool emergency_stop{false};
@@ -186,11 +248,28 @@ private:
     std::condition_variable collector_condvar;
     std::condition_variable writer_condvar;
 
-    void finishAndWait();
+    size_t rows_consumed = 0;
+    size_t rows_collected = 0;
+    std::atomic_bool are_totals_written = false;
+
+    /// We change statistics in onProgress() which can be called from different threads.
+    std::mutex statistics_mutex;
+    bool save_totals_and_extremes_in_statistics;
+    bool supports_non_default_serialization_kinds;
+
+    String exception_message;
+    bool exception_is_rethrown = false;
+    bool started_prefix = false;
+    bool collected_prefix = false;
+    bool started_suffix = false;
+    bool collected_suffix = false;
+    bool collected_finalize = false;
+
+    void finishAndWait() noexcept;
 
     void onBackgroundException()
     {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::lock_guard lock(mutex);
         if (!background_exception)
         {
             background_exception = std::current_exception();
@@ -200,19 +279,43 @@ private:
         collector_condvar.notify_all();
     }
 
-    void scheduleFormatterThreadForUnitWithNumber(size_t ticket_number)
+    void rethrowBackgroundException()
     {
-        pool.scheduleOrThrowOnError([this, thread_group = CurrentThread::getGroup(), ticket_number]
+        /// Rethrow background exception only once, because
+        /// OutputFormat can be used after it to write an exception.
+        if (!exception_is_rethrown)
         {
-            formatterThreadFunction(ticket_number, thread_group);
+            exception_is_rethrown = true;
+            std::rethrow_exception(background_exception);
+        }
+    }
+
+    void scheduleFormatterThreadForUnitWithNumber(size_t ticket_number, size_t first_row_num)
+    {
+        pool.scheduleOrThrowOnError([this, thread_group = getCurrentThreadGroup(), ticket_number, first_row_num]
+        {
+            formatterThreadFunction(ticket_number, first_row_num, thread_group);
         });
     }
 
     /// Collects all temporary buffers into main WriteBuffer.
-    void collectorThreadFunction(const ThreadGroupStatusPtr & thread_group);
+    void collectorThreadFunction(const ThreadGroupPtr & thread_group);
 
     /// This function is executed in ThreadPool and the only purpose of it is to format one Chunk into a continuous buffer in memory.
-    void formatterThreadFunction(size_t current_unit_number, const ThreadGroupStatusPtr & thread_group);
+    void formatterThreadFunction(size_t current_unit_number, size_t first_row_num, const ThreadGroupPtr & thread_group);
+
+    void setRowsBeforeLimit(size_t rows_before_limit) override
+    {
+        std::lock_guard lock(statistics_mutex);
+        statistics.rows_before_limit = rows_before_limit;
+        statistics.applied_limit = true;
+    }
+    void setRowsBeforeAggregation(size_t rows_before_aggregation) override
+    {
+        std::lock_guard lock(statistics_mutex);
+        statistics.rows_before_aggregation = rows_before_aggregation;
+        statistics.applied_aggregation = true;
+    }
 };
 
 }

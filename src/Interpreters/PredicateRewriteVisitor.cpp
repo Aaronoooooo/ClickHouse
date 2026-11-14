@@ -1,5 +1,7 @@
 #include <Interpreters/PredicateRewriteVisitor.h>
 
+#include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <Core/Block.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTAsterisk.h>
 #include <Parsers/ASTSubquery.h>
@@ -7,11 +9,11 @@
 #include <Parsers/ASTColumnsMatcher.h>
 #include <Parsers/ASTQualifiedAsterisk.h>
 #include <Parsers/ASTSelectIntersectExceptQuery.h>
+#include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Interpreters/IdentifierSemantic.h>
 #include <Interpreters/getTableExpressions.h>
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/ExtractExpressionInfoVisitor.h>
-#include <AggregateFunctions/AggregateFunctionFactory.h>
 
 
 namespace DB
@@ -95,8 +97,8 @@ void PredicateRewriteVisitorData::visitOtherInternalSelect(ASTSelectQuery & sele
     size_t alias_index = 0;
     for (auto & ref_select : temp_select_query->refSelect()->children)
     {
-        if (!ref_select->as<ASTAsterisk>() && !ref_select->as<ASTQualifiedAsterisk>() && !ref_select->as<ASTColumnsMatcher>() &&
-            !ref_select->as<ASTIdentifier>())
+        if (!ref_select->as<ASTAsterisk>() && !ref_select->as<ASTQualifiedAsterisk>() && !ref_select->as<ASTColumnsListMatcher>()
+            && !ref_select->as<ASTColumnsRegexpMatcher>() && !ref_select->as<ASTIdentifier>())
         {
             if (const auto & alias = ref_select->tryGetAlias(); alias.empty())
                 ref_select->setAlias("--predicate_optimizer_" + toString(alias_index++));
@@ -106,7 +108,7 @@ void PredicateRewriteVisitorData::visitOtherInternalSelect(ASTSelectQuery & sele
     const Names & internal_columns = InterpreterSelectQuery(
         temp_internal_select,
         const_pointer_cast<Context>(getContext()),
-        SelectQueryOptions().analyze()).getSampleBlock().getNames();
+        SelectQueryOptions().analyze()).getSampleBlock()->getNames();
 
     if (rewriteSubquery(*temp_select_query, internal_columns))
     {
@@ -132,21 +134,70 @@ static void cleanAliasAndCollectIdentifiers(ASTPtr & predicate, std::vector<ASTI
         identifiers.emplace_back(identifier);
 }
 
+
+/// Clean aliases and use aliased name
+/// Transforms `(a = b as c) AND (x = y)` to `(a = c) AND (x = y)`
+static void useAliasInsteadOfIdentifier(const ASTPtr & predicate)
+{
+    if (!predicate->as<ASTSubquery>())
+    {
+        for (auto & children : predicate->children)
+            useAliasInsteadOfIdentifier(children);
+    }
+
+    if (const auto alias = predicate->tryGetAlias(); !alias.empty())
+    {
+        if (ASTIdentifier * identifier = predicate->as<ASTIdentifier>())
+            identifier->setShortName(alias);
+        predicate->setAlias({});
+    }
+}
+
+static void getConjunctionHashesFrom(const ASTPtr & ast, std::set<IASTHash> & hashes)
+{
+    for (const auto & pred : splitConjunctionsAst(ast))
+    {
+        /// Clone not to modify `ast`
+        ASTPtr pred_copy = pred->clone();
+        useAliasInsteadOfIdentifier(pred_copy);
+        hashes.emplace(pred_copy->getTreeHash(/*ignore_aliases=*/ true));
+    }
+}
+
 bool PredicateRewriteVisitorData::rewriteSubquery(ASTSelectQuery & subquery, const Names & inner_columns)
 {
     if ((!optimize_final && subquery.final())
-        || (!optimize_with && subquery.with())
+        || (subquery.with() && (!optimize_with || hasNonRewritableFunction(subquery.with(), getContext())))
         || subquery.withFill()
-        || subquery.limitBy() || subquery.limitLength()
-        || hasNonRewritableFunction(subquery.select(), getContext()))
+        || subquery.limitBy() || subquery.limitLength() || subquery.limitByLength() || subquery.limitByOffset()
+        || subquery.limitAfter() || subquery.limitUntil()
+        || hasNonRewritableFunction(subquery.select(), getContext())
+        /// The predicate goes into `HAVING`, which is evaluated before the window functions `QUALIFY` filters by.
+        || subquery.qualify()
+        || (subquery.orderBy() && subquery.limitOffset()))
         return false;
 
     Names outer_columns = table_columns.columns.getNames();
+
+    /// Do not add same conditions twice to avoid extra rewrites with exponential blowup
+    /// (e.g. in case of deep complex query with lots of JOINs)
+    std::set<IASTHash> hashes;
+    getConjunctionHashesFrom(subquery.where(), hashes);
+    getConjunctionHashesFrom(subquery.having(), hashes);
+
+    bool is_changed = false;
     for (const auto & predicate : predicates)
     {
         std::vector<ASTIdentifier *> identifiers;
         ASTPtr optimize_predicate = predicate->clone();
         cleanAliasAndCollectIdentifiers(optimize_predicate, identifiers);
+
+        auto predicate_hash = optimize_predicate->getTreeHash(/*ignore_aliases=*/ true);
+        if (hashes.contains(predicate_hash))
+            continue;
+
+        hashes.emplace(predicate_hash);
+        is_changed = true;
 
         for (const auto & identifier : identifiers)
         {
@@ -165,10 +216,10 @@ bool PredicateRewriteVisitorData::rewriteSubquery(ASTSelectQuery & subquery, con
         /// We only need to push all the predicates to subquery having
         /// The subquery optimizer will move the appropriate predicates from having to where
         subquery.setExpression(ASTSelectQuery::Expression::HAVING,
-            subquery.having() ? makeASTFunction("and", optimize_predicate, subquery.having()) : optimize_predicate);
+            subquery.having() ? makeASTOperator("and", optimize_predicate, subquery.having()) : optimize_predicate);
     }
 
-    return true;
+    return is_changed;
 }
 
 }

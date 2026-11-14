@@ -5,45 +5,43 @@
 #include <Columns/FilterDescription.h>
 #include <Columns/ColumnsCommon.h>
 
+#include <Common/FailPoint.h>
 #include <Common/typeid_cast.h>
+#include <Core/SettingsEnums.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
+#include <Functions/IFunction.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Interpreters/ExpressionActions.h>
 
 namespace DB
 {
+namespace FailPoints
+{
+    extern const char totals_having_transform_pause[];
+    extern const char totals_having_transform_drop_cancelled_chunk[];
+}
+
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int ILLEGAL_COLUMN;
 }
 
-void finalizeChunk(Chunk & chunk)
-{
-    auto num_rows = chunk.getNumRows();
-    auto columns = chunk.detachColumns();
-
-    for (auto & column : columns)
-        if (typeid_cast<const ColumnAggregateFunction *>(column.get()))
-            column = ColumnAggregateFunction::convertToValues(IColumn::mutate(std::move(column)));
-
-    chunk.setColumns(std::move(columns), num_rows);
-}
-
-void finalizeBlock(Block & block)
+static void finalizeBlock(Block & block, const ColumnsMask & aggregates_mask)
 {
     for (size_t i = 0; i < block.columns(); ++i)
     {
-        ColumnWithTypeAndName & current = block.getByPosition(i);
-        const DataTypeAggregateFunction * unfinalized_type = typeid_cast<const DataTypeAggregateFunction *>(current.type.get());
+        if (!aggregates_mask[i])
+            continue;
 
-        if (unfinalized_type)
+        ColumnWithTypeAndName & current = block.getByPosition(i);
+        const DataTypeAggregateFunction & unfinalized_type = typeid_cast<const DataTypeAggregateFunction &>(*current.type);
+
+        current.type = unfinalized_type.getReturnType();
+        if (current.column)
         {
-            current.type = unfinalized_type->getReturnType();
-            if (current.column)
-            {
-                auto mut_column = IColumn::mutate(std::move(current.column));
-                current.column = ColumnAggregateFunction::convertToValues(std::move(mut_column));
-            }
+            auto mut_column = IColumn::mutate(std::move(current.column));
+            current.column = ColumnAggregateFunction::convertToValues(std::move(mut_column));
         }
     }
 }
@@ -53,14 +51,15 @@ Block TotalsHavingTransform::transformHeader(
     const ActionsDAG * expression,
     const std::string & filter_column_name,
     bool remove_filter,
-    bool final)
+    bool final,
+    const ColumnsMask & aggregates_mask)
 {
     if (final)
-        finalizeBlock(block);
+        finalizeBlock(block, aggregates_mask);
 
     if (expression)
     {
-        block = expression->updateHeader(std::move(block));
+        block = expression->updateHeader(block);
         if (remove_filter)
             block.erase(filter_column_name);
     }
@@ -70,6 +69,7 @@ Block TotalsHavingTransform::transformHeader(
 
 TotalsHavingTransform::TotalsHavingTransform(
     const Block & header,
+    const ColumnsMask & aggregates_mask_,
     bool overflow_row_,
     const ExpressionActionsPtr & expression_,
     const std::string & filter_column_,
@@ -77,7 +77,8 @@ TotalsHavingTransform::TotalsHavingTransform(
     TotalsMode totals_mode_,
     double auto_include_threshold_,
     bool final_)
-    : ISimpleTransform(header, transformHeader(header, expression_  ? &expression_->getActionsDAG() : nullptr, filter_column_, remove_filter_, final_), true)
+    : ISimpleTransform(header, transformHeader(header, expression_  ? &expression_->getActionsDAG() : nullptr, filter_column_, remove_filter_, final_, aggregates_mask_), true)
+    , aggregates_mask(aggregates_mask_)
     , overflow_row(overflow_row_)
     , expression(expression_)
     , filter_column_name(filter_column_)
@@ -87,14 +88,19 @@ TotalsHavingTransform::TotalsHavingTransform(
     , final(final_)
 {
     finalized_header = getInputPort().getHeader();
-    finalizeBlock(finalized_header);
+    finalizeBlock(finalized_header, aggregates_mask);
 
     /// Port for Totals.
+    /// Use updateHeader (same method as transformHeader for the main output) to ensure
+    /// the totals port header has the same column constness as the main output port.
+    /// Previously this used ExpressionActions::execute which can produce different constness
+    /// via a different code path in defaultImplementationForNulls at 0 rows.
     if (expression)
     {
-        auto totals_header = finalized_header;
-        size_t num_rows = totals_header.rows();
-        expression->execute(totals_header, num_rows);
+        set_spillables.add(expression->getActionsDAG());
+        /// Use updateHeader (dry-run evaluation) instead of expression->execute(),
+        /// because sets from subqueries may not be ready yet at this point.
+        auto totals_header = expression->getActionsDAG().updateHeader(finalized_header);
         filter_column_pos = totals_header.getPositionByName(filter_column_name);
         if (remove_filter)
             totals_header.erase(filter_column_name);
@@ -129,6 +135,12 @@ IProcessor::Status TotalsHavingTransform::prepare()
         finished_transform = true;
     }
 
+    if (isCancelled())
+    {
+        getTotalsPort().finish();
+        return Status::Finished;
+    }
+
     auto & totals_output = getTotalsPort();
 
     /// Check can output.
@@ -138,7 +150,7 @@ IProcessor::Status TotalsHavingTransform::prepare()
     if (!totals_output.canPush())
         return Status::PortFull;
 
-    if (!totals)
+    if (!total_prepared)
         return Status::Ready;
 
     totals_output.push(std::move(totals));
@@ -149,9 +161,26 @@ IProcessor::Status TotalsHavingTransform::prepare()
 void TotalsHavingTransform::work()
 {
     if (finished_transform)
+    {
+        if (isCancelled())
+            return;
         prepareTotals();
+    }
     else
         ISimpleTransform::work();
+}
+
+void TotalsHavingTransform::onCancel() noexcept
+{
+    ISimpleTransform::onCancel();
+    if (expression)
+    {
+        for (const auto & node : expression->getNodes())
+        {
+            if (node.type == ActionsDAG::ActionType::FUNCTION && node.function)
+                node.function->cancelExecution();
+        }
+    }
 }
 
 void TotalsHavingTransform::transform(Chunk & chunk)
@@ -159,13 +188,9 @@ void TotalsHavingTransform::transform(Chunk & chunk)
     /// Block with values not included in `max_rows_to_group_by`. We'll postpone it.
     if (overflow_row)
     {
-        const auto & info = chunk.getChunkInfo();
-        if (!info)
-            throw Exception("Chunk info was not set for chunk in TotalsHavingTransform.", ErrorCodes::LOGICAL_ERROR);
-
-        const auto * agg_info = typeid_cast<const AggregatedChunkInfo *>(info.get());
+        const auto & agg_info = chunk.getChunkInfos().get<AggregatedChunkInfo>();
         if (!agg_info)
-            throw Exception("Chunk should have AggregatedChunkInfo in TotalsHavingTransform.", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Chunk should have AggregatedChunkInfo in TotalsHavingTransform.");
 
         if (agg_info->is_overflows)
         {
@@ -177,15 +202,29 @@ void TotalsHavingTransform::transform(Chunk & chunk)
     if (!chunk)
         return;
 
+    if (isCancelled())
+    {
+        chunk.clear();
+        stopReading();
+        return;
+    }
+
     auto finalized = chunk.clone();
     if (final)
-        finalizeChunk(finalized);
+        finalizeChunk(finalized, aggregates_mask);
 
     total_keys += finalized.getNumRows();
 
     if (filter_column_name.empty())
     {
         addToTotals(chunk, nullptr);
+        if (isCancelled())
+        {
+            FailPointInjection::pauseFailPoint(FailPoints::totals_having_transform_drop_cancelled_chunk);
+            chunk.clear();
+            stopReading();
+            return;
+        }
         chunk = std::move(finalized);
     }
     else
@@ -198,10 +237,25 @@ void TotalsHavingTransform::transform(Chunk & chunk)
         for (const auto & action : expression->getActions())
         {
             if (action.node->type == ActionsDAG::ActionType::ARRAY_JOIN)
-                throw Exception("Having clause cannot contain arrayJoin", ErrorCodes::ILLEGAL_COLUMN);
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Having clause cannot contain arrayJoin");
         }
 
-        expression->execute(finalized_block, num_rows);
+        if (isCancelled())
+        {
+            stopReading();
+            chunk.clear();
+            return;
+        }
+
+        expression->execute(finalized_block, num_rows, false, false, &getCancellationFlag());
+
+        if (isCancelled())
+        {
+            stopReading();
+            chunk.clear();
+            return;
+        }
+
         ColumnPtr filter_column_ptr = finalized_block.getByPosition(filter_column_pos).column;
         if (remove_filter)
             finalized_block.erase(filter_column_name);
@@ -212,6 +266,13 @@ void TotalsHavingTransform::transform(Chunk & chunk)
         if (const_filter_description.always_true)
         {
             addToTotals(chunk, nullptr);
+            if (isCancelled())
+            {
+                FailPointInjection::pauseFailPoint(FailPoints::totals_having_transform_drop_cancelled_chunk);
+                chunk.clear();
+                stopReading();
+                return;
+            }
             chunk.setColumns(std::move(columns), num_rows);
             return;
         }
@@ -219,7 +280,16 @@ void TotalsHavingTransform::transform(Chunk & chunk)
         if (const_filter_description.always_false)
         {
             if (totals_mode == TotalsMode::BEFORE_HAVING)
+            {
                 addToTotals(chunk, nullptr);
+                if (isCancelled())
+                {
+                    FailPointInjection::pauseFailPoint(FailPoints::totals_having_transform_drop_cancelled_chunk);
+                    chunk.clear();
+                    stopReading();
+                    return;
+                }
+            }
 
             chunk.clear();
             return;
@@ -229,9 +299,27 @@ void TotalsHavingTransform::transform(Chunk & chunk)
 
         /// Add values to `totals` (if it was not already done).
         if (totals_mode == TotalsMode::BEFORE_HAVING)
+        {
             addToTotals(chunk, nullptr);
+            if (isCancelled())
+            {
+                FailPointInjection::pauseFailPoint(FailPoints::totals_having_transform_drop_cancelled_chunk);
+                chunk.clear();
+                stopReading();
+                return;
+            }
+        }
         else
+        {
             addToTotals(chunk, filter_description.data);
+            if (isCancelled())
+            {
+                FailPointInjection::pauseFailPoint(FailPoints::totals_having_transform_drop_cancelled_chunk);
+                chunk.clear();
+                stopReading();
+                return;
+            }
+        }
 
         /// Filter the block by expression in HAVING.
         for (auto & column : columns)
@@ -261,7 +349,7 @@ void TotalsHavingTransform::addToTotals(const Chunk & chunk, const IColumn::Filt
         if (const auto * column = typeid_cast<const ColumnAggregateFunction *>(current.get()))
         {
             auto & totals_column = typeid_cast<ColumnAggregateFunction &>(*current_totals[col]);
-            assert(totals_column.size() == 1);
+            chassert(totals_column.size() == 1);
 
             /// Accumulate all aggregate states from a column of a source chunk into
             /// the corresponding totals column.
@@ -269,18 +357,36 @@ void TotalsHavingTransform::addToTotals(const Chunk & chunk, const IColumn::Filt
             size_t size = vec.size();
 
             if (filter && filter->size() != size)
-                throw Exception("Filter has size which differs from column size", ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Filter has size which differs from column size");
 
             if (filter)
             {
                 for (size_t row = 0; row < size; ++row)
+                {
+                    if ((row & 0xFFF) == 0)
+                    {
+                        if (row > 0) [[unlikely]]
+                            FailPointInjection::pauseFailPoint(FailPoints::totals_having_transform_pause);
+                        if (isCancelled())
+                            return;
+                    }
                     if ((*filter)[row])
                         totals_column.insertMergeFrom(vec[row]);
+                }
             }
             else
             {
                 for (size_t row = 0; row < size; ++row)
+                {
+                    if ((row & 0xFFF) == 0)
+                    {
+                        if (row > 0) [[unlikely]]
+                            FailPointInjection::pauseFailPoint(FailPoints::totals_having_transform_pause);
+                        if (isCancelled())
+                            return;
+                    }
                     totals_column.insertMergeFrom(vec[row]);
+                }
             }
         }
     }
@@ -288,6 +394,18 @@ void TotalsHavingTransform::addToTotals(const Chunk & chunk, const IColumn::Filt
 
 void TotalsHavingTransform::prepareTotals()
 {
+    if (isCancelled())
+    {
+        /// The main stream was already cancelled and the result is discarded anyway, so none of the
+        /// totals work below has to be done: no merging of `overflow_aggregates`, no finalization of
+        /// aggregate states, and no evaluation of the `HAVING` expression for the totals row.
+        /// Install an empty chunk matching the totals port header and mark the totals as prepared,
+        /// so that this method is not scheduled again (`prepare` finishes the cancelled totals port).
+        totals = Chunk(getTotalsPort().getHeader().cloneEmptyColumns(), 0);
+        total_prepared = true;
+        return;
+    }
+
     /// If totals_mode == AFTER_HAVING_AUTO, you need to decide whether to add aggregates to TOTALS for strings,
     /// not passed max_rows_to_group_by.
     if (overflow_aggregates)
@@ -295,23 +413,50 @@ void TotalsHavingTransform::prepareTotals()
         if (totals_mode == TotalsMode::BEFORE_HAVING
             || totals_mode == TotalsMode::AFTER_HAVING_INCLUSIVE
             || (totals_mode == TotalsMode::AFTER_HAVING_AUTO
-                && static_cast<double>(passed_keys) / total_keys >= auto_include_threshold))
+                && static_cast<double>(passed_keys) / static_cast<double>(total_keys) >= auto_include_threshold))
             addToTotals(overflow_aggregates, nullptr);
     }
 
     totals = Chunk(std::move(current_totals), 1);
-    finalizeChunk(totals);
+    finalizeChunk(totals, aggregates_mask);
+
+    if (isCancelled())
+    {
+        /// Cancellation could have arrived after the entry check, while the overflow aggregates were
+        /// being merged and the totals row finalized. The result is discarded anyway, so do not start
+        /// evaluating the `HAVING` expression for the totals row; replace the totals with an empty
+        /// chunk matching the totals port header (the finalized chunk still has the pre-expression
+        /// structure), and mark the totals as prepared.
+        totals = Chunk(getTotalsPort().getHeader().cloneEmptyColumns(), 0);
+        total_prepared = true;
+        return;
+    }
 
     if (expression)
     {
         size_t num_rows = totals.getNumRows();
         auto block = finalized_header.cloneWithColumns(totals.detachColumns());
-        expression->execute(block, num_rows);
+
+        expression->execute(block, num_rows, false, false, &getCancellationFlag());
+
+        if (isCancelled())
+        {
+            /// The query is being cancelled and the result is discarded anyway.
+            /// The columns of `totals` are already detached into `block`, so put an empty chunk
+            /// matching the totals port header in its place, and mark the totals as prepared,
+            /// so that `prepare` does not schedule this method again.
+            totals = Chunk(getTotalsPort().getHeader().cloneEmptyColumns(), 0);
+            total_prepared = true;
+            return;
+        }
+
         if (remove_filter)
             block.erase(filter_column_name);
         /// Note: after expression totals may have several rows if `arrayJoin` was used in expression.
         totals = Chunk(block.getColumns(), num_rows);
     }
+
+    total_prepared = true;
 }
 
 }

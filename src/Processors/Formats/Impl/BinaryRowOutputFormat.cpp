@@ -1,8 +1,11 @@
 #include <IO/WriteBuffer.h>
 #include <IO/WriteHelpers.h>
+#include <DataTypes/Serializations/ISerialization.h>
 #include <Columns/IColumn.h>
 #include <DataTypes/IDataType.h>
+#include <DataTypes/DataTypesBinaryEncoding.h>
 #include <Processors/Formats/Impl/BinaryRowOutputFormat.h>
+#include <Processors/Port.h>
 #include <Formats/FormatFactory.h>
 #include <Formats/registerWithNamesAndTypes.h>
 
@@ -10,8 +13,8 @@
 namespace DB
 {
 
-BinaryRowOutputFormat::BinaryRowOutputFormat(WriteBuffer & out_, const Block & header, bool with_names_, bool with_types_, const RowOutputFormatParams & params_)
-    : IRowOutputFormat(header, out_, params_), with_names(with_names_), with_types(with_types_)
+BinaryRowOutputFormat::BinaryRowOutputFormat(WriteBuffer & out_, SharedHeader header, bool with_names_, bool with_types_, const FormatSettings & format_settings_)
+    : IRowOutputFormat(header, out_), with_names(with_names_), with_types(with_types_), format_settings(format_settings_)
 {
 }
 
@@ -35,19 +38,26 @@ void BinaryRowOutputFormat::writePrefix()
 
     if (with_types)
     {
-        for (size_t i = 0; i < columns; ++i)
+        if (format_settings.binary.encode_types_in_binary_format)
         {
-            writeStringBinary(header.safeGetByPosition(i).type->getName(), out);
+            for (size_t i = 0; i < columns; ++i)
+                encodeDataType(header.safeGetByPosition(i).type, out);
+        }
+        else
+        {
+            for (size_t i = 0; i < columns; ++i)
+                writeStringBinary(header.safeGetByPosition(i).type->getName(), out);
         }
     }
 }
 
 void BinaryRowOutputFormat::writeField(const IColumn & column, const ISerialization & serialization, size_t row_num)
 {
-    serialization.serializeBinary(column, row_num, out);
+    serialization.serializeBinary(column, row_num, out, format_settings);
 }
 
 
+void registerOutputFormatRowBinary(FormatFactory & factory);
 void registerOutputFormatRowBinary(FormatFactory & factory)
 {
     auto register_func = [&](const String & format_name, bool with_names, bool with_types)
@@ -55,14 +65,22 @@ void registerOutputFormatRowBinary(FormatFactory & factory)
         factory.registerOutputFormat(format_name, [with_names, with_types](
             WriteBuffer & buf,
             const Block & sample,
-            const RowOutputFormatParams & params,
-            const FormatSettings &)
+            const FormatSettings & format_settings,
+            FormatFilterInfoPtr /*format_filter_info*/)
         {
-            return std::make_shared<BinaryRowOutputFormat>(buf, sample, with_names, with_types, params);
+            return std::make_shared<BinaryRowOutputFormat>(buf, std::make_shared<const Block>(sample), with_names, with_types, format_settings);
         });
+        factory.markOutputFormatSupportsParallelFormatting(format_name);
     };
 
     registerWithNamesAndTypes("RowBinary", register_func);
+
+    factory.markOutputFormatNotTTYFriendly("RowBinary");
+    factory.markOutputFormatNotTTYFriendly("RowBinaryWithNames");
+    factory.markOutputFormatNotTTYFriendly("RowBinaryWithNamesAndTypes");
+    factory.setContentType("RowBinary", "application/octet-stream");
+    factory.setContentType("RowBinaryWithNames", "application/octet-stream");
+    factory.setContentType("RowBinaryWithNamesAndTypes", "application/octet-stream");
 }
 
 }

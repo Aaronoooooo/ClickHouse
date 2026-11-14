@@ -1,5 +1,11 @@
 -- Tags: replica
 
+SET automatic_parallel_replicas_mode = 0;
+SET enable_parallel_replicas=1;
+SET max_parallel_replicas=3;
+SET parallel_replicas_mode='sampling_key';
+SET parallel_replicas_for_non_replicated_merge_tree = 1;
+
 DROP TABLE IF EXISTS t;
 CREATE TABLE t (x String) ENGINE = MergeTree ORDER BY x;
 INSERT INTO t VALUES ('Hello');

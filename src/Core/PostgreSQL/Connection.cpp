@@ -1,7 +1,7 @@
-#include "Connection.h"
+#include <Core/PostgreSQL/Connection.h>
 
 #if USE_LIBPQXX
-#include <base/logger_useful.h>
+#include <Common/logger_useful.h>
 
 
 namespace postgres
@@ -9,13 +9,12 @@ namespace postgres
 
 Connection::Connection(const ConnectionInfo & connection_info_, bool replication_, size_t num_tries_)
     : connection_info(connection_info_), replication(replication_), num_tries(num_tries_)
-    , log(&Poco::Logger::get("PostgreSQLReplicaConnection"))
+    , log(getLogger("PostgreSQLReplicaConnection"))
 {
+    /// Amended in place to keep `tls_secret_files` alive: the temporary credential files must
+    /// live as long as the connection string that references them.
     if (replication)
-    {
-        connection_info = std::make_pair(
-            fmt::format("{} replication=database", connection_info.first), connection_info.second);
-    }
+        connection_info.connection_string = fmt::format("{} replication=database", connection_info.connection_string);
 }
 
 void Connection::execWithRetry(const std::function<void(pqxx::nontransaction &)> & exec)
@@ -33,7 +32,7 @@ void Connection::execWithRetry(const std::function<void(pqxx::nontransaction &)>
             LOG_DEBUG(log, "Cannot execute query due to connection failure, attempt: {}/{}. (Message: {})",
                       try_no, num_tries, e.what());
 
-            if (try_no == num_tries)
+            if (try_no + 1 == num_tries)
                 throw;
         }
     }
@@ -61,11 +60,14 @@ void Connection::updateConnection()
 {
     if (connection)
         connection->close();
+
     /// Always throws if there is no connection.
-    connection = std::make_unique<pqxx::connection>(connection_info.first);
+    connection = std::make_unique<pqxx::connection>(connection_info.connection_string);
+
     if (replication)
         connection->set_variable("default_transaction_isolation", "'repeatable read'");
-    LOG_DEBUG(&Poco::Logger::get("PostgreSQLConnection"), "New connection to {}", connection_info.second);
+
+    LOG_DEBUG(getLogger("PostgreSQLConnection"), "New connection to {}", connection_info.host_port);
 }
 
 void Connection::connect()
@@ -73,6 +75,7 @@ void Connection::connect()
     if (!connection || !connection->is_open())
         updateConnection();
 }
+
 }
 
 #endif

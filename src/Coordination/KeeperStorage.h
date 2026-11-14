@@ -1,183 +1,390 @@
 #pragma once
 
-#include <Common/ThreadPool.h>
-#include <Common/ZooKeeper/IKeeper.h>
-#include <Common/ConcurrentBoundedQueue.h>
-#include <Common/ZooKeeper/ZooKeeperCommon.h>
-#include <Coordination/SessionExpiryQueue.h>
-#include <Coordination/ACLMap.h>
-#include <Coordination/SnapshotableHashTable.h>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <Coordination/KeeperDelta.h>
+#include <Coordination/ACLMap.h>
+#include <Coordination/SessionExpiryQueue.h>
+#include <Coordination/SnapshotableHashTable.h>
+#include <Coordination/KeeperCommon.h>
+#include <Coordination/KeeperNodesStorage.h>
+#include <Coordination/KeeperReadThreadPool.h>
+#include <Coordination/KeeperStorage_fwd.h>
+#include <Common/StringHashForHeterogeneousLookup.h>
+#include <Common/SharedMutex.h>
+#include <Common/Concepts.h>
+
+#include <base/defines.h>
+#include <memory>
 
 namespace DB
 {
 
-using namespace DB;
-struct KeeperStorageRequestProcessor;
-using KeeperStorageRequestProcessorPtr = std::shared_ptr<KeeperStorageRequestProcessor>;
-using ResponseCallback = std::function<void(const Coordination::ZooKeeperResponsePtr &)>;
-using ChildrenSet = std::unordered_set<std::string>;
-using SessionAndTimeout = std::unordered_map<int64_t, int64_t>;
+class KeeperContext;
+using KeeperContextPtr = std::shared_ptr<KeeperContext>;
 
-struct KeeperStorageSnapshot;
+struct KeeperSnapshotReader;
+
+using ResponseCallback = std::function<void(const Coordination::ZooKeeperResponsePtr &)>;
 
 /// Keeper state machine almost equal to the ZooKeeper's state machine.
 /// Implements all logic of operations, data changes, sessions allocation.
-/// In-memory and not thread safe.
-class KeeperStorage
+/// In-memory and not generally thread safe, though preprocessRequest and processRequest can run in parallel.
+/// Split into 3 parts:
+///  * KeeperNodesStorage interface, with two implementations to choose from. Stores the actual
+///    nodes, which usually take lots of memory/space and need to be careful about performance.
+///    Manages committed and uncommitted state.
+///  * KeeperStorageImpl<KeeperNodesStorage> (template) implements execution of all the types of
+///    user requests. Talks to KeeperNodesStorage to manipulate the nodes, talks to KeeperStorage
+///    to report deltas and digest. (It's a template to try to go fast, but we haven't actually
+///    benchmarked it against a maybe simpler inheritance-based implementation.)
+///  * KeeperStorage base class that manages everything else: sessions, watches, set of ephemeral
+///    nodes, ACLs, digest, deltas.
+class KeeperStorage : public std::enable_shared_from_this<KeeperStorage>
 {
 public:
-    int64_t session_id_counter{1};
+    static String generateDigest(const String & userdata);
 
-    struct Node
-    {
-        String data;
-        uint64_t acl_id = 0; /// 0 -- no ACL by default
-        bool is_sequental = false;
-        Coordination::Stat stat{};
-        int32_t seq_num = 0;
-        ChildrenSet children{};
-    };
+    using AuthID = KeeperAuthID;
 
-    struct ResponseForSession
-    {
-        int64_t session_id;
-        Coordination::ZooKeeperResponsePtr response;
-    };
-
-    using ResponsesForSessions = std::vector<ResponseForSession>;
-
-    struct RequestForSession
-    {
-        int64_t session_id;
-        Coordination::ZooKeeperRequestPtr request;
-    };
-
-    struct AuthID
-    {
-        std::string scheme;
-        std::string id;
-
-        bool operator==(const AuthID & other) const
-        {
-            return scheme == other.scheme && id == other.id;
-        }
-    };
-
-    using RequestsForSessions = std::vector<RequestForSession>;
-
-    using Container = SnapshotableHashTable<Node>;
     using Ephemerals = std::unordered_map<int64_t, std::unordered_set<std::string>>;
-    using SessionAndWatcher = std::unordered_map<int64_t, std::unordered_set<std::string>>;
-    using SessionIDs = std::vector<int64_t>;
+
+    enum class WatchType : uint8_t
+    {
+        WATCH,
+        LIST_WATCH,
+        PERSISTENT_WATCH,
+        PERSISTENT_LIST_WATCH,
+        PERSISTENT_RECURSIVE_WATCH,
+        LIST_WITH_DATA_WATCH,
+    };
+
+    struct WatchInfo
+    {
+        std::string_view path;
+        WatchType type;
+
+        bool operator==(const WatchInfo &) const = default;
+    };
+
+    struct WatchInfoHash
+    {
+        UInt64 operator()(WatchInfo info) const;
+    };
+
+    using SessionAndWatcher = std::unordered_map<int64_t, std::unordered_set<WatchInfo, WatchInfoHash>>;
+    using SessionIDs = std::unordered_set<int64_t>;
 
     /// Just vector of SHA1 from user:password
     using AuthIDs = std::vector<AuthID>;
     using SessionAndAuth = std::unordered_map<int64_t, AuthIDs>;
-    SessionAndAuth session_and_auth;
+    using Watches = std::unordered_map<
+        String /* path, relative of root_path */,
+        SessionIDs,
+        StringHashForHeterogeneousLookup,
+        StringHashForHeterogeneousLookup::transparent_key_equal>;
 
-    using Watches = std::map<String /* path, relative of root_path */, SessionIDs>;
+    /// Path -> session -> the children filter of the session's list requests on the path, `ALL` if they differ.
+    using ListWithDataWatches = std::unordered_map<
+        String,
+        std::unordered_map<int64_t, Coordination::ListRequestType>,
+        StringHashForHeterogeneousLookup,
+        StringHashForHeterogeneousLookup::transparent_key_equal>;
 
-    /// Main hashtable with nodes. Contain all information about data.
-    /// All other structures expect session_and_timeout can be restored from
-    /// container.
-    Container container;
+    using Delta = KeeperDelta;
+    using Operation = KeeperDelta::Operation;
+    using DeltaIterator = std::list<KeeperStorage::Delta>::iterator;
+    using DeltaRange = std::ranges::subrange<DeltaIterator>;
 
-    /// Mapping session_id -> set of ephemeral nodes paths
-    Ephemerals ephemerals;
-    /// Mapping sessuib_id -> set of watched nodes paths
-    SessionAndWatcher sessions_and_watchers;
-    /// Expiration queue for session, allows to get dead sessions at some point of time
-    SessionExpiryQueue session_expiry_queue;
-    /// All active sessions with timeout
-    SessionAndTimeout session_and_timeout;
+    KeeperNodesStorage * nodes_storage = nullptr;
+
+    mutable std::mutex transaction_mutex;
+
+    /// Global id of all requests applied to storage
+    int64_t zxid TSA_GUARDED_BY(transaction_mutex) = 0;
+
+    // older Keeper node (pre V5 snapshots) can create snapshots and receive logs from newer Keeper nodes;
+    // this can lead to some inconsistencies, e.g. from snapshot it will use log_idx as zxid
+    // while the log will have a smaller zxid because it's generated by the newer nodes;
+    // we save the value loaded from snapshot to know when is it okay to have
+    // smaller zxid in newer requests
+    int64_t old_snapshot_zxid{0};
+
+    uint64_t nodes_digest = 0;
+
+    int64_t session_id_counter{1};
+
+    mutable SharedMutex auth_mutex;
+    SessionAndAuth committed_session_and_auth;
 
     /// ACLMap for more compact ACLs storage inside nodes.
     ACLMap acl_map;
 
-    /// Global id of all requests applied to storage
-    int64_t zxid{0};
-    bool finalized{false};
+    KeeperContextPtr keeper_context;
 
-    /// Currently active watches (node_path -> subscribed sessions)
-    Watches watches;
-    Watches list_watches;   /// Watches for 'list' request (watches on children).
-
-    void clearDeadWatches(int64_t session_id);
-
-    /// Get current zxid
-    int64_t getZXID() const
-    {
-        return zxid;
-    }
+    mutable SharedMutex storage_mutex;
 
     const String superdigest;
 
-public:
-    KeeperStorage(int64_t tick_time_ms, const String & superdigest_);
+    std::mutex ephemeral_mutex;
+    /// Mapping session_id -> set of ephemeral nodes paths
+    Ephemerals committed_ephemerals;
+    size_t committed_ephemeral_nodes{0};
 
-    /// Allocate new session id with the specified timeouts
-    int64_t getSessionID(int64_t session_timeout_ms)
-    {
-        auto result = session_id_counter++;
-        session_and_timeout.emplace(result, session_timeout_ms);
-        session_expiry_queue.addNewSessionOrUpdate(result, session_timeout_ms);
-        return result;
-    }
+    /// Paths of nodes that may carry TTL. Protected by storage_mutex, but don't tell that to TSA
+    /// or it'll produce false positives in `commit` and `loadNodesFromSnapshot`.
+    mutable std::unordered_set<
+        String,
+        StringHashForHeterogeneousLookup,
+        StringHashForHeterogeneousLookup::transparent_key_equal>
+        ttl_paths;
 
-    /// Add session id. Used when restoring KeeperStorage from snapshot.
-    void addSessionID(int64_t session_id, int64_t session_timeout_ms)
-    {
-        session_and_timeout.emplace(session_id, session_timeout_ms);
-        session_expiry_queue.addNewSessionOrUpdate(session_id, session_timeout_ms);
-    }
+    /// Paths of all container nodes (auto-deleted when last child is removed)
+    mutable std::unordered_set<
+        String,
+        StringHashForHeterogeneousLookup,
+        StringHashForHeterogeneousLookup::transparent_key_equal>
+        container_paths;
 
-    /// Process user request and return response.
-    /// check_acl = false only when converting data from ZooKeeper.
-    ResponsesForSessions processRequest(const Coordination::ZooKeeperRequestPtr & request, int64_t session_id, std::optional<int64_t> new_last_zxid, bool check_acl = true);
+    /// All active sessions with timeout
+    SessionAndTimeout session_and_timeout;
+
+    /// Currently active watches (node_path -> subscribed sessions)
+    Watches watches;
+    Watches list_watches; /// Watches for 'list' request (watches on children).
+    /// Watches of list requests that returned children stats or data. They also fire on a change of a child's ACL,
+    /// and of its data if the child passes their filter.
+    ListWithDataWatches list_with_data_watches;
+    Watches persistent_watches;
+    Watches persistent_list_watches;
+    Watches persistent_recursive_watches;
+
+    /// Mapping session_id -> set of watched nodes paths
+    SessionAndWatcher sessions_and_watchers;
+
+    KeeperReadThreadPool read_thread_pool;
 
     void finalize();
 
-    /// Set of methods for creating snapshots
+    bool isFinalized() const;
 
-    /// Turn on snapshot mode, so data inside Container is not deleted, but replaced with new version.
-    void enableSnapshotMode()
-    {
-        container.enableSnapshotMode();
-    }
+    /// Get current committed zxid
+    int64_t getZXID() const;
 
-    /// Turn off snapshot mode.
-    void disableSnapshotMode()
-    {
-        container.disableSnapshotMode();
-    }
+    int64_t getNextZXID() const;
 
-    Container::const_iterator getSnapshotIteratorBegin() const
-    {
-        return container.begin();
-    }
+    /// Allocate new session id with the specified timeouts
+    int64_t getSessionID(int64_t session_timeout_ms);
 
-    /// Clear outdated data from internal container.
-    void clearGarbageAfterSnapshot()
-    {
-        container.clearOutdatedNodes();
-    }
-
-    /// Get all active sessions
-    const SessionAndTimeout & getActiveSessions() const
-    {
-        return session_and_timeout;
-    }
+    /// Add session id. Used when restoring KeeperStorage from snapshot.
+    void addSessionID(int64_t session_id, int64_t session_timeout_ms) TSA_NO_THREAD_SAFETY_ANALYSIS;
 
     /// Get all dead sessions
-    std::vector<int64_t> getDeadSessions()
+    std::vector<int64_t> getDeadSessions() const;
+
+    /// Get all active sessions
+    SessionAndTimeout getActiveSessions() const;
+
+    KeeperDigest getNodesDigest(bool committed, bool lock_transaction_mutex) const;
+
+    /// Introspection function used for 4-letter commands and asynchronous metrics.
+    /// Shoudn't be called in parallel with processRequest or processLocalRequests.
+    KeeperStorageStats getStorageStats() const;
+
+    uint64_t getTotalWatchesCount() const;
+
+    void dumpWatches(WriteBufferFromOwnString & buf) const;
+    void dumpWatchesByPath(WriteBufferFromOwnString & buf) const;
+    void dumpSessionsAndEphemerals(WriteBufferFromOwnString & buf) const;
+
+    bool containsWatch(const String & path, Coordination::CheckWatchRequest::CheckWatchType check_type) const;
+    void addPersistentWatch(const String & path, Coordination::AddWatchRequest::AddWatchMode mode, int64_t session_id);
+
+    bool removePersistentWatch(const String& path, Coordination::RemoveWatchRequest::WatchType type, int64_t session_id);
+protected:
+    /// If initialize_system_nodes is false, container starts with no nodes at all, not even "/".
+    KeeperStorage(int64_t tick_time_ms, const String & superdigest_, const KeeperContextPtr & keeper_context_);
+
+    /// Expiration queue for session, allows to get dead sessions at some point of time
+    SessionExpiryQueue session_expiry_queue;
+
+    /// One preprocessed batch of requests (one Raft log entry).
+    struct UncommittedBatchInfo
     {
-        return session_expiry_queue.getExpiredSessions();
-    }
+        /// Zxid range from KeeperRequestBatch.
+        int64_t first_zxid{-1};
+        int64_t last_zxid{-1};
+        /// Digest after the batch's last preprocessed request (i.e. after the whole batch once
+        /// preprocessing of the batch is complete).
+        KeeperDigest nodes_digest;
+        /// index in storage of the log containing the batch
+        int64_t log_idx = 0;
+    };
+
+    std::list<UncommittedBatchInfo> uncommitted_batches TSA_GUARDED_BY(transaction_mutex);
+
+public:
+    KeeperStagingTransaction staging;
+
+protected:
+
+    std::atomic<bool> finalized{false};
+
+    size_t total_watches_count = 0;
+
+    void clearDeadWatches(int64_t session_id);
+    int64_t getNextZXIDLocked() const TSA_REQUIRES(transaction_mutex);
+
+    std::atomic<bool> initialized{false};
+
+public:
+    struct UncommittedState
+    {
+        explicit UncommittedState(KeeperStorage & storage_);
+
+        ~UncommittedState();
+
+        void addDeltas(std::list<Delta> new_deltas);
+        void cleanup(int64_t commit_zxid);
+        void rollback(int64_t rollback_zxid);
+        void rollback(std::list<Delta> rollback_deltas);
+
+        bool hasACL(int64_t session_id, bool committed, std::function<bool(const AuthID &)> predicate) const;
+
+        void forEachAuthInSession(int64_t session_id, std::function<void(const AuthID &)> func) const;
+
+        std::unordered_map<int64_t, std::unordered_set<int64_t>> closed_sessions_to_zxids;
+
+        Ephemerals ephemerals;
+
+        /// for each session, store list of uncommitted auths with their ZXID
+        /// TODO: If there are lots of uncommitted Close requests, this grows big, and request
+        ///       preprocessing becomes super slow (tens of seconds) because cleanup iterates over
+        ///       this whole map. Maybe do something about it.
+        std::unordered_map<int64_t, std::list<std::pair<int64_t, std::shared_ptr<AuthID>>>> session_and_auth;
+
+        mutable std::mutex deltas_mutex;
+        std::list<Delta> deltas TSA_GUARDED_BY(deltas_mutex);
+        KeeperStorage & storage;
+    };
+
+    UncommittedState uncommitted_state{*this};
+
+    /// 0 if no uncommitted requests.
+    uint64_t getLastUncommittedLogIdx() const;
+
+    Coordination::Error commit(DeltaRange deltas);
+
+    /// Used internally by `preprocess` and `processLocal` implementations.
+    /// They usually have acl_id readily available, so we don't have to look up the node here.
+    bool checkACL(ACLId acl_id, int32_t permissions, int64_t session_id, bool committed) const;
+
+    /// Used externally. Locks storage mutex and looks up the node.
+    bool checkCommittedACL(std::string_view path, int32_t permissions, int64_t session_id);
+
+    /// If initialize_system_nodes is false, container starts with no nodes at all, not even "/".
+    static std::shared_ptr<KeeperStorage> create(int64_t tick_time_ms, const String & superdigest_, const KeeperContextPtr & keeper_context_, bool initialize_system_nodes = true);
+
+    /// Issue a MVCC lock-free read view of committed nodes. The view keeps this storage alive.
+    std::unique_ptr<KeeperNodesReadView> issueReadView();
+
+    virtual ~KeeperStorage();
+
+    void initializeSystemNodes() TSA_NO_THREAD_SAFETY_ANALYSIS;
+
+    /// Must be called on an empty storage, created with initialize_system_nodes = false.
+    /// Caller has already read everything before the nodes, this method starts from createStreams.
+    /// TODO: When we have chunked snapshots, probably pass a ThreadPool here.
+    void loadFromSnapshot(KeeperSnapshotReader & reader) TSA_NO_THREAD_SAFETY_ANALYSIS;
+
+    /// Process a batch of local read requests (no deltas, no commit).
+    virtual KeeperResponsesForSessions processLocalRequests(
+        const KeeperRequestsForSessions & requests,
+        bool check_acl) = 0;
+    /// Pre-validate the batch's requests and apply them to uncommitted state, in order.
+    /// The batch must have first_zxid assigned; request i gets zxid batch.getZxid(i). Requests
+    /// that don't create storage transactions (`SessionID`, `Reconfig`) are skipped.
+    /// Returns the digest after the last request, or nullopt if the storage is finalized.
+    /// Idempotent: if the batch was already preprocessed (on the leader, in the PreAppendLogLeader
+    /// callback, before the log idx was known), only stamps batch.log_idx on its transactions.
+    /// check_acl = false only when converting data from ZooKeeper.
+    /// (No default arguments: clang-tidy's google-default-arguments prohibits them on virtual methods.)
+    virtual std::optional<KeeperDigest> preprocessBatch(const KeeperRequestBatch & batch, bool check_acl) = 0;
+
+    /// Convenience wrapper for tools and tests: preprocess a single request as a batch of one.
+    /// The storage must not be finalized.
+    KeeperDigest preprocessRequest(
+        const Coordination::ZooKeeperRequestPtr & request,
+        int64_t session_id,
+        int64_t time,
+        int64_t commit_zxid,
+        bool check_acl,
+        int64_t log_idx);
+
+    /// Commit one previously preprocessed request of the current batch. Apply the changes to the
+    /// committed state. Produce triggered watch notifications, and the response for the request
+    /// itself if produce_response is set (the response is only needed on the server that owns the
+    /// request's client session; other servers would discard it in their response threads).
+    /// The `Close` response is always produced, because `sessionCleanerTask` on the leader sends
+    /// `Close` for sessions whose connection is on another server.
+    /// Caller must call endProcessBatch at the end of batch.
+    virtual KeeperResponsesForSessions processOneRequest(
+        const Coordination::ZooKeeperRequestPtr & request,
+        int64_t session_id,
+        int64_t commit_zxid,
+        bool produce_response) = 0;
+    /// Call after calling processOneRequest for all requests in batch.
+    void endProcessBatch(const KeeperRequestBatch & batch);
+
+    /// Convenience wrapper for tools and tests: commit a single request as a batch of one.
+    KeeperResponsesForSessions processRequest(
+        const Coordination::ZooKeeperRequestPtr & request,
+        int64_t session_id,
+        int64_t commit_zxid);
+
+    void rollbackBatch(const KeeperRequestBatch & batch, bool allow_missing);
+
+    KeeperResponsesForSessions setWatches(
+        int64_t last_zxid,
+        const std::vector<String> & watches_paths,
+        const std::vector<String> & list_watches_paths,
+        const std::vector<String> & exist_watches_paths,
+        const std::vector<String> & persistent_watches_paths,
+        const std::vector<String> & persistent_recursive_watches_paths,
+        int64_t session_id);
+
+    std::vector<std::pair<std::string, Int32>> collectExpiredTTLPaths(int64_t now_ms, size_t batch_size) const;
+
+    /// Container nodes eligible for GC: childless after having had children, or never
+    /// populated and empty past max_never_used_interval_ms.
+    std::vector<std::pair<std::string, Int32>> collectContainerCandidates(size_t batch_size, UInt64 max_never_used_interval_ms) const;
+
+    /// Used by tests.
+    bool containsTTLPath(const std::string & path) const;
+
+    void nodeLoadedFromSnapshot(std::string_view path, const KeeperNodeStats & stats);
+
+    /// Undoes the bookkeeping done by `nodeLoadedFromSnapshot` for an orphaned node that is
+    /// removed from the snapshot during startup recovery (`remove_orphaned_nodes_on_startup`).
+    void nodeRemovedFromSnapshot(std::string_view path, const KeeperNodeStats & stats);
+
+    /// Register watches from a request/response pair.
+    void updateWatches(
+        const Coordination::ZooKeeperRequestPtr & zk_request,
+        const Coordination::Response * response,
+        int64_t session_id);
+
+    std::pair<KeeperResponsesForSessions, Int64> processWatchesImpl(
+        std::string_view path, Coordination::Event event_type);
+
+    std::pair<KeeperResponsesForSessions, Int64> processACLChangeWatchesImpl(std::string_view path);
+
+    void prepareAddAuth(std::shared_ptr<KeeperStorage::AuthID> new_auth, int64_t session_id);
 };
 
-using KeeperStoragePtr = std::unique_ptr<KeeperStorage>;
+/// Remove `path` from the set of ephemeral paths owned by `session_id`.
+void unregisterEphemeralPath(KeeperStorage::Ephemerals & ephemerals, int64_t session_id, const std::string & path, bool throw_if_missing);
 
 }

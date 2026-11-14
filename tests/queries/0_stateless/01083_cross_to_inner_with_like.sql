@@ -1,3 +1,6 @@
+
+SET convert_query_to_cnf = 0;
+
 DROP TABLE IF EXISTS n;
 DROP TABLE IF EXISTS r;
 

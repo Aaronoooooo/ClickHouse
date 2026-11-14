@@ -1,48 +1,130 @@
 #include <city.h>
-#include <string.h>
+#include <cstring>
+#include <algorithm>
 
-#include <base/unaligned.h>
 #include <base/types.h>
+#include <base/defines.h>
 
-#include "CompressedWriteBuffer.h"
+#include <IO/WriteHelpers.h>
+#include <Common/ElapsedTimeProfileEventIncrement.h>
+
 #include <Compression/CompressionFactory.h>
+#include <Compression/CompressedWriteBuffer.h>
 
+
+namespace ProfileEvents
+{
+extern const Event CompressedWriteBufferBlocks;
+extern const Event CompressedWriteBufferBytes;
+extern const Event CompressedWriteBufferCompressMicroseconds;
+}
 
 namespace DB
 {
 
 namespace ErrorCodes
 {
+extern const int LOGICAL_ERROR;
 }
-
-static constexpr auto CHECKSUM_SIZE{sizeof(CityHash_v1_0_2::uint128)};
 
 void CompressedWriteBuffer::nextImpl()
 {
     if (!offset())
         return;
 
-    size_t decompressed_size = offset();
+    chassert(offset() <= INT_MAX);
+    UInt32 decompressed_size = static_cast<UInt32>(offset());
     UInt32 compressed_reserve_size = codec->getCompressedReserveSize(decompressed_size);
-    compressed_buffer.resize(compressed_reserve_size);
-    UInt32 compressed_size = codec->compress(working_buffer.begin(), decompressed_size, compressed_buffer.data());
+    if (uncompressed_codec)
+        compressed_reserve_size = std::max(compressed_reserve_size, uncompressed_codec->getCompressedReserveSize(decompressed_size));
 
-    CityHash_v1_0_2::uint128 checksum = CityHash_v1_0_2::CityHash128(compressed_buffer.data(), compressed_size);
-    out.write(reinterpret_cast<const char *>(&checksum), CHECKSUM_SIZE);
-    out.write(compressed_buffer.data(), compressed_size);
+    ProfileEvents::increment(ProfileEvents::CompressedWriteBufferBlocks);
+    ProfileEvents::increment(ProfileEvents::CompressedWriteBufferBytes, decompressed_size);
+
+    /** During compression we need buffer with capacity >= compressed_reserve_size + CHECKSUM_SIZE.
+      *
+      * If output buffer has necessary capacity, we can compress data directly into the output buffer.
+      * Then we can write checksum at the output buffer begin.
+      *
+      * If output buffer does not have necessary capacity. Compress data into a temporary buffer.
+      * Then we can write checksum and copy the temporary buffer into the output buffer.
+      */
+    const bool compress_in_place = out.available() >= compressed_reserve_size + sizeof(CityHash_v1_0_2::uint128);
+    char * compressed_ptr = nullptr;
+    if (compress_in_place)
+    {
+        compressed_ptr = out.position() + sizeof(CityHash_v1_0_2::uint128);
+    }
+    else
+    {
+        compressed_buffer.resize(compressed_reserve_size);
+        compressed_ptr = compressed_buffer.data();
+    }
+
+    UInt32 compressed_size = 0;
+    {
+        ProfileEventTimeIncrement<Time::Microseconds> watch(ProfileEvents::CompressedWriteBufferCompressMicroseconds);
+        compressed_size = codec->compress(working_buffer.begin(), decompressed_size, compressed_ptr, codec_state.get());
+
+        /// The block is stored as is if compression saves less than 1/8 of its size.
+        if (uncompressed_codec && static_cast<UInt64>(compressed_size) * 8 > static_cast<UInt64>(decompressed_size) * 7)
+            compressed_size = uncompressed_codec->compress(working_buffer.begin(), decompressed_size, compressed_ptr);
+    }
+
+    CityHash_v1_0_2::uint128 checksum = CityHash_v1_0_2::CityHash128(compressed_ptr, compressed_size);
+
+    writeBinaryLittleEndian(checksum.low64, out);
+    writeBinaryLittleEndian(checksum.high64, out);
+
+    if (compress_in_place)
+        out.position() += compressed_size;
+    else
+        out.write(compressed_buffer.data(), compressed_size);
+
+    growAdaptiveBufferAfterFlush();
 }
 
-CompressedWriteBuffer::~CompressedWriteBuffer()
+void CompressedWriteBuffer::finalizeImpl()
 {
-    finalize();
+    /// Don't try to resize buffer in nextImpl.
+    use_adaptive_buffer_size = false;
+    next();
+    BufferWithOwnMemory<WriteBuffer>::finalizeImpl();
 }
 
 CompressedWriteBuffer::CompressedWriteBuffer(
-    WriteBuffer & out_,
-    CompressionCodecPtr codec_,
-    size_t buf_size)
-    : BufferWithOwnMemory<WriteBuffer>(buf_size), out(out_), codec(std::move(codec_))
+    WriteBuffer & out_, CompressionCodecPtr codec_, size_t buf_size, bool use_adaptive_buffer_size_, size_t adaptive_buffer_initial_size)
+    : BufferWithOwnMemory<WriteBuffer>(adaptiveBufferInitialSize(use_adaptive_buffer_size_, adaptive_buffer_initial_size, buf_size))
+    , out(out_)
+    , codec(std::move(codec_))
 {
+    enableAdaptiveBufferGrowth(use_adaptive_buffer_size_, buf_size);
+    if (!codec)
+        codec = CompressionCodecFactory::instance().getDefaultCodec();
+    codec_state = codec->createCompressionState();
 }
 
+void CompressedWriteBuffer::cancelImpl() noexcept
+{
+    BufferWithOwnMemory<WriteBuffer>::cancelImpl();
+    out.cancel();
+}
+
+void CompressedWriteBuffer::storeIncompressibleBlocksUncompressed()
+{
+    chassert(!codec->isEncryption());
+    uncompressed_codec = CompressionCodecFactory::instance().get("NONE", {});
+}
+
+void CompressedWriteBuffer::setCodec(CompressionCodecPtr codec_)
+{
+    // Flush all the pending data that was supposed to be compressed with the old codec.
+    next();
+    if (offset() != 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CompressedWriteBuffer: offset() is not zero");
+
+    chassert(codec_);
+    codec = std::move(codec_);
+    codec_state = codec->createCompressionState();
+}
 }

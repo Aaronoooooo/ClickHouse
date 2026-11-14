@@ -1,31 +1,52 @@
 #pragma once
 
-#include "config_core.h"
+#include "config.h"
 
 #if USE_LIBPQXX
 
 #include <pqxx/pqxx>
 #include <Core/Types.h>
+#include <Common/Logger.h>
+#include <Common/VectorWithMemoryTracking.h>
 #include <boost/noncopyable.hpp>
 
-/* Methods to work with PostgreSQL connection object.
+#include <memory>
+
+/** Methods to work with PostgreSQL connection object.
  * Should only be used in case there has to be a single connection object, which
  * is long-lived and there are no concurrent connection queries.
- * Now only use case - for replication handler for replication from PostgreSQL.
- * In all other integration engine use pool with failover.
- **/
+ */
 
 namespace Poco { class Logger; }
 
+namespace DB { class TemporarySecretFile; }
+
+namespace pqxx
+{
+    using ConnectionPtr = std::unique_ptr<pqxx::connection>;
+}
+
 namespace postgres
 {
-using ConnectionInfo = std::pair<String, String>;
-using ConnectionPtr = std::unique_ptr<pqxx::connection>;
+
+struct ConnectionInfo
+{
+    String connection_string;
+    String host_port; /// For logs.
+
+    /// Temporary files holding TLS credentials that were given as literal contents rather than
+    /// paths. `connection_string` embeds their paths and libpq re-reads the files on every
+    /// (re)connect, so they must live exactly as long as the connection info they belong to.
+    DB::VectorWithMemoryTracking<std::shared_ptr<DB::TemporarySecretFile>> tls_secret_files;
+};
 
 class Connection : private boost::noncopyable
 {
 public:
-    Connection(const ConnectionInfo & connection_info_, bool replication_ = false, size_t num_tries = 3);
+    explicit Connection(
+        const ConnectionInfo & connection_info_,
+        bool replication_ = false,
+        size_t num_tries = 3);
 
     void execWithRetry(const std::function<void(pqxx::nontransaction &)> & exec);
 
@@ -33,21 +54,29 @@ public:
 
     void connect();
 
+    void updateConnection();
+
     void tryUpdateConnection();
+
+    bool isConnected() const { return connection != nullptr && connection->is_open(); }
 
     const ConnectionInfo & getConnectionInfo() { return connection_info; }
 
-private:
-    void updateConnection();
+    String getInfoForLog() const { return connection_info.host_port; }
 
-    ConnectionPtr connection;
+private:
+
+    pqxx::ConnectionPtr connection;
     ConnectionInfo connection_info;
 
     bool replication;
     size_t num_tries;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
+
+using ConnectionPtr = std::unique_ptr<Connection>;
+
 }
 
 #endif

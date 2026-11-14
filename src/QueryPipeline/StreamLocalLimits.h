@@ -1,9 +1,12 @@
 #pragma once
 #include <QueryPipeline/SizeLimits.h>
 #include <QueryPipeline/ExecutionSpeedLimits.h>
+#include <list>
 
 namespace DB
 {
+
+struct Settings;
 
 /** What limitations and quotas should be checked.
   * LIMITS_CURRENT - checks amount of data returned by current stream only (BlockStreamProfileInfo is used for check).
@@ -12,7 +15,7 @@ namespace DB
   *  It is checks max_{rows,bytes}_to_read in progress handler and use info from ProcessListElement::progress_in for this.
   *  Currently this check is performed only in leaf streams.
   */
-enum class LimitsMode
+enum class LimitsMode : uint8_t
 {
     LIMITS_CURRENT,
     LIMITS_TOTAL,
@@ -28,6 +31,18 @@ struct StreamLocalLimits
     ExecutionSpeedLimits speed_limits;
 
     OverflowMode timeout_overflow_mode = OverflowMode::THROW;
+
+    /// Result-size limits (max_result_rows / max_result_bytes / result_overflow_mode)
+    /// applied to the final stream of a query. Used by executeQuery and EXPLAIN ANALYZE.
+    static StreamLocalLimits forQueryResult(const Settings & settings);
 };
+
+struct StorageLimits
+{
+    StreamLocalLimits local_limits;
+    SizeLimits leaf_limits;
+};
+
+using StorageLimitsList = std::list<StorageLimits>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
 
 }

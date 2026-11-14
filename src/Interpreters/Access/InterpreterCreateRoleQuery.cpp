@@ -1,79 +1,118 @@
+#include <Interpreters/InterpreterFactory.h>
 #include <Interpreters/Access/InterpreterCreateRoleQuery.h>
-#include <Parsers/Access/ASTCreateRoleQuery.h>
+
 #include <Access/AccessControl.h>
+#include <Access/Common/AccessFlags.h>
 #include <Access/Role.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/executeDDLQueryOnCluster.h>
+#include <Interpreters/removeOnClusterClauseIfNeeded.h>
+#include <Parsers/Access/ASTCreateRoleQuery.h>
+#include <Parsers/Access/ASTUserNameWithHost.h>
 
 
 namespace DB
 {
+
 namespace
 {
     void updateRoleFromQueryImpl(
         Role & role,
         const ASTCreateRoleQuery & query,
         const String & override_name,
-        const std::optional<SettingsProfileElements> & override_settings)
+        const std::optional<AlterSettingsProfileElements> & override_settings)
     {
         if (!override_name.empty())
             role.setName(override_name);
-        else if (!query.new_name.empty())
-            role.setName(query.new_name);
-        else if (query.names.size() == 1)
-            role.setName(query.names.front());
+        else if (query.new_name)
+            role.setName(query.new_name->toString());
+        else if (query.names->size() == 1)
+            role.setName(query.names->toStrings().at(0));
 
         if (override_settings)
-            role.settings = *override_settings;
+            role.settings.applyChanges(*override_settings);
+        else if (query.alter_settings)
+            role.settings.applyChanges(AlterSettingsProfileElements{*query.alter_settings});
         else if (query.settings)
-            role.settings = *query.settings;
+            role.settings.applyChanges(AlterSettingsProfileElements{*query.settings});
     }
 }
 
 
 BlockIO InterpreterCreateRoleQuery::execute()
 {
-    const auto & query = query_ptr->as<const ASTCreateRoleQuery &>();
+    const auto updated_query_ptr = removeOnClusterClauseIfNeeded(query_ptr, getContext());
+    const auto & query = updated_query_ptr->as<const ASTCreateRoleQuery &>();
+    const Strings names = query.names->toStrings();
+
     auto & access_control = getContext()->getAccessControl();
-    if (query.alter)
-        getContext()->checkAccess(AccessType::ALTER_ROLE);
-    else
-        getContext()->checkAccess(AccessType::CREATE_ROLE);
+
+    /// `CREATE ROLE OR REPLACE` throws away the privileges granted to an existing role of the same name,
+    /// so it is a drop followed by a create and requires the privileges of both. `DROP ROLE` is required
+    /// whether or not the role currently exists, mirroring `REPLACE TABLE`, so that the check does not
+    /// reveal which roles exist either.
+    AccessFlags access_type = query.alter ? AccessType::ALTER_ROLE : AccessType::CREATE_ROLE;
+    if (query.or_replace)
+        access_type |= AccessType::DROP_ROLE;
+
+    for (const auto & name : names)
+        getContext()->checkAccess(access_type, name);
+
+    if (query.new_name && !query.alter)
+        getContext()->checkAccess(AccessType::CREATE_ROLE, query.new_name->toString());
+
+    std::optional<AlterSettingsProfileElements> settings_from_query;
+    if (query.alter_settings)
+        settings_from_query = AlterSettingsProfileElements{*query.alter_settings, access_control};
+    else if (query.settings)
+        settings_from_query = AlterSettingsProfileElements{SettingsProfileElements(*query.settings, access_control)};
+
+    if (settings_from_query && !query.attach)
+        getContext()->checkSettingsConstraints(*settings_from_query, SettingSource::ROLE);
 
     if (!query.cluster.empty())
-        return executeDDLQueryOnCluster(query_ptr, getContext());
+        return executeDDLQueryOnCluster(updated_query_ptr, getContext());
 
-    std::optional<SettingsProfileElements> settings_from_query;
-    if (query.settings)
-        settings_from_query = SettingsProfileElements{*query.settings, access_control};
+    IAccessStorage * storage = &access_control;
+    MultipleAccessStorage::StoragePtr storage_ptr;
+
+    if (!query.storage_name.empty())
+    {
+        storage_ptr = access_control.getStorageByName(query.storage_name);
+        storage = storage_ptr.get();
+    }
 
     if (query.alter)
     {
-        auto update_func = [&](const AccessEntityPtr & entity) -> AccessEntityPtr
+        auto update_func = [&](const AccessEntityPtr & entity, const UUID &) -> AccessEntityPtr
         {
             auto updated_role = typeid_cast<std::shared_ptr<Role>>(entity->clone());
             updateRoleFromQueryImpl(*updated_role, query, {}, settings_from_query);
             return updated_role;
         };
+        auto ids = query.if_exists ? storage->find<Role>(names) : storage->getIDs<Role>(names);
+        getContext()->checkSettingsConstraintsForOverwrite(ids, update_func);
         if (query.if_exists)
-        {
-            auto ids = access_control.find<Role>(query.names);
             access_control.tryUpdate(ids, update_func);
-        }
         else
-            access_control.update(access_control.getIDs<Role>(query.names), update_func);
+            access_control.update(ids, update_func);
     }
     else
     {
         std::vector<AccessEntityPtr> new_roles;
-        for (const auto & name : query.names)
+        for (const auto & name : names)
         {
             auto new_role = std::make_shared<Role>();
             updateRoleFromQueryImpl(*new_role, query, name, settings_from_query);
             new_roles.emplace_back(std::move(new_role));
         }
 
-        if (query.if_not_exists)
+        if (query.or_replace)
+            getContext()->checkSettingsConstraintsForOverwrite(new_roles, query.storage_name);
+
+        if (!query.storage_name.empty())
+            access_control.insertInto(query.storage_name, new_roles, query.or_replace, !query.if_not_exists);
+        else if (query.if_not_exists)
             access_control.tryInsert(new_roles);
         else if (query.or_replace)
             access_control.insertOrReplace(new_roles);
@@ -89,4 +128,15 @@ void InterpreterCreateRoleQuery::updateRoleFromQuery(Role & role, const ASTCreat
 {
     updateRoleFromQueryImpl(role, query, {}, {});
 }
+
+void registerInterpreterCreateRoleQuery(InterpreterFactory & factory);
+void registerInterpreterCreateRoleQuery(InterpreterFactory & factory)
+{
+    auto create_fn = [] (const InterpreterFactory::Arguments & args)
+    {
+        return std::make_unique<InterpreterCreateRoleQuery>(args.query, args.context);
+    };
+    factory.registerInterpreter("InterpreterCreateRoleQuery", create_fn);
+}
+
 }

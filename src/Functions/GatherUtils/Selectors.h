@@ -1,9 +1,9 @@
 #pragma once
 
-#include "Algorithms.h"
-#include "ArraySourceVisitor.h"
-#include "ArraySinkVisitor.h"
-#include "ValueSourceVisitor.h"
+#include <Functions/GatherUtils/Algorithms.h>
+#include <Functions/GatherUtils/ArraySourceVisitor.h>
+#include <Functions/GatherUtils/ArraySinkVisitor.h>
+#include <Functions/GatherUtils/ValueSourceVisitor.h>
 
 
 namespace DB
@@ -17,7 +17,6 @@ namespace ErrorCodes
 
 namespace GatherUtils
 {
-#pragma GCC visibility push(hidden)
 
 /// Base classes which selects template function implementation with concrete ArraySource or ArraySink
 /// Derived classes should implement selectImpl for ArraySourceSelector and ArraySinkSelector,
@@ -26,7 +25,7 @@ namespace GatherUtils
 template <typename Base, typename Tuple, int index, typename ... Args>
 void callSelectMemberFunctionWithTupleArgument(Tuple & tuple, Args && ... args)
 {
-    if constexpr (index == std::tuple_size<Tuple>::value)
+    if constexpr (index == std::tuple_size_v<Tuple>)
         Base::selectImpl(args ...);
     else
         callSelectMemberFunctionWithTupleArgument<Base, Tuple, index + 1>(tuple, args ..., std::get<index>(tuple));
@@ -35,7 +34,7 @@ void callSelectMemberFunctionWithTupleArgument(Tuple & tuple, Args && ... args)
 template <typename Base, typename Tuple, int index, typename ... Args>
 void callSelectSource(bool is_const, bool is_nullable, Tuple & tuple, Args && ... args)
 {
-    if constexpr (index == std::tuple_size<Tuple>::value)
+    if constexpr (index == std::tuple_size_v<Tuple>)
         Base::selectSource(is_const, is_nullable, args ...);
     else
         callSelectSource<Base, Tuple, index + 1>(is_const, is_nullable, tuple, args ..., std::get<index>(tuple));
@@ -64,6 +63,16 @@ struct ArraySourceSelector
     template <typename ... Args>
     static void select(IArraySource & source, Args && ... args)
     {
+        /// ReplicatedSource follows the non-virtual iteration methods of its base source, so it must be dispatched to the algorithm
+        /// with its concrete type. Only selectors that declare `supports_replicated_source = true` do that
+        constexpr bool supports_replicated_source = requires { requires Base::supports_replicated_source; };
+        if constexpr (!supports_replicated_source)
+        {
+            if (source.isReplicated())
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "{} does not support lazily replicated array sources", demangle(typeid(Base).name()));
+        }
+
         ArraySourceSelectorVisitor<Base, Args ...> visitor(source, args ...);
         source.accept(visitor);
     }
@@ -116,8 +125,11 @@ struct ArraySourcePairSelector
     static void selectSource(bool is_second_const, bool is_second_nullable, SecondSource && second,
                              bool is_first_const, bool is_first_nullable, FirstSource && first, Args && ... args)
     {
-        Base::selectSourcePair(is_first_const, is_first_nullable, first,
-                               is_second_const, is_second_nullable, second, args ...);
+        if constexpr (std::is_same_v<FirstSource, SecondSource>)
+        {
+            Base::selectSourcePair(is_first_const, is_first_nullable, first,
+                                   is_second_const, is_second_nullable, second, args ...);
+        }
     }
 };
 
@@ -127,44 +139,44 @@ struct ArrayAndValueSourceSelectorBySink : public ArraySinkSelector<ArrayAndValu
     template <typename Sink, typename ... Args>
     static void selectImpl(Sink && sink, IArraySource & array_source, IValueSource & value_source, Args && ... args)
     {
-        using SynkType = typename std::decay<Sink>::type;
-        using ArraySource = typename SynkType::CompatibleArraySource;
-        using ValueSource = typename SynkType::CompatibleValueSource;
+        using SinkType = typename std::decay_t<Sink>;
+        using ArraySource = typename SinkType::CompatibleArraySource;
+        using ValueSource = typename SinkType::CompatibleValueSource;
 
-        auto checkType = [] (auto source_ptr)
+        auto check_type = [] (auto source_ptr)
         {
             if (source_ptr == nullptr)
-                throw Exception(demangle(typeid(Base).name()) + " expected "
-                            + demangle(typeid(typename SynkType::CompatibleArraySource).name())
-                            + " or " + demangle(typeid(ConstSource<typename SynkType::CompatibleArraySource>).name())
-                            + " or " + demangle(typeid(typename SynkType::CompatibleValueSource).name()) +
-                            + " or " + demangle(typeid(ConstSource<typename SynkType::CompatibleValueSource>).name())
-                            + " but got " + demangle(typeid(*source_ptr).name()), ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "{} expected {} or {} or {} or {} but got {}",
+                                demangle(typeid(Base).name()),
+                                demangle(typeid(typename SinkType::CompatibleArraySource).name()),
+                                demangle(typeid(ConstSource<typename SinkType::CompatibleArraySource>).name()),
+                                demangle(typeid(typename SinkType::CompatibleValueSource).name()),
+                                demangle(typeid(ConstSource<typename SinkType::CompatibleValueSource>).name()),
+                                demangle(typeid(*source_ptr).name()));
         };
-        auto checkTypeAndCallConcat = [& sink, & checkType, & args ...] (auto array_source_ptr, auto value_source_ptr)
+        auto check_type_and_call_concat = [& sink, & check_type, & args ...] (auto array_source_ptr, auto value_source_ptr)
         {
-            checkType(array_source_ptr);
-            checkType(value_source_ptr);
+            check_type(array_source_ptr);
+            check_type(value_source_ptr);
 
             Base::selectArrayAndValueSourceBySink(*array_source_ptr, *value_source_ptr, sink, args ...);
         };
 
         if (array_source.isConst() && value_source.isConst())
-            checkTypeAndCallConcat(typeid_cast<ConstSource<ArraySource> *>(&array_source),
+            check_type_and_call_concat(typeid_cast<ConstSource<ArraySource> *>(&array_source),
                                    typeid_cast<ConstSource<ValueSource> *>(&value_source));
         else if (array_source.isConst())
-            checkTypeAndCallConcat(typeid_cast<ConstSource<ArraySource> *>(&array_source),
+            check_type_and_call_concat(typeid_cast<ConstSource<ArraySource> *>(&array_source),
                                    typeid_cast<ValueSource *>(&value_source));
         else if (value_source.isConst())
-            checkTypeAndCallConcat(typeid_cast<ArraySource *>(&array_source),
+            check_type_and_call_concat(typeid_cast<ArraySource *>(&array_source),
                                    typeid_cast<ConstSource<ValueSource> *>(&value_source));
         else
-            checkTypeAndCallConcat(typeid_cast<ArraySource *>(&array_source),
+            check_type_and_call_concat(typeid_cast<ArraySource *>(&array_source),
                                    typeid_cast<ValueSource *>(&value_source));
     }
 };
 
-#pragma GCC visibility pop
 }
 
 }

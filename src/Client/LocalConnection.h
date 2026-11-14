@@ -1,18 +1,24 @@
 #pragma once
 
-#include "Connection.h"
-#include <Interpreters/Context.h>
+#include <Client/Connection.h>
+#include <Core/Field.h>
+#include <Core/SettingsEnums.h>
+#include <Interpreters/Context_fwd.h>
 #include <QueryPipeline/BlockIO.h>
-#include <IO/TimeoutSetter.h>
 #include <Interpreters/Session.h>
-#include <Storages/ColumnsDescription.h>
+#include <Interpreters/ProfileEventsExt.h>
+#include <Common/QueryScope.h>
+#include <Common/ThreadStatus.h>
 
 
 namespace DB
 {
+class ColumnsDescription;
 class PullingAsyncPipelineExecutor;
 class PushingAsyncPipelineExecutor;
 class PushingPipelineExecutor;
+class QueryPipeline;
+class ReadBuffer;
 
 /// State of query processing.
 struct LocalQueryState
@@ -23,46 +29,112 @@ struct LocalQueryState
 
     /// Query text.
     String query;
+    /// The dialect/gate the query text was sent in: the `input()` initializer reparses `query` and must
+    /// use the dialect the outbound text was pinned to (see `ClientBase::pinOutboundDialect`),
+    /// not the live session ones - a JSON `INSERT ... FROM input(...) SETTINGS dialect = 'clickhouse'`
+    /// (or `... enable_json_ast_dialect = 0`) would otherwise be reparsed with the changed settings and fail.
+    Dialect parsed_dialect = Dialect::clickhouse;
+    bool enable_json_ast_dialect = false;
+    /// Parser limits and parser flags captured when the query was received, before any query-local
+    /// `SETTINGS` from the query itself are applied. The `input()` initializer must reparse with the
+    /// settings that accepted the original query, not its query-local mutations.
+    UInt64 max_query_size = 0;
+    UInt64 max_parser_depth = 0;
+    UInt64 max_parser_backtracks = 0;
+    bool allow_settings_after_format_in_insert = false;
+    bool implicit_select = false;
+    bool enable_trino_dialect = false;
+    String promql_database;
+    String promql_table;
+    Field promql_evaluation_time;
+    String logsql_database;
+    String logsql_table;
+    String logsql_time_column;
+    String logsql_message_column;
+    bool enable_logsql_dialect = false;
+    /// AST-size limits used only by the JSON dialect.
+    UInt64 json_ast_max_depth = 0;
+    UInt64 json_ast_max_elements = 0;
     /// Streams of blocks, that are processing the query.
     BlockIO io;
     /// Current stream to pull blocks from.
     std::unique_ptr<PullingAsyncPipelineExecutor> executor;
     std::unique_ptr<PushingPipelineExecutor> pushing_executor;
     std::unique_ptr<PushingAsyncPipelineExecutor> pushing_async_executor;
+    /// For sending data for input() function.
+    std::unique_ptr<QueryPipeline> input_pipeline;
+    std::unique_ptr<PullingAsyncPipelineExecutor> input_pipeline_executor;
 
-    std::optional<Exception> exception;
+    InternalProfileEventsQueuePtr profile_queue;
+    InternalTextLogsQueuePtr logs_queue;
+
+    std::unique_ptr<Exception> exception;
 
     /// Current block to be sent next.
     std::optional<Block> block;
-    std::optional<ColumnsDescription> columns_description;
+    std::shared_ptr<ColumnsDescription> columns_description;
+    std::optional<ProfileInfo> profile_info;
 
-    /// Is request cancelled
-    bool is_cancelled = false;
+    /// Is request cancelled. Atomic: the interactive cancel callback may set it on a pipeline thread.
+    std::atomic_bool is_cancelled = false;
     bool is_finished = false;
 
     bool sent_totals = false;
     bool sent_extremes = false;
     bool sent_progress = false;
+    bool sent_profile_info = false;
+    bool sent_profile_events = false;
 
     /// To output progress, the difference after the previous sending of progress.
     Progress progress;
     /// Time after the last check to stop the request and send the progress.
     Stopwatch after_send_progress;
+    Stopwatch after_send_profile_events;
+
+    QueryScope query_scope_holder;
 };
 
 
 class LocalConnection : public IServerConnection, WithContext
 {
 public:
-    explicit LocalConnection(ContextPtr context_, bool send_progress_ = false);
+    explicit LocalConnection(
+        ContextPtr context_,
+        ReadBuffer * in_,
+        bool send_progress_,
+        bool send_profile_events_,
+        const String & server_display_name_);
+
+    explicit LocalConnection(
+        std::unique_ptr<Session> && session_,
+        ReadBuffer * in_,
+        bool send_progress_ = false,
+        bool send_profile_events_ = false,
+        const String & server_display_name_ = "");
 
     ~LocalConnection() override;
 
     IServerConnection::Type getConnectionType() const override { return IServerConnection::Type::LOCAL; }
 
-    static ServerConnectionPtr createConnection(const ConnectionParameters & connection_parameters, ContextPtr current_context, bool send_progress = false);
+    static ServerConnectionPtr createConnection(
+        const ConnectionParameters & connection_parameters,
+        ContextPtr current_context,
+        ReadBuffer * in = nullptr,
+        bool send_progress = false,
+        bool send_profile_events = false,
+        const String & server_display_name = "");
+
+    static ServerConnectionPtr createConnection(
+        const ConnectionParameters & connection_parameters,
+        std::unique_ptr<Session> && session,
+        ReadBuffer * in_,
+        bool send_progress = false,
+        bool send_profile_events = false,
+        const String & server_display_name = "");
 
     void setDefaultDatabase(const String & database) override;
+
+    void setCancelCallback(std::function<bool()> callback) override { is_cancelled_callback = std::move(callback); }
 
     void getServerVersion(const ConnectionTimeouts & timeouts,
                           String & name,
@@ -75,22 +147,37 @@ public:
     const String & getServerTimezone(const ConnectionTimeouts & timeouts) override;
     const String & getServerDisplayName(const ConnectionTimeouts & timeouts) override;
 
-    const String & getDescription() const override { return description; }
+    const String & getDescription([[maybe_unused]] bool with_extra = false) const override { return description; }  /// NOLINT
+
+    std::vector<std::pair<String, String>> getPasswordComplexityRules() const override { return {}; }
 
     void sendQuery(
         const ConnectionTimeouts & timeouts,
         const String & query,
+        const NameToNameMap & query_parameters,
         const String & query_id/* = "" */,
         UInt64 stage/* = QueryProcessingStage::Complete */,
         const Settings * settings/* = nullptr */,
         const ClientInfo * client_info/* = nullptr */,
-        bool with_pending_data/* = false */) override;
+        bool with_pending_data/* = false */,
+        const std::vector<String> & external_roles,
+        std::function<void(const Progress &)> process_progress_callback) override;
+
+    void sendQueryPlan(const QueryPlan &) override;
 
     void sendCancel() override;
 
     void sendData(const Block & block, const String & name/* = "" */, bool scalar/* = false */) override;
 
+    bool isSendDataNeeded() const override;
+
     void sendExternalTablesData(ExternalTablesData &) override;
+
+    void sendScalarsData(Scalars & data) override;
+
+    void sendMergeTreeReadTaskResponse(const ParallelReadResponse & response) override;
+
+    void sendMergeTreeAllRangesAnnouncementResponse(const InitialAllRangesAnnouncementResponse & response) override;
 
     bool poll(size_t timeout_microseconds/* = 0 */) override;
 
@@ -99,44 +186,61 @@ public:
     std::optional<UInt64> checkPacket(size_t timeout_microseconds/* = 0*/) override;
 
     Packet receivePacket() override;
+    UInt64 receivePacketType() override;
 
     void forceConnected(const ConnectionTimeouts &) override {}
 
     bool isConnected() const override { return true; }
 
-    bool checkConnected() override { return true; }
+    bool checkConnected(const ConnectionTimeouts & /*timeouts*/) override { return true; }
+
+    bool checkConnectedWithoutRoundTrip() override { return true; }
 
     void disconnect() override {}
 
     void setThrottler(const ThrottlerPtr &) override {}
 
 private:
-    void initBlockInput();
-
-    void processOrdinaryQuery();
-
-    void processOrdinaryQueryWithProcessors();
-
-    void updateState();
-
     bool pullBlock(Block & block);
 
     void finishQuery();
 
     void updateProgress(const Progress & value);
 
+    void sendProfileEvents();
+
+    /// Returns true on executor timeout, meaning a retryable error.
     bool pollImpl();
 
+    /// Store the in-flight exception in `state->exception` (preserving its type and message)
+    /// so that it is delivered to the client as a `Protocol::Server::Exception` packet.
+    /// Must be called from within a catch block.
+    void captureCurrentException();
+
+    bool needSendProgressOrMetrics();
+    bool needSendLogs();
+
     ContextMutablePtr query_context;
-    Session session;
+    std::unique_ptr<Session> session;
 
     bool send_progress;
+    bool send_profile_events;
+    String server_display_name;
+    /// Optional callback to check if the query was cancelled (e.g. via Ctrl+C).
+    /// Set by the client application; used as `interactive_cancel_callback` on the query context.
+    std::function<bool()> is_cancelled_callback;
     String description = "clickhouse-local";
 
     std::optional<LocalQueryState> state;
-    std::optional<ThreadStatus> thread_status;
 
     /// Last "server" packet.
     std::optional<UInt64> next_packet_type;
+
+    String current_database;
+
+    ProfileEvents::ThreadIdToCountersSnapshot last_sent_snapshots;
+
+    ReadBuffer * in;
 };
+
 }

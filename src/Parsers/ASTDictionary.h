@@ -2,15 +2,18 @@
 
 #include <Parsers/IAST.h>
 #include <Parsers/ASTFunctionWithKeyValueArguments.h>
-#include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTExpressionList.h>
 
 #include <Parsers/ASTSetQuery.h>
 
 #include <Parsers/ParserSetQuery.h>
 
+namespace Poco::JSON { class Object; }
+
 namespace DB
 {
+
+class ASTLiteral;
 
 /// AST for external dictionary lifetime:
 /// lifetime(min 10 max 100)
@@ -23,8 +26,11 @@ public:
     String getID(char) const override { return "Dictionary lifetime"; }
 
     ASTPtr clone() const override;
+    void writeJSON(WriteBuffer & out) const override;
+    void readJSON(const Poco::JSON::Object & json) override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 /// AST for external dictionary layout. Has name and contain single parameter
@@ -37,15 +43,23 @@ public:
     String layout_type;
     /// parameters (size_in_cells, ...)
     /// ASTExpressionList -> ASTPair -> (ASTLiteral key, ASTLiteral value).
-    ASTExpressionList * parameters;
+    ASTExpressionList * parameters{};
     /// has brackets after layout type
     bool has_brackets = true;
 
     String getID(char) const override { return "Dictionary layout"; }
 
     ASTPtr clone() const override;
+    void writeJSON(WriteBuffer & out) const override;
+    void readJSON(const Poco::JSON::Object & json) override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    void forEachPointerToChild(std::function<void(IAST **, boost::intrusive_ptr<IAST> *)> f) override
+    {
+        f(reinterpret_cast<IAST **>(&parameters), nullptr);
+    }
+
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 
@@ -61,8 +75,11 @@ public:
     String getID(char) const override { return "Dictionary range"; }
 
     ASTPtr clone() const override;
+    void writeJSON(WriteBuffer & out) const override;
+    void readJSON(const Poco::JSON::Object & json) override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 class ASTDictionarySettings : public IAST
@@ -73,8 +90,11 @@ public:
     String getID(char) const override { return "Dictionary settings"; }
 
     ASTPtr clone() const override;
+    void writeJSON(WriteBuffer & out) const override;
+    void readJSON(const Poco::JSON::Object & json) override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 
@@ -100,8 +120,11 @@ public:
     String getID(char) const override { return "Dictionary definition"; }
 
     ASTPtr clone() const override;
+    void writeJSON(WriteBuffer & out) const override;
+    void readJSON(const Poco::JSON::Object & json) override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 }

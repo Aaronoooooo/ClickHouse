@@ -1,17 +1,16 @@
 #include <unistd.h>
-#include <vector>
 #include <stdexcept>
 
 #include <zlib.h>
+#include <Examples/clickhouse_examples.h>
 
-#pragma GCC diagnostic ignored "-Wold-style-cast"
-
+#include <Common/VectorWithMemoryTracking.h>
 
 /// https://github.com/zlib-ng/zlib-ng/issues/494
-int main(int, char **)
+int mainEntryExampleZlibNgBug(int, char **)
 {
-    std::vector<unsigned char> in(1048576);
-    std::vector<unsigned char> out(1048576);
+    DB::VectorWithMemoryTracking<unsigned char> in(1048576);
+    DB::VectorWithMemoryTracking<unsigned char> out(1048576);
 
     ssize_t in_size = read(STDIN_FILENO, in.data(), 1048576);
     if (in_size < 0)
@@ -23,9 +22,9 @@ int main(int, char **)
         throw std::runtime_error("Cannot deflateInit2");
 
     zstr.next_in = in.data();
-    zstr.avail_in = in.size();
+    zstr.avail_in = static_cast<uint32_t>(in.size());
     zstr.next_out = out.data();
-    zstr.avail_out = out.size();
+    zstr.avail_out = static_cast<uint32_t>(out.size());
 
     while (zstr.avail_in > 0)
         if (Z_OK != deflate(&zstr, Z_NO_FLUSH))

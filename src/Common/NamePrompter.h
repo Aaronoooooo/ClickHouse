@@ -1,7 +1,8 @@
 #pragma once
 
 #include <base/types.h>
-#include <Common/PODArray.h>
+#include <Common/VectorWithMemoryTracking.h>
+#include <Common/levenshteinDistance.h>
 
 #include <algorithm>
 #include <cctype>
@@ -12,6 +13,7 @@
 
 namespace DB
 {
+
 template <size_t MaxNumHints>
 class NamePrompter
 {
@@ -19,7 +21,7 @@ public:
     using DistanceIndex = std::pair<size_t, size_t>;
     using DistanceIndexQueue = std::priority_queue<DistanceIndex>;
 
-    static std::vector<String> getHints(const String & name, const std::vector<String> & prompting_strings)
+    static VectorWithMemoryTracking<String> getHints(const String & name, const VectorWithMemoryTracking<String> & prompting_strings)
     {
         DistanceIndexQueue queue;
         for (size_t i = 0; i < prompting_strings.size(); ++i)
@@ -28,32 +30,7 @@ public:
     }
 
 private:
-    static size_t levenshteinDistance(const String & lhs, const String & rhs)
-    {
-        size_t m = lhs.size();
-        size_t n = rhs.size();
-
-        PODArrayWithStackMemory<size_t, 64> row(n + 1);
-
-        for (size_t i = 1; i <= n; ++i)
-            row[i] = i;
-
-        for (size_t j = 1; j <= m; ++j)
-        {
-            row[0] = j;
-            size_t prev = j - 1;
-            for (size_t i = 1; i <= n; ++i)
-            {
-                size_t old = row[i];
-                row[i] = std::min(prev + (std::tolower(lhs[j - 1]) != std::tolower(rhs[i - 1])),
-                    std::min(row[i - 1], row[i]) + 1);
-                prev = old;
-            }
-        }
-        return row[n];
-    }
-
-    static void appendToQueue(size_t ind, const String & name, DistanceIndexQueue & queue, const std::vector<String> & prompting_strings)
+    static void appendToQueue(size_t ind, const String & name, DistanceIndexQueue & queue, const VectorWithMemoryTracking<String> & prompting_strings)
     {
         const String & prompt = prompting_strings[ind];
 
@@ -65,7 +42,7 @@ private:
 
         if (prompt.size() <= name.size() + mistake_factor && prompt.size() + mistake_factor >= name.size())
         {
-            size_t distance = levenshteinDistance(prompt, name);
+            size_t distance = levenshteinDistanceCaseInsensitive(prompt, name);
             if (distance <= mistake_factor)
             {
                 queue.emplace(distance, ind);
@@ -75,9 +52,9 @@ private:
         }
     }
 
-    static std::vector<String> release(DistanceIndexQueue & queue, const std::vector<String> & prompting_strings)
+    static VectorWithMemoryTracking<String> release(DistanceIndexQueue & queue, const VectorWithMemoryTracking<String> & prompting_strings)
     {
-        std::vector<String> answer;
+        VectorWithMemoryTracking<String> answer;
         answer.reserve(queue.size());
         while (!queue.empty())
         {
@@ -90,22 +67,47 @@ private:
     }
 };
 
+String getHintsErrorMessageSuffix(const VectorWithMemoryTracking<String> & hints);
 
-template <size_t MaxNumHints, typename Self>
+void appendHintsMessage(String & error_message, const VectorWithMemoryTracking<String> & hints);
+
+template <size_t MaxNumHints = 1>
 class IHints
 {
 public:
-    virtual std::vector<String> getAllRegisteredNames() const = 0;
+    virtual VectorWithMemoryTracking<String> getAllRegisteredNames() const = 0;
 
-    std::vector<String> getHints(const String & name) const
+    VectorWithMemoryTracking<String> getHints(const String & name) const
     {
         return prompter.getHints(name, getAllRegisteredNames());
     }
+
+    VectorWithMemoryTracking<String> getHints(const String & name, const VectorWithMemoryTracking<String> & prompting_strings) const
+    {
+        return prompter.getHints(name, prompting_strings);
+    }
+
+    void appendHintsMessage(String & error_message, const String & name) const
+    {
+        auto hints = getHints(name);
+        DB::appendHintsMessage(error_message, hints);
+    }
+
+    String getHintsMessage(const String & name) const
+    {
+        return getHintsErrorMessageSuffix(getHints(name));
+    }
+
+    IHints() = default;
+
+    IHints(const IHints &) = default;
+    IHints(IHints &&) noexcept = default;
+    IHints & operator=(const IHints &) = default;
+    IHints & operator=(IHints &&) noexcept = default;
 
     virtual ~IHints() = default;
 
 private:
     NamePrompter<MaxNumHints> prompter;
 };
-
 }

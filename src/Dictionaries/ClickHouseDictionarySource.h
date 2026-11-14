@@ -2,11 +2,13 @@
 
 #include <memory>
 #include <Poco/Logger.h>
+#include <QueryPipeline/BlockIO.h>
 #include <Client/ConnectionPoolWithFailover.h>
-#include <Interpreters/Context.h>
-#include "DictionaryStructure.h"
-#include "ExternalQueryBuilder.h"
-#include "IDictionarySource.h"
+#include <Interpreters/Context_fwd.h>
+#include <Dictionaries/DictionaryStructure.h>
+#include <Dictionaries/ExternalQueryBuilder.h>
+#include <Dictionaries/IDictionarySource.h>
+#include <Dictionaries/InvalidateQueryResponse.h>
 
 
 namespace DB
@@ -23,6 +25,9 @@ public:
         const std::string host;
         const std::string user;
         const std::string password;
+        const std::string proto_send_chunked;
+        const std::string proto_recv_chunked;
+        const std::string quota_key;
         const std::string db;
         const std::string table;
         const std::string query;
@@ -45,22 +50,22 @@ public:
     ClickHouseDictionarySource(const ClickHouseDictionarySource & other);
     ClickHouseDictionarySource & operator=(const ClickHouseDictionarySource &) = delete;
 
-    Pipe loadAllWithSizeHint(std::atomic<size_t> * result_size_hint) override;
+    BlockIO loadAll() override;
 
-    Pipe loadAll() override;
+    BlockIO loadUpdatedAll() override;
 
-    Pipe loadUpdatedAll() override;
+    BlockIO loadIds(const VectorWithMemoryTracking<UInt64> & ids) override;
 
-    Pipe loadIds(const std::vector<UInt64> & ids) override;
-
-    Pipe loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows) override;
+    BlockIO loadKeys(const Columns & key_columns, const VectorWithMemoryTracking<size_t> & requested_rows) override;
 
     bool isModified() const override;
     bool supportsSelectiveLoad() const override { return true; }
 
     bool hasUpdateField() const override;
 
-    DictionarySourcePtr clone() const override { return std::make_unique<ClickHouseDictionarySource>(*this); }
+    bool isLocal() const { return configuration.is_local; }
+
+    DictionarySourcePtr clone() const override { return std::make_shared<ClickHouseDictionarySource>(*this); }
 
     std::string toString() const override;
 
@@ -71,20 +76,26 @@ public:
 private:
     std::string getUpdateFieldAndDate();
 
-    Pipe createStreamForQuery(const String & query, std::atomic<size_t> * result_size_hint = nullptr);
+    BlockIO createStreamForQuery(const String & query);
 
     std::string doInvalidateQuery(const std::string & request) const;
+
+    ContextMutablePtr createQueryContext() const;
 
     std::chrono::time_point<std::chrono::system_clock> update_time;
     const DictionaryStructure dict_struct;
     const Configuration configuration;
-    mutable std::string invalidate_query_response;
-    ExternalQueryBuilder query_builder;
+    mutable InvalidateQueryResponse invalidate_query_response;
+    ExternalQueryBuilderPtr query_builder;
     Block sample_block;
     ContextMutablePtr context;
     ConnectionPoolWithFailoverPtr pool;
-    const std::string load_all_query;
-    Poco::Logger * log = &Poco::Logger::get("ClickHouseDictionarySource");
+    std::string load_all_query;
+    LoggerPtr log = getLogger("ClickHouseDictionarySource");
+
+    /// RegExpTreeDictionary is the only dictionary whose structure of attributions differ from the input block.
+    /// For now we need to modify sample_block in the ctor of RegExpTreeDictionary.
+    friend class RegExpTreeDictionary;
 };
 
 }

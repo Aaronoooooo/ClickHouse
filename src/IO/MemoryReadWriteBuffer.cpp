@@ -1,15 +1,10 @@
 #include <IO/MemoryReadWriteBuffer.h>
+#include <base/scope_guard.h>
 #include <boost/noncopyable.hpp>
 
 
 namespace DB
 {
-
-namespace ErrorCodes
-{
-    extern const int CURRENT_WRITE_BUFFER_IS_EXHAUSTED;
-}
-
 
 class ReadBufferFromMemoryWriteBuffer : public ReadBuffer, boost::noncopyable, private Allocator<false>
 {
@@ -45,7 +40,7 @@ private:
     {
         if (chunk_head != chunk_list.end())
         {
-            internalBuffer() = *chunk_head;
+            setInternalBuffer(*chunk_head);
 
             /// It is last chunk, it should be truncated
             if (std::next(chunk_head) != chunk_list.end())
@@ -57,7 +52,8 @@ private:
         }
         else
         {
-            buffer() = internalBuffer() = Buffer(nullptr, nullptr);
+            setInternalBuffer(Buffer(nullptr, nullptr));
+            buffer() = internalBuffer();
             position() = nullptr;
         }
 
@@ -98,7 +94,7 @@ void MemoryWriteBuffer::nextImpl()
 
 void MemoryWriteBuffer::addChunk()
 {
-    size_t next_chunk_size;
+    size_t next_chunk_size = 0;
     if (chunk_list.empty())
     {
         chunk_tail = chunk_list.before_begin();
@@ -106,7 +102,7 @@ void MemoryWriteBuffer::addChunk()
     }
     else
     {
-        next_chunk_size = std::max(static_cast<size_t>(1), static_cast<size_t>(chunk_tail->size() * growth_rate));
+        next_chunk_size = std::max(1uz, static_cast<size_t>(static_cast<double>(chunk_tail->size()) * growth_rate));
         next_chunk_size = std::min(next_chunk_size, max_chunk_size);
     }
 
@@ -118,21 +114,26 @@ void MemoryWriteBuffer::addChunk()
         if (0 == next_chunk_size)
         {
             set(position(), 0);
-            throw Exception("MemoryWriteBuffer limit is exhausted", ErrorCodes::CURRENT_WRITE_BUFFER_IS_EXHAUSTED);
+            throw WriteBuffer::CurrentBufferExhausted();
         }
     }
 
     Position begin = reinterpret_cast<Position>(alloc(next_chunk_size));
+    bool added = false;
+    SCOPE_EXIT(if (!added) free(begin, next_chunk_size));
     chunk_tail = chunk_list.emplace_after(chunk_tail, begin, begin + next_chunk_size);
+    added = true;
     total_chunks_size += next_chunk_size;
 
     set(chunk_tail->begin(), chunk_tail->size());
 }
 
 
-std::shared_ptr<ReadBuffer> MemoryWriteBuffer::getReadBufferImpl()
+std::unique_ptr<ReadBuffer> MemoryWriteBuffer::getReadBufferImpl()
 {
-    auto res = std::make_shared<ReadBufferFromMemoryWriteBuffer>(std::move(*this));
+    finalize();
+
+    auto res = std::make_unique<ReadBufferFromMemoryWriteBuffer>(std::move(*this));
 
     /// invalidate members
     chunk_list.clear();

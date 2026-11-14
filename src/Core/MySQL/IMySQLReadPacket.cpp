@@ -1,3 +1,4 @@
+#include <Common/Exception.h>
 #include <Core/MySQL/IMySQLReadPacket.h>
 #include <IO/MySQLPacketPayloadReadBuffer.h>
 #include <IO/LimitReadBuffer.h>
@@ -8,6 +9,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int UNKNOWN_PACKET_FROM_CLIENT;
+    extern const int CANNOT_READ_ALL_DATA;
 }
 
 namespace MySQLProtocol
@@ -16,6 +18,11 @@ namespace MySQLProtocol
 void IMySQLReadPacket::readPayload(ReadBuffer & in, uint8_t & sequence_id)
 {
     MySQLPacketPayloadReadBuffer payload(in, sequence_id);
+    readPayloadFrom(payload);
+}
+
+void IMySQLReadPacket::readPayloadFrom(ReadBuffer & payload)
+{
     payload.next();
     readPayloadImpl(payload);
     if (!payload.eof())
@@ -33,21 +40,24 @@ void IMySQLReadPacket::readPayloadWithUnpacked(ReadBuffer & in)
 
 void LimitedReadPacket::readPayload(ReadBuffer &in, uint8_t &sequence_id)
 {
-    LimitReadBuffer limited(in, 10000, true, "too long MySQL packet.");
-    IMySQLReadPacket::readPayload(limited, sequence_id);
+    /// On the payload, not on `in`: `in` is the connection, which continues with the next packet.
+    MySQLPacketPayloadReadBuffer payload(in, sequence_id);
+    LimitReadBuffer limited(payload, {.read_no_more = 10000, .expect_eof = true, .excetion_hint = "too long MySQL packet."});
+    readPayloadFrom(limited);
 }
 
 void LimitedReadPacket::readPayloadWithUnpacked(ReadBuffer & in)
 {
-    LimitReadBuffer limited(in, 10000, true, "too long MySQL packet.");
+    LimitReadBuffer limited(in,{.read_no_more = 10000, .expect_eof = true, .excetion_hint = "too long MySQL packet."});
     IMySQLReadPacket::readPayloadWithUnpacked(limited);
 }
 
-uint64_t readLengthEncodedNumber(ReadBuffer & buffer)
+uint64_t readLengthEncodedNumber(ReadBuffer & buffer, UInt16 & bytes_read)
 {
     char c{};
     uint64_t buf = 0;
     buffer.readStrict(c);
+    bytes_read = 1;
     auto cc = static_cast<uint8_t>(c);
     switch (cc)
     {
@@ -56,12 +66,15 @@ uint64_t readLengthEncodedNumber(ReadBuffer & buffer)
             break;
         case 0xfc:
             buffer.readStrict(reinterpret_cast<char *>(&buf), 2);
+            bytes_read += 2;
             break;
         case 0xfd:
             buffer.readStrict(reinterpret_cast<char *>(&buf), 3);
+            bytes_read += 3;
             break;
         case 0xfe:
             buffer.readStrict(reinterpret_cast<char *>(&buf), 8);
+            bytes_read += 8;
             break;
         default:
             return cc;
@@ -69,11 +82,29 @@ uint64_t readLengthEncodedNumber(ReadBuffer & buffer)
     return buf;
 }
 
+uint64_t readLengthEncodedNumber(ReadBuffer & buffer)
+{
+    UInt16 bytes_read = 0;
+    return readLengthEncodedNumber(buffer, bytes_read);
+}
+
 void readLengthEncodedString(String & s, ReadBuffer & buffer)
 {
     uint64_t len = readLengthEncodedNumber(buffer);
-    s.resize(len);
-    buffer.readStrict(reinterpret_cast<char *>(s.data()), len);
+    /// `len` is fully attacker-controlled (up to 2^64-1 via the 0xfe prefix). Grow the string in
+    /// bounded chunks as bytes actually arrive instead of resizing to `len` up front, so a bogus
+    /// length cannot trigger a huge pre-emptive allocation (pre-auth on the MySQL handshake path).
+    s.clear();
+    while (s.size() < len)
+    {
+        if (buffer.eof())
+            throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA,
+                "Cannot read all data for a length-encoded string. Expected: {}, read: {}", len, s.size());
+        size_t chunk = std::min(static_cast<uint64_t>(buffer.available()), len - s.size());
+        size_t old_size = s.size();
+        s.resize(old_size + chunk);
+        buffer.readStrict(s.data() + old_size, chunk);
+    }
 }
 
 }

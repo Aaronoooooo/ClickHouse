@@ -1,11 +1,10 @@
+#include <algorithm>
+#include <Common/StringUtils.h>
 #include <Access/Common/AccessFlags.h>
+
+#include <array>
 #include <Access/Common/AccessType.h>
 #include <Common/Exception.h>
-#include <base/types.h>
-#include <boost/algorithm/string/case_conv.hpp>
-#include <boost/algorithm/string/replace.hpp>
-#include <boost/algorithm/string/split.hpp>
-#include <boost/algorithm/string/trim.hpp>
 #include <unordered_map>
 
 
@@ -15,6 +14,7 @@ namespace ErrorCodes
 {
     extern const int UNKNOWN_ACCESS_TYPE;
     extern const int LOGICAL_ERROR;
+    extern const int MIXED_ACCESS_PARAMETER_TYPES;
 }
 
 namespace
@@ -35,18 +35,27 @@ namespace
             return access_type_to_flags_mapping[static_cast<size_t>(type)];
         }
 
-        Flags keywordToFlags(const std::string_view & keyword) const
+        bool tryKeywordToFlags(std::string_view keyword, Flags & result) const
         {
             auto it = keyword_to_flags_map.find(keyword);
             if (it == keyword_to_flags_map.end())
             {
                 String uppercased_keyword{keyword};
-                boost::to_upper(uppercased_keyword);
+                toUpperASCII(uppercased_keyword);
                 it = keyword_to_flags_map.find(uppercased_keyword);
                 if (it == keyword_to_flags_map.end())
-                    throw Exception("Unknown access type: " + String(keyword), ErrorCodes::UNKNOWN_ACCESS_TYPE);
+                    return false;
             }
-            return it->second;
+            result = it->second;
+            return true;
+        }
+
+        Flags keywordToFlags(std::string_view keyword) const
+        {
+            Flags result;
+            if (!tryKeywordToFlags(keyword, result))
+                throw Exception(ErrorCodes::UNKNOWN_ACCESS_TYPE, "Unknown access type: {}", String(keyword));
+            return result;
         }
 
         Flags keywordsToFlags(const std::vector<std::string_view> & keywords) const
@@ -96,11 +105,18 @@ namespace
 
         const Flags & getAllFlags() const { return all_flags; }
         const Flags & getGlobalFlags() const { return all_flags_for_target[GLOBAL]; }
+        const Flags & getGlobalWithParameterFlags() const { return all_flags_grantable_on_global_with_parameter_level; }
         const Flags & getDatabaseFlags() const { return all_flags_for_target[DATABASE]; }
         const Flags & getTableFlags() const { return all_flags_for_target[TABLE]; }
         const Flags & getColumnFlags() const { return all_flags_for_target[COLUMN]; }
         const Flags & getDictionaryFlags() const { return all_flags_for_target[DICTIONARY]; }
+        const Flags & getTableEngineFlags() const { return all_flags_for_target[TABLE_ENGINE]; }
+        const Flags & getSourceFlags() const { return all_flags_for_target[SOURCE]; }
+        const Flags & getUserNameFlags() const { return all_flags_for_target[USER_NAME]; }
+        const Flags & getDefinerFlags() const { return all_flags_for_target[DEFINER]; }
+        const Flags & getNamedCollectionFlags() const { return all_flags_for_target[NAMED_COLLECTION]; }
         const Flags & getAllFlagsGrantableOnGlobalLevel() const { return getAllFlags(); }
+        const Flags & getAllFlagsGrantableOnGlobalWithParameterLevel() const { return getGlobalWithParameterFlags(); }
         const Flags & getAllFlagsGrantableOnDatabaseLevel() const { return all_flags_grantable_on_database_level; }
         const Flags & getAllFlagsGrantableOnTableLevel() const { return all_flags_grantable_on_table_level; }
         const Flags & getAllFlagsGrantableOnColumnLevel() const { return getColumnFlags(); }
@@ -110,12 +126,17 @@ namespace
         {
             UNKNOWN = -2,
             GROUP = -1,
-            GLOBAL,
-            DATABASE,
-            TABLE,
+            GLOBAL = 0,
+            DATABASE = 1,
+            TABLE = 2,
             VIEW = TABLE,
-            COLUMN,
-            DICTIONARY,
+            COLUMN = 3,
+            DICTIONARY = 4,
+            NAMED_COLLECTION = 5,
+            USER_NAME = 6,
+            TABLE_ENGINE = 7,
+            DEFINER = 8,
+            SOURCE = 9,
         };
 
         struct Node;
@@ -142,28 +163,33 @@ namespace
             }
         };
 
-        static String replaceUnderscoreWithSpace(const std::string_view & str)
+        static String replaceUnderscoreWithSpace(std::string_view str)
         {
             String res{str};
-            boost::replace_all(res, "_", " ");
+            std::replace(res.begin(), res.end(), '_', ' ');
             return res;
         }
 
-        static Strings splitAliases(const std::string_view & str)
+        static Strings splitAliases(std::string_view str)
         {
             Strings aliases;
-            boost::split(aliases, str, boost::is_any_of(","));
-            for (auto & alias : aliases)
-                boost::trim(alias);
+            for (size_t begin = 0; begin <= str.length();)
+            {
+                size_t end = str.find(',', begin);
+                if (end == std::string_view::npos)
+                    end = str.length();
+                aliases.emplace_back(trim(String{str.substr(begin, end - begin)}, isWhitespaceASCII));
+                begin = end + 1;
+            }
             return aliases;
         }
 
         static void makeNode(
             AccessType access_type,
-            const std::string_view & name,
-            const std::string_view & aliases,
+            std::string_view name,
+            std::string_view aliases,
             NodeType node_type,
-            const std::string_view & parent_group_name,
+            std::string_view parent_group_name,
             std::unordered_map<std::string_view, Node *> & nodes,
             std::unordered_map<std::string_view, NodePtr> & owned_nodes,
             size_t & next_flag)
@@ -178,8 +204,8 @@ namespace
             }
             else
             {
-                if (nodes.count(keyword))
-                    throw Exception(keyword + " declared twice", ErrorCodes::LOGICAL_ERROR);
+                if (nodes.contains(keyword))
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "{} declared twice", keyword);
                 node = std::make_unique<Node>(keyword, node_type);
                 nodes[node->keyword] = node.get();
             }
@@ -204,12 +230,24 @@ namespace
             {
                 auto parent_node = std::make_unique<Node>(parent_keyword);
                 it_parent = nodes.emplace(parent_node->keyword, parent_node.get()).first;
-                assert(!owned_nodes.count(parent_node->keyword));
+                chassert(!owned_nodes.contains(parent_node->keyword));
                 std::string_view parent_keyword_as_string_view = parent_node->keyword;
                 owned_nodes[parent_keyword_as_string_view] = std::move(parent_node);
             }
             it_parent->second->addChild(std::move(node));
         }
+
+        /// One entry per access type. Expanding `makeNode` at each of the 258 call sites instead
+        /// compiled to 35 KB, since every call has to materialize four string views; driving it
+        /// from a table costs a loop and some rodata.
+        struct NodeDescriptor
+        {
+            AccessType access_type;
+            std::string_view name;
+            std::string_view aliases;
+            NodeType node_type;
+            std::string_view parent_group_name;
+        };
 
         void makeNodes()
         {
@@ -218,16 +256,24 @@ namespace
             size_t next_flag = 0;
 
 #           define MAKE_ACCESS_FLAGS_NODE(name, aliases, node_type, parent_group_name) \
-                makeNode(AccessType::name, #name, aliases, node_type, #parent_group_name, nodes, owned_nodes, next_flag);
+                NodeDescriptor{AccessType::name, #name, aliases, node_type, #parent_group_name},
 
+            static constexpr std::array node_descriptors
+            {
                 APPLY_FOR_ACCESS_TYPES(MAKE_ACCESS_FLAGS_NODE)
+            };
 
 #           undef MAKE_ACCESS_FLAGS_NODE
 
-            if (!owned_nodes.count("NONE"))
-                throw Exception("'NONE' not declared", ErrorCodes::LOGICAL_ERROR);
-            if (!owned_nodes.count("ALL"))
-                throw Exception("'ALL' not declared", ErrorCodes::LOGICAL_ERROR);
+            for (const auto & descriptor : node_descriptors)
+                makeNode(
+                    descriptor.access_type, descriptor.name, descriptor.aliases, descriptor.node_type,
+                    descriptor.parent_group_name, nodes, owned_nodes, next_flag);
+
+            if (!owned_nodes.contains("NONE"))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "'NONE' not declared");
+            if (!owned_nodes.contains("ALL"))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "'ALL' not declared");
 
             all_node = std::move(owned_nodes["ALL"]);
             none_node = std::move(owned_nodes["NONE"]);
@@ -238,9 +284,8 @@ namespace
             {
                 const auto & unused_node = *(owned_nodes.begin()->second);
                 if (unused_node.node_type == UNKNOWN)
-                    throw Exception("Parent group '" + unused_node.keyword + "' not found", ErrorCodes::LOGICAL_ERROR);
-                else
-                    throw Exception("Access type '" + unused_node.keyword + "' should have parent group", ErrorCodes::LOGICAL_ERROR);
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Parent group '{}' not found", unused_node.keyword);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Access type '{}' should have parent group", unused_node.keyword);
             }
         }
 
@@ -255,7 +300,7 @@ namespace
             start_node->aliases.emplace_back(start_node->keyword);
             for (auto & alias : start_node->aliases)
             {
-                boost::to_upper(alias);
+                toUpperASCII(alias);
                 keyword_to_flags_map[alias] = start_node->flags;
             }
 
@@ -288,13 +333,14 @@ namespace
             }
             if (start_node->node_type != GROUP)
             {
-                assert(static_cast<size_t>(start_node->node_type) < std::size(all_flags_for_target));
+                chassert(static_cast<size_t>(start_node->node_type) < std::size(all_flags_for_target));
                 all_flags_for_target[start_node->node_type] |= start_node->flags;
             }
             for (const auto & child : start_node->children)
                 collectAllFlags(child.get());
 
             all_flags_grantable_on_table_level = all_flags_for_target[TABLE] | all_flags_for_target[DICTIONARY] | all_flags_for_target[COLUMN];
+            all_flags_grantable_on_global_with_parameter_level = all_flags_for_target[NAMED_COLLECTION] | all_flags_for_target[USER_NAME] | all_flags_for_target[TABLE_ENGINE] | all_flags_for_target[DEFINER] | all_flags_for_target[SOURCE];
             all_flags_grantable_on_database_level = all_flags_for_target[DATABASE] | all_flags_grantable_on_table_level;
         }
 
@@ -345,15 +391,104 @@ namespace
         std::unordered_map<std::string_view, Flags> keyword_to_flags_map;
         std::vector<Flags> access_type_to_flags_mapping;
         Flags all_flags;
-        Flags all_flags_for_target[static_cast<size_t>(DICTIONARY) + 1];
+        Flags all_flags_for_target[static_cast<size_t>(SOURCE) + 1];
         Flags all_flags_grantable_on_database_level;
         Flags all_flags_grantable_on_table_level;
+        Flags all_flags_grantable_on_global_with_parameter_level;
     };
 }
 
+bool AccessFlags::isGlobalWithParameter() const
+{
+    return getParameterType() != AccessFlags::NONE;
+}
+
+bool AccessFlags::validateParameter(String & parameter, std::function<void(const char *)> add_to_expected) const
+{
+    if (getParameterType() == AccessFlags::SOURCE)
+    {
+        bool is_valid = parameter.empty() || AccessTypeObjects::validateSource(parameter);
+        if (!is_valid)
+        {
+            for (const auto & [alias, _] : AccessTypeObjects::getAliasesMapSource())
+                add_to_expected(alias.c_str());  // We can use c_str here because the string itself is stored in singleton object.
+        }
+        else if (!parameter.empty())
+            parameter = AccessTypeObjects::unifySource(parameter);
+
+        return is_valid;
+    }
+
+    return true;
+}
+
+
+std::unordered_map<AccessFlags::ParameterType, AccessFlags> AccessFlags::splitIntoParameterTypes() const
+{
+    std::unordered_map<ParameterType, AccessFlags> result;
+
+    auto named_collection_flags = AccessFlags::allNamedCollectionFlags() & *this;
+    if (named_collection_flags)
+        result.emplace(ParameterType::NAMED_COLLECTION, named_collection_flags);
+
+    auto user_flags = AccessFlags::allUserNameFlags() & *this;
+    if (user_flags)
+        result.emplace(ParameterType::USER_NAME, user_flags);
+
+    auto definer_flags = AccessFlags::allDefinerFlags() & *this;
+    if (definer_flags)
+        result.emplace(ParameterType::DEFINER, definer_flags);
+
+    auto table_engine_flags = AccessFlags::allTableEngineFlags() & *this;
+    if (table_engine_flags)
+        result.emplace(ParameterType::TABLE_ENGINE, table_engine_flags);
+
+    auto source_flags = AccessFlags::allSourceFlags() & *this;
+    if (source_flags)
+        result.emplace(ParameterType::SOURCE, source_flags);
+
+
+    auto other_flags = (~named_collection_flags & ~user_flags & ~definer_flags & ~table_engine_flags & ~source_flags) & *this;
+    if (other_flags)
+        result.emplace(ParameterType::NONE, other_flags);
+
+    return result;
+}
+
+AccessFlags::ParameterType AccessFlags::getParameterType() const
+{
+    if (isEmpty() || !AccessFlags::allGlobalWithParameterFlags().contains(*this))
+        return AccessFlags::NONE;
+
+    /// All flags refer to NAMED COLLECTION access type.
+    if (AccessFlags::allNamedCollectionFlags().contains(*this))
+        return AccessFlags::NAMED_COLLECTION;
+
+    if (AccessFlags::allUserNameFlags().contains(*this))
+        return AccessFlags::USER_NAME;
+
+    if (AccessFlags::allDefinerFlags().contains(*this))
+        return AccessFlags::DEFINER;
+
+    /// All flags refer to TABLE ENGINE access type.
+    if (AccessFlags::allTableEngineFlags().contains(*this))
+        return AccessFlags::TABLE_ENGINE;
+
+    /// All flags refer to SOURCE access type.
+    if (AccessFlags::allSourceFlags().contains(*this))
+        return AccessFlags::SOURCE;
+
+    throw Exception(ErrorCodes::MIXED_ACCESS_PARAMETER_TYPES, "Having mixed parameter types: {}", toString());
+}
 
 AccessFlags::AccessFlags(AccessType type) : flags(Helper::instance().accessTypeToFlags(type)) {}
-AccessFlags::AccessFlags(const std::string_view & keyword) : flags(Helper::instance().keywordToFlags(keyword)) {}
+AccessFlags::AccessFlags(std::string_view keyword) : flags(Helper::instance().keywordToFlags(keyword)) {}
+
+bool AccessFlags::tryFromKeyword(std::string_view keyword, AccessFlags & result)
+{
+    return Helper::instance().tryKeywordToFlags(keyword, result.flags);
+}
+
 AccessFlags::AccessFlags(const std::vector<std::string_view> & keywords) : flags(Helper::instance().keywordsToFlags(keywords)) {}
 AccessFlags::AccessFlags(const Strings & keywords) : flags(Helper::instance().keywordsToFlags(keywords)) {}
 String AccessFlags::toString() const { return Helper::instance().flagsToString(flags); }
@@ -361,11 +496,18 @@ std::vector<AccessType> AccessFlags::toAccessTypes() const { return Helper::inst
 std::vector<std::string_view> AccessFlags::toKeywords() const { return Helper::instance().flagsToKeywords(flags); }
 AccessFlags AccessFlags::allFlags() { return Helper::instance().getAllFlags(); }
 AccessFlags AccessFlags::allGlobalFlags() { return Helper::instance().getGlobalFlags(); }
+AccessFlags AccessFlags::allGlobalWithParameterFlags() { return Helper::instance().getGlobalWithParameterFlags(); }
 AccessFlags AccessFlags::allDatabaseFlags() { return Helper::instance().getDatabaseFlags(); }
 AccessFlags AccessFlags::allTableFlags() { return Helper::instance().getTableFlags(); }
 AccessFlags AccessFlags::allColumnFlags() { return Helper::instance().getColumnFlags(); }
 AccessFlags AccessFlags::allDictionaryFlags() { return Helper::instance().getDictionaryFlags(); }
+AccessFlags AccessFlags::allNamedCollectionFlags() { return Helper::instance().getNamedCollectionFlags(); }
+AccessFlags AccessFlags::allUserNameFlags() { return Helper::instance().getUserNameFlags(); }
+AccessFlags AccessFlags::allDefinerFlags() { return Helper::instance().getDefinerFlags(); }
+AccessFlags AccessFlags::allTableEngineFlags() { return Helper::instance().getTableEngineFlags(); }
+AccessFlags AccessFlags::allSourceFlags() { return Helper::instance().getSourceFlags(); }
 AccessFlags AccessFlags::allFlagsGrantableOnGlobalLevel() { return Helper::instance().getAllFlagsGrantableOnGlobalLevel(); }
+AccessFlags AccessFlags::allFlagsGrantableOnGlobalWithParameterLevel() { return Helper::instance().getAllFlagsGrantableOnGlobalWithParameterLevel(); }
 AccessFlags AccessFlags::allFlagsGrantableOnDatabaseLevel() { return Helper::instance().getAllFlagsGrantableOnDatabaseLevel(); }
 AccessFlags AccessFlags::allFlagsGrantableOnTableLevel() { return Helper::instance().getAllFlagsGrantableOnTableLevel(); }
 AccessFlags AccessFlags::allFlagsGrantableOnColumnLevel() { return Helper::instance().getAllFlagsGrantableOnColumnLevel(); }

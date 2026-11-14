@@ -1,7 +1,7 @@
 #pragma once
 
-#include <DataTypes/IDataType.h>
 #include <Parsers/IAST_fwd.h>
+#include <Common/Documentation.h>
 #include <Common/IFactoryWithAliases.h>
 #include <DataTypes/DataTypeCustom.h>
 
@@ -25,7 +25,7 @@ class DataTypeFactory final : private boost::noncopyable, public IFactoryWithAli
 private:
     using SimpleCreator = std::function<DataTypePtr()>;
     using DataTypesDictionary = std::unordered_map<String, Value>;
-    using CreatorWithCustom = std::function<std::pair<DataTypePtr,DataTypeCustomDescPtr>(const ASTPtr & parameters)>;
+    using CreatorWithCustom = std::function<std::pair<DataTypePtr, DataTypeCustomDescPtr>(const ASTPtr & parameters)>;
     using SimpleCreatorWithCustom = std::function<std::pair<DataTypePtr,DataTypeCustomDescPtr>()>;
 
 public:
@@ -35,27 +35,45 @@ public:
     DataTypePtr get(const String & family_name, const ASTPtr & parameters) const;
     DataTypePtr get(const ASTPtr & ast) const;
     DataTypePtr getCustom(DataTypeCustomDescPtr customization) const;
+    DataTypePtr getCustom(const String & base_name, DataTypeCustomDescPtr customization) const;
+
+    /// Return nullptr in case of error.
+    DataTypePtr tryGet(const String & full_name) const;
+    DataTypePtr tryGet(const String & family_name, const ASTPtr & parameters) const;
+    DataTypePtr tryGet(const ASTPtr & ast) const;
 
     /// Register a type family by its name.
-    void registerDataType(const String & family_name, Value creator, CaseSensitiveness case_sensitiveness = CaseSensitive);
+    void registerDataType(const String & family_name, Value creator, Case case_sensitiveness = Case::Sensitive, Documentation documentation = {});
 
     /// Register a simple data type, that have no parameters.
-    void registerSimpleDataType(const String & name, SimpleCreator creator, CaseSensitiveness case_sensitiveness = CaseSensitive);
+    void registerSimpleDataType(const String & name, SimpleCreator creator, Case case_sensitiveness = Case::Sensitive, Documentation documentation = {});
 
     /// Register a customized type family
-    void registerDataTypeCustom(const String & family_name, CreatorWithCustom creator, CaseSensitiveness case_sensitiveness = CaseSensitive);
+    void registerDataTypeCustom(const String & family_name, CreatorWithCustom creator, Case case_sensitiveness = Case::Sensitive, Documentation documentation = {});
 
     /// Register a simple customized data type
-    void registerSimpleDataTypeCustom(const String & name, SimpleCreatorWithCustom creator, CaseSensitiveness case_sensitiveness = CaseSensitive);
+    void registerSimpleDataTypeCustom(const String & name, SimpleCreatorWithCustom creator, Case case_sensitiveness = Case::Sensitive, Documentation documentation = {});
+
+    /// Returns the embedded documentation for a data type family (empty if none was registered).
+    Documentation getDocumentation(const String & family_name) const;
 
 private:
-    const Value & findCreatorByName(const String & family_name) const;
+    template <bool nullptr_on_error>
+    DataTypePtr getImpl(const String & full_name) const;
+    template <bool nullptr_on_error>
+    DataTypePtr getImpl(const String & family_name, const ASTPtr & parameters) const;
+    template <bool nullptr_on_error>
+    DataTypePtr getImpl(const ASTPtr & ast) const;
+    template <bool nullptr_on_error>
+    const Value * findCreatorByName(const String & family_name) const;
 
-private:
     DataTypesDictionary data_types;
 
     /// Case insensitive data types will be additionally added here with lowercased name.
     DataTypesDictionary case_insensitive_data_types;
+
+    /// Embedded documentation, keyed by data type family name.
+    std::unordered_map<String, Documentation> data_type_documentations;
 
     DataTypeFactory();
 
@@ -71,21 +89,27 @@ void registerDataTypeDecimal(DataTypeFactory & factory);
 void registerDataTypeDate(DataTypeFactory & factory);
 void registerDataTypeDate32(DataTypeFactory & factory);
 void registerDataTypeDateTime(DataTypeFactory & factory);
+void registerDataTypeTime(DataTypeFactory & factory);
 void registerDataTypeString(DataTypeFactory & factory);
 void registerDataTypeFixedString(DataTypeFactory & factory);
 void registerDataTypeEnum(DataTypeFactory & factory);
 void registerDataTypeArray(DataTypeFactory & factory);
 void registerDataTypeTuple(DataTypeFactory & factory);
+void registerDataTypeQBit(DataTypeFactory & factory);
 void registerDataTypeMap(DataTypeFactory & factory);
 void registerDataTypeNullable(DataTypeFactory & factory);
 void registerDataTypeNothing(DataTypeFactory & factory);
 void registerDataTypeUUID(DataTypeFactory & factory);
+void registerDataTypeIPv4andIPv6(DataTypeFactory & factory);
 void registerDataTypeAggregateFunction(DataTypeFactory & factory);
 void registerDataTypeNested(DataTypeFactory & factory);
 void registerDataTypeInterval(DataTypeFactory & factory);
 void registerDataTypeLowCardinality(DataTypeFactory & factory);
-void registerDataTypeDomainIPv4AndIPv6(DataTypeFactory & factory);
+void registerDataTypeDomainBool(DataTypeFactory & factory);
 void registerDataTypeDomainSimpleAggregateFunction(DataTypeFactory & factory);
 void registerDataTypeDomainGeo(DataTypeFactory & factory);
+void registerDataTypeVariant(DataTypeFactory & factory);
+void registerDataTypeDynamic(DataTypeFactory & factory);
+void registerDataTypeJSON(DataTypeFactory & factory);
 
 }

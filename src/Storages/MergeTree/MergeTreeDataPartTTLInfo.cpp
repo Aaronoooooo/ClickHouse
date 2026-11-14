@@ -1,32 +1,58 @@
 #include <Storages/MergeTree/MergeTreeDataPartTTLInfo.h>
+#include <Compression/CompressionFactory.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Common/quoteString.h>
 #include <algorithm>
+#include <Parsers/ExpressionListParsers.h>
+#include <Parsers/IAST.h>
+#include <Parsers/parseQuery.h>
+#include <Storages/TTLDescription.h>
 
 #include <base/JSON.h>
 
 namespace DB
 {
 
+void MergeTreeDataPartTTLInfo::update(time_t time)
+{
+    if (time && (!min || time < min))
+        min = time;
+
+    max = std::max(time, max);
+}
+
+void MergeTreeDataPartTTLInfo::update(const MergeTreeDataPartTTLInfo & other_info)
+{
+    if (other_info.min && (!min || other_info.min < min))
+        min = other_info.min;
+
+    max = std::max(other_info.max, max);
+    if (ttl_finished.has_value())
+        ttl_finished = ttl_finished.value() && other_info.finished();
+    else
+        ttl_finished = other_info.finished();
+}
+
 void MergeTreeDataPartTTLInfos::update(const MergeTreeDataPartTTLInfos & other_infos)
 {
     for (const auto & [name, ttl_info] : other_infos.columns_ttl)
     {
         columns_ttl[name].update(ttl_info);
-        updatePartMinMaxTTL(ttl_info.min, ttl_info.max);
+        updatePartMinMaxTTL(ttl_info);
     }
 
     for (const auto & [name, ttl_info] : other_infos.rows_where_ttl)
     {
         rows_where_ttl[name].update(ttl_info);
-        updatePartMinMaxTTL(ttl_info.min, ttl_info.max);
+        updatePartMinMaxTTL(ttl_info);
     }
 
     for (const auto & [name, ttl_info] : other_infos.group_by_ttl)
     {
-        group_by_ttl[name].update(ttl_info);
-        updatePartMinMaxTTL(ttl_info.min, ttl_info.max);
+        const MergeTreeDataPartTTLInfo not_finished_ttl_info{ .min = ttl_info.min, .max = ttl_info.max, .ttl_finished = false };
+        group_by_ttl[name].update(not_finished_ttl_info);
+        updatePartMinMaxTTL(not_finished_ttl_info);
     }
 
     for (const auto & [name, ttl_info] : other_infos.recompression_ttl)
@@ -36,7 +62,7 @@ void MergeTreeDataPartTTLInfos::update(const MergeTreeDataPartTTLInfos & other_i
         moves_ttl[expression].update(ttl_info);
 
     table_ttl.update(other_infos.table_ttl);
-    updatePartMinMaxTTL(table_ttl.min, table_ttl.max);
+    updatePartMinMaxTTL(table_ttl);
 }
 
 
@@ -57,12 +83,12 @@ void MergeTreeDataPartTTLInfos::read(ReadBuffer & in)
             ttl_info.max = col["max"].getUInt();
 
             if (col.has("finished"))
-                ttl_info.finished = col["finished"].getUInt();
+                ttl_info.ttl_finished = col["finished"].getUInt();
 
             String name = col["name"].getString();
             columns_ttl.emplace(name, ttl_info);
 
-            updatePartMinMaxTTL(ttl_info.min, ttl_info.max);
+            updatePartMinMaxTTL(ttl_info);
         }
     }
     if (json.has("table"))
@@ -72,9 +98,9 @@ void MergeTreeDataPartTTLInfos::read(ReadBuffer & in)
         table_ttl.max = table["max"].getUInt();
 
         if (table.has("finished"))
-            table_ttl.finished = table["finished"].getUInt();
+            table_ttl.ttl_finished = table["finished"].getUInt();
 
-        updatePartMinMaxTTL(table_ttl.min, table_ttl.max);
+        updatePartMinMaxTTL(table_ttl);
     }
 
     auto fill_ttl_info_map = [this](const JSON & json_part, TTLInfoMap & ttl_info_map, bool update_min_max)
@@ -86,13 +112,13 @@ void MergeTreeDataPartTTLInfos::read(ReadBuffer & in)
             ttl_info.max = elem["max"].getUInt();
 
             if (elem.has("finished"))
-                ttl_info.finished = elem["finished"].getUInt();
+                ttl_info.ttl_finished = elem["finished"].getUInt();
 
             String expression = elem["expression"].getString();
             ttl_info_map.emplace(expression, ttl_info);
 
             if (update_min_max)
-                updatePartMinMaxTTL(ttl_info.min, ttl_info.max);
+                updatePartMinMaxTTL(ttl_info);
         }
     };
 
@@ -138,7 +164,7 @@ void MergeTreeDataPartTTLInfos::write(WriteBuffer & out) const
             writeString(",\"max\":", out);
             writeIntText(it->second.max, out);
             writeString(R"(,"finished":)", out);
-            writeIntText(static_cast<uint8_t>(it->second.finished), out);
+            writeIntText(static_cast<uint8_t>(it->second.finished()), out);
             writeString("}", out);
         }
         writeString("]", out);
@@ -152,7 +178,7 @@ void MergeTreeDataPartTTLInfos::write(WriteBuffer & out) const
         writeString(R"(,"max":)", out);
         writeIntText(table_ttl.max, out);
         writeString(R"(,"finished":)", out);
-        writeIntText(static_cast<uint8_t>(table_ttl.finished), out);
+        writeIntText(static_cast<uint8_t>(table_ttl.finished()), out);
         writeString("}", out);
     }
 
@@ -175,7 +201,7 @@ void MergeTreeDataPartTTLInfos::write(WriteBuffer & out) const
             writeString(R"(,"max":)", out);
             writeIntText(it->second.max, out);
             writeString(R"(,"finished":)", out);
-            writeIntText(static_cast<uint8_t>(it->second.finished), out);
+            writeIntText(static_cast<uint8_t>(it->second.finished()), out);
             writeString("}", out);
         }
         writeString("]", out);
@@ -219,37 +245,89 @@ time_t MergeTreeDataPartTTLInfos::getMinimalMaxRecompressionTTL() const
     return max;
 }
 
+namespace
+{
+
+bool hasAnyNonFinishedTTLInMap(const TTLInfoMap & map)
+{
+    for (const auto & [name, info] : map)
+        if (info.initialized() && !info.finished())
+            return true;
+
+    return false;
+}
+
+}
+
+bool MergeTreeDataPartTTLInfos::hasAnyNonFinishedRowTTLs() const
+{
+    if (table_ttl.initialized() && !table_ttl.finished())
+        return true;
+
+    return hasAnyNonFinishedTTLInMap(rows_where_ttl) || hasAnyNonFinishedTTLInMap(group_by_ttl);
+}
+
+bool MergeTreeDataPartTTLInfos::hasAnyNonFinishedColumnTTLs() const
+{
+    return hasAnyNonFinishedTTLInMap(columns_ttl);
+}
+
+time_t MergeTreeDataPartTTLInfos::getMinimalNonFinishedColumnTTL() const
+{
+    time_t min_ttl = 0;
+
+    for (const auto & [name, info] : columns_ttl)
+        if (info.initialized() && !info.finished())
+            if (info.min && (!min_ttl || info.min < min_ttl))
+                min_ttl = info.min;
+
+    return min_ttl;
+}
+
 bool MergeTreeDataPartTTLInfos::hasAnyNonFinishedTTLs() const
 {
-    auto has_non_finished_ttl = [] (const TTLInfoMap & map) -> bool
-    {
-        for (const auto & [name, info] : map)
-        {
-            if (!info.finished)
-                return true;
-        }
-        return false;
-    };
-
-    if (!table_ttl.finished)
+    if (table_ttl.initialized() && !table_ttl.finished())
         return true;
 
-    if (has_non_finished_ttl(columns_ttl))
+    if (hasAnyNonFinishedTTLInMap(columns_ttl))
         return true;
 
-    if (has_non_finished_ttl(rows_where_ttl))
+    if (hasAnyNonFinishedTTLInMap(rows_where_ttl))
         return true;
 
-    if (has_non_finished_ttl(moves_ttl))
+    if (hasAnyNonFinishedTTLInMap(moves_ttl))
         return true;
 
-    if (has_non_finished_ttl(recompression_ttl))
+    if (hasAnyNonFinishedTTLInMap(recompression_ttl))
         return true;
 
-    if (has_non_finished_ttl(group_by_ttl))
+    if (hasAnyNonFinishedTTLInMap(group_by_ttl))
         return true;
 
     return false;
+}
+
+namespace
+{
+    /// We had backward incompatibility in representation of serialized expressions, example:
+    ///
+    /// `expired + toIntervalSecond(20)` vs `plus(expired, toIntervalSecond(20))`
+    /// Since they are stored as strings we cannot compare them directly as strings
+    /// To avoid backward incompatibility we parse them and check AST hashes.
+    /// This O(N^2), but amount of TTLs should be small, so it should be Ok.
+    auto tryToFindTTLExpressionInMapByASTMatching(const TTLInfoMap & ttl_info_map, const std::string & result_column)
+    {
+        ParserExpression parser;
+        auto ast_needle = parseQuery(parser, result_column.data(), result_column.data() + result_column.size(), "", 0, 0, 0);
+        for (auto it = ttl_info_map.begin(); it != ttl_info_map.end(); ++it)
+        {
+            const std::string & stored_expression = it->first;
+            auto ast_candidate = parseQuery(parser, stored_expression.data(), stored_expression.data() + stored_expression.size(), "", 0, 0, 0);
+            if (ast_candidate->getTreeHash(false) == ast_needle->getTreeHash(false))
+                return it;
+        }
+        return ttl_info_map.end();
+    }
 }
 
 std::optional<TTLDescription> selectTTLDescriptionForTTLInfos(const TTLDescriptions & descriptions, const TTLInfoMap & ttl_info_map, time_t current_time, bool use_max)
@@ -261,9 +339,13 @@ std::optional<TTLDescription> selectTTLDescriptionForTTLInfos(const TTLDescripti
         auto ttl_info_it = ttl_info_map.find(ttl_entry_it->result_column);
 
         if (ttl_info_it == ttl_info_map.end())
-            continue;
+        {
+            ttl_info_it = tryToFindTTLExpressionInMapByASTMatching(ttl_info_map, ttl_entry_it->result_column);
+            if (ttl_info_it == ttl_info_map.end())
+                continue;
+        }
 
-        time_t ttl_time;
+        time_t ttl_time = 0;
 
         if (use_max)
             ttl_time = ttl_info_it->second.max;
@@ -282,5 +364,12 @@ std::optional<TTLDescription> selectTTLDescriptionForTTLInfos(const TTLDescripti
     return best_ttl_time ? *best_entry_it : std::optional<TTLDescription>();
 }
 
+bool isExplicitRecompression(
+    const TTLDescriptions & recompression_ttl_entries, const TTLInfoMap & recompression_ttl_info, time_t current_time)
+{
+    auto best_ttl_entry
+        = selectTTLDescriptionForTTLInfos(recompression_ttl_entries, recompression_ttl_info, current_time, /*use_max=*/true);
+    return best_ttl_entry && !CompressionCodecFactory::isDefaultCodec(best_ttl_entry->recompression_codec);
+}
 
 }

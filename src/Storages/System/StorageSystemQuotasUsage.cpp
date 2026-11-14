@@ -1,4 +1,5 @@
 #include <Storages/System/StorageSystemQuotasUsage.h>
+#include <Storages/System/SystemTableSourceRegistry.h>
 #include <Storages/System/StorageSystemQuotaUsage.h>
 #include <Interpreters/Context.h>
 #include <Access/AccessControl.h>
@@ -8,15 +9,22 @@
 
 namespace DB
 {
-NamesAndTypesList StorageSystemQuotasUsage::getNamesAndTypes()
+ColumnsDescription StorageSystemQuotasUsage::getColumnsDescription()
 {
-    return StorageSystemQuotaUsage::getNamesAndTypesImpl(/* add_column_is_current = */ true);
+    return StorageSystemQuotaUsage::getColumnsDescriptionImpl(/* add_column_is_current = */ true);
 }
 
-void StorageSystemQuotasUsage::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo &) const
+void StorageSystemQuotasUsage::fillData(MutableColumns & res_columns, ContextPtr context, const ActionsDAG::Node *, std::vector<UInt8>) const
 {
-    context->checkAccess(AccessType::SHOW_QUOTAS);
+    /// If "select_from_system_db_requires_grant" is enabled the access rights were already checked in InterpreterSelectQuery.
+    const auto & access_control = context->getAccessControl();
+    if (!access_control.doesSelectFromSystemDatabaseRequireGrant())
+        context->checkAccess(AccessType::SHOW_QUOTAS);
+
     auto all_quotas_usage = context->getAccessControl().getAllQuotasUsage();
     StorageSystemQuotaUsage::fillDataImpl(res_columns, context, /* add_column_is_current = */ true, all_quotas_usage);
 }
 }
+
+/// Register the source file of this system table for `system.documentation`.
+namespace DB { REGISTER_SYSTEM_TABLE_SOURCE(StorageSystemQuotasUsage) }

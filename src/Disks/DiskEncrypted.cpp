@@ -2,12 +2,28 @@
 
 #if USE_SSL
 #include <Disks/DiskFactory.h>
+#include <Disks/loadLocalDiskConfig.h>
+#include <IO/ReadPipeline.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/Cache/EncryptionHeaderCache.h>
+#include <Common/Base64.h>
+#include <Common/Exception.h>
 #include <IO/FileEncryptionCommon.h>
 #include <IO/ReadBufferFromEncryptedFile.h>
 #include <IO/ReadBufferFromFileDecorator.h>
 #include <IO/ReadBufferFromString.h>
-#include <IO/WriteBufferFromEncryptedFile.h>
+#include <IO/S3/Credentials.h>
+#include <IO/S3Common.h>
 #include <boost/algorithm/hex.hpp>
+#include <Common/quoteString.h>
+#include <Common/typeid_cast.h>
+
+#if CLICKHOUSE_CLOUD
+#include <Core/KMS.h>
+#endif
+
+#include <algorithm>
+#include <filesystem>
 
 
 namespace DB
@@ -17,7 +33,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int INCORRECT_DISK_INDEX;
-    extern const int DATA_ENCRYPTION_ERROR;
+    extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
 
@@ -40,87 +56,248 @@ namespace
         }
     }
 
+    struct Key
+    {
+        String plain;
+        std::optional<String> encrypted;
+    };
+
+    /// Reads encryption keys from the configuration.
+    void getKeysFromConfig(const Poco::Util::AbstractConfiguration & config, const String & config_prefix,
+                           std::map<UInt64, Key> & out_keys_by_id, std::vector<Key>& out_keys_without_id)
+    {
+        Strings config_keys;
+        config.keys(config_prefix, config_keys);
+
+        /// The keys are picked by a pattern of their names (`key`, `key[1]`, ...). Look up the bare names,
+        /// so that a configuration tracking the read keys (`ConfigurationWithUsageTracking`, used for
+        /// a definition of a disk) knows that the elements with these names are read even when they are absent.
+        config.has(config_prefix + ".key");
+        config.has(config_prefix + ".key_hex");
+#if CLICKHOUSE_CLOUD
+        config.has(config_prefix + ".key_aws");
+        config.has(config_prefix + ".key_gcp");
+        config.has(config_prefix + ".key_azure");
+        /// The options of a key management service are read only to decrypt a key, so they are read only
+        /// when there is such a key. Look them up as well, so that they are known for a disk that gets
+        /// such a key on a configuration reload.
+        config.has(config_prefix + ".no_sign_request");
+        config.has(config_prefix + ".aws_kms_endpoint");
+#endif
+
+        for (const std::string & config_key : config_keys)
+        {
+            Key key;
+            std::optional<UInt64> key_id;
+
+            if ((config_key == "key") || config_key.starts_with("key["))
+            {
+                String key_path = config_prefix + "." + config_key;
+                key.plain = config.getString(key_path);
+                String key_id_path = key_path + "[@id]";
+                if (config.has(key_id_path))
+                    key_id = config.getUInt64(key_id_path);
+            }
+            else if ((config_key == "key_hex") || config_key.starts_with("key_hex["))
+            {
+                String key_path = config_prefix + "." + config_key;
+                key.plain = unhexKey(config.getString(key_path));
+                String key_id_path = key_path + "[@id]";
+                if (config.has(key_id_path))
+                    key_id = config.getUInt64(key_id_path);
+            }
+#if CLICKHOUSE_CLOUD
+            else if ((config_key == "key_aws") || config_key.starts_with("key_aws[") || (config_key == "key_gcp") || config_key.starts_with("key_gcp[") ||
+                     (config_key == "key_azure") || config_key.starts_with("key_azure["))
+            {
+                String key_path = config_prefix + "." + config_key;
+                String key_id_path = key_path + "[@id]";
+                if (config.has(key_id_path))
+                    key_id = config.getUInt64(key_id_path);
+                key.plain = decryptKeyUsingCloudKeyManagementService(config,config_prefix, key_path, config_key);
+                key.encrypted = config.getString(key_path);
+            }
+#endif
+            else
+                continue;
+
+            if (key_id)
+            {
+                if (!out_keys_by_id.contains(*key_id))
+                    out_keys_by_id[*key_id] = key;
+                else
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Multiple keys specified for same ID {}", *key_id);
+            }
+            else
+                out_keys_without_id.push_back(key);
+        }
+
+        if (out_keys_by_id.empty() && out_keys_without_id.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "No encryption keys found");
+
+        if (out_keys_by_id.empty() && (out_keys_without_id.size() == 1))
+        {
+            out_keys_by_id[0] = out_keys_without_id.front();
+            out_keys_without_id.clear();
+        }
+    }
+
+    /// Reads the current encryption key from the configuration.
+    String getCurrentKeyFromConfig(const Poco::Util::AbstractConfiguration & config, const String & config_prefix,
+                                   const std::map<UInt64, Key> & keys_by_id, const std::vector<Key> & keys_without_id)
+    {
+        String key_path = config_prefix + ".current_key";
+        String key_hex_path = config_prefix + ".current_key_hex";
+        String key_id_path = config_prefix + ".current_key_id";
+
+        if (config.has(key_path) + config.has(key_hex_path) + config.has(key_id_path) > 1)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The current key is specified multiple times");
+
+        auto check_current_key_found = [&](const String & current_key_)
+        {
+            for (const auto & [_, key] : keys_by_id)
+            {
+                if (key.plain == current_key_)
+                    return current_key_;
+
+                if (std::string_view(key.encrypted.value_or("")) == std::string_view(current_key_))
+                    return key.plain;
+            }
+            for (const auto & key : keys_without_id)
+            {
+                if (key.plain == current_key_)
+                    return current_key_;
+
+                if (std::string_view(key.encrypted.value_or("")) == std::string_view(current_key_))
+                    return key.plain;
+            }
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The current key is not found in keys");
+        };
+
+        if (config.has(key_path))
+        {
+            String current_key = config.getString(key_path);
+            return check_current_key_found(current_key);
+        }
+        if (config.has(key_hex_path))
+        {
+            String current_key = unhexKey(config.getString(key_hex_path));
+            return check_current_key_found(current_key);
+        }
+        if (config.has(key_id_path))
+        {
+            UInt64 current_key_id = config.getUInt64(key_id_path);
+            auto it = keys_by_id.find(current_key_id);
+            if (it == keys_by_id.end())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Not found a key with the current ID {}", current_key_id);
+            return it->second.plain;
+        }
+        if (keys_by_id.size() == 1 && keys_without_id.empty() && keys_by_id.begin()->first == 0)
+        {
+            /// There is only a single key defined with id=0, so we can choose it as current.
+            return keys_by_id.begin()->second.plain;
+        }
+
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The current key is not specified");
+    }
+
+    /// Reads the current encryption algorithm from the configuration.
+    Algorithm getCurrentAlgorithmFromConfig(const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
+    {
+        String path = config_prefix + ".algorithm";
+        if (!config.has(path))
+            return DEFAULT_ENCRYPTION_ALGORITHM;
+        return parseAlgorithmFromString(config.getString(path));
+    }
+
+    void checkCustomDiskPathIsInsideWrappedDisk(const String & path)
+    {
+        std::filesystem::path fs_path(path);
+        if (fs_path.is_absolute() || std::ranges::any_of(fs_path, [](const auto & component) { return component == ".."; }))
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Path of the encrypted custom disk must be relative to the wrapped disk and must not contain `..`, but got {}",
+                quoteString(path));
+    }
+
+    /// Reads the name of a wrapped disk & the path on the wrapped disk and then finds that disk in a disk map.
+    void getDiskAndPathFromConfig(const Poco::Util::AbstractConfiguration & config, const String & config_prefix, const DisksMap & map,
+                                  DiskPtr & out_disk, String & out_path)
+    {
+        String disk_name = config.getString(config_prefix + ".disk", "");
+        if (disk_name.empty())
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS, "Name of the wrapped disk must not be empty. Encrypted disk is a wrapper over another disk");
+
+        auto disk_it = map.find(disk_name);
+        if (disk_it == map.end())
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS, "The wrapped disk must have been announced earlier. No disk with name {}", disk_name);
+
+        out_disk = disk_it->second;
+
+        out_path = config.getString(config_prefix + ".path", "");
+        if (!out_path.empty() && (out_path.back() != '/'))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk path must ends with '/', but '{}' doesn't.", quoteString(out_path));
+    }
+
+    /// Parses the settings of an encrypted disk from the configuration.
     std::unique_ptr<const DiskEncryptedSettings> parseDiskEncryptedSettings(
-        const String & name, const Poco::Util::AbstractConfiguration & config, const String & config_prefix, const DisksMap & map)
+        const String & disk_name,
+        const Poco::Util::AbstractConfiguration & config,
+        const String & config_prefix,
+        const DisksMap & disk_map)
     {
         try
         {
             auto res = std::make_unique<DiskEncryptedSettings>();
-            res->current_algorithm = DEFAULT_ENCRYPTION_ALGORITHM;
-            if (config.has(config_prefix + ".algorithm"))
-                parseFromString(res->current_algorithm, config.getString(config_prefix + ".algorithm"));
 
-            Strings config_keys;
-            config.keys(config_prefix, config_keys);
-            for (const std::string & config_key : config_keys)
+            std::map<UInt64, Key> keys_by_id;
+            std::vector<Key> keys_without_id;
+            getKeysFromConfig(config, config_prefix, keys_by_id, keys_without_id);
+
+            for (const auto & [key_id, key_entry] : keys_by_id)
             {
-                String key;
-                UInt64 key_id;
+                const auto key = key_entry.plain;
+                auto fingerprint = calculateKeyFingerprint(key);
+                res->all_keys[fingerprint] = key;
 
-                if ((config_key == "key") || config_key.starts_with("key["))
-                {
-                    key = config.getString(config_prefix + "." + config_key, "");
-                    key_id = config.getUInt64(config_prefix + "." + config_key + "[@id]", 0);
-                }
-                else if ((config_key == "key_hex") || config_key.starts_with("key_hex["))
-                {
-                    key = unhexKey(config.getString(config_prefix + "." + config_key, ""));
-                    key_id = config.getUInt64(config_prefix + "." + config_key + "[@id]", 0);
-                }
-                else
-                    continue;
-
-                if (res->keys.contains(key_id))
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Multiple keys have the same ID {}", key_id);
-                res->keys[key_id] = key;
+                /// Version 1 used key fingerprints based on the key id.
+                /// We have to add such fingerprints to the map too to support reading files encrypted by version 1.
+                auto v1_fingerprint = calculateV1KeyFingerprint(key, key_id);
+                res->all_keys[v1_fingerprint] = key;
             }
 
-            if (res->keys.empty())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "No keys, an encrypted disk needs keys to work");
-
-            if (!config.has(config_prefix + ".current_key_id"))
+            for (const auto & key : keys_without_id)
             {
-                /// In case of multiple keys, current_key_id is mandatory
-                if (res->keys.size() > 1)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "There are multiple keys in config. current_key_id is required");
-
-                /// If there is only one key with non zero ID, curren_key_id should be defined.
-                if (res->keys.size() == 1 && !res->keys.contains(0))
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Config has one key with non zero id. сurrent_key_id is required");
+                auto fingerprint = calculateKeyFingerprint(key.plain);
+                res->all_keys[fingerprint] = key.plain;
             }
 
-            res->current_key_id = config.getUInt64(config_prefix + ".current_key_id", 0);
-            if (!res->keys.contains(res->current_key_id))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Not found a key with the current ID {}", res->current_key_id);
-            FileEncryption::checkKeySize(res->current_algorithm, res->keys[res->current_key_id].size());
+            String current_key = getCurrentKeyFromConfig(config, config_prefix, keys_by_id, keys_without_id);
+            res->current_key = current_key;
+            res->current_key_fingerprint = calculateKeyFingerprint(current_key);
 
-            String wrapped_disk_name = config.getString(config_prefix + ".disk", "");
-            if (wrapped_disk_name.empty())
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Name of the wrapped disk must not be empty. Encrypted disk is a wrapper over another disk");
+            res->current_algorithm = getCurrentAlgorithmFromConfig(config, config_prefix);
 
-            auto wrapped_disk_it = map.find(wrapped_disk_name);
-            if (wrapped_disk_it == map.end())
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "The wrapped disk must have been announced earlier. No disk with name {}",
-                    wrapped_disk_name);
-            res->wrapped_disk = wrapped_disk_it->second;
+            FileEncryption::checkKeySize(res->current_key.size(), res->current_algorithm);
 
-            res->disk_path = config.getString(config_prefix + ".path", "");
-            if (!res->disk_path.empty() && (res->disk_path.back() != '/'))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk path must ends with '/', but '{}' doesn't.", quoteString(res->disk_path));
+            DiskPtr wrapped_disk;
+            String disk_path;
+            getDiskAndPathFromConfig(config, config_prefix, disk_map, wrapped_disk, disk_path);
+            res->wrapped_disk = wrapped_disk;
+            res->disk_path = disk_path;
 
             return res;
         }
         catch (Exception & e)
         {
-            e.addMessage("Disk " + name);
+            e.addMessage("Disk " + disk_name);
             throw;
         }
     }
 
+    /// Reads the header of an encrypted file.
     FileEncryption::Header readHeader(ReadBufferFromFileBase & read_buffer)
     {
         try
@@ -136,41 +313,43 @@ namespace
         }
     }
 
-    String getCurrentKey(const String & path, const DiskEncryptedSettings & settings)
-    {
-        auto it = settings.keys.find(settings.current_key_id);
-        if (it == settings.keys.end())
-            throw Exception(
-                ErrorCodes::DATA_ENCRYPTION_ERROR,
-                "Not found a key with the current ID {} required to cipher file {}",
-                settings.current_key_id,
-                quoteString(path));
-
-        return it->second;
-    }
-
-    String getKey(const String & path, const FileEncryption::Header & header, const DiskEncryptedSettings & settings)
-    {
-        auto it = settings.keys.find(header.key_id);
-        if (it == settings.keys.end())
-            throw Exception(
-                ErrorCodes::DATA_ENCRYPTION_ERROR,
-                "Not found a key with ID {} required to decipher file {}",
-                header.key_id,
-                quoteString(path));
-
-        String key = it->second;
-        if (calculateKeyHash(key) != header.key_hash)
-            throw Exception(
-                ErrorCodes::DATA_ENCRYPTION_ERROR, "Wrong key with ID {}, could not decipher file {}", header.key_id, quoteString(path));
-
-        return key;
-    }
-
     bool inline isSameDiskType(const IDisk & one, const IDisk & another)
     {
         return typeid(one) == typeid(another);
     }
+
+    class DiskEncryptedDirectoryIterator final : public IDirectoryIterator
+    {
+    public:
+        DiskEncryptedDirectoryIterator(DirectoryIteratorPtr delegate_, String path_prefix_)
+            : delegate(std::move(delegate_))
+            , path_prefix(std::move(path_prefix_))
+        {
+        }
+
+        void next() override { delegate->next(); }
+        bool isValid() const override { return delegate->isValid(); }
+
+        String path() const override
+        {
+            auto delegate_path = delegate->path();
+
+            if (!delegate_path.starts_with(path_prefix))
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Encrypted disk iterator returned path {} without expected prefix {}",
+                    quoteString(delegate_path),
+                    quoteString(path_prefix));
+
+            return delegate_path.substr(path_prefix.size());
+        }
+
+        String name() const override { return delegate->name(); }
+
+    private:
+        DirectoryIteratorPtr delegate;
+        String path_prefix;
+    };
 }
 
 class DiskEncryptedReservation : public IReservation
@@ -182,11 +361,12 @@ public:
     }
 
     UInt64 getSize() const override { return reservation->getSize(); }
+    std::optional<UInt64> getUnreservedSpace() const override { return reservation->getUnreservedSpace(); }
 
     DiskPtr getDisk(size_t i) const override
     {
         if (i != 0)
-            throw Exception("Can't use i != 0 with single disk reservation", ErrorCodes::INCORRECT_DISK_INDEX);
+            throw Exception(ErrorCodes::INCORRECT_DISK_INDEX, "Can't use i != 0 with single disk reservation");
         return disk;
     }
 
@@ -201,13 +381,26 @@ private:
 
 DiskEncrypted::DiskEncrypted(
     const String & name_, const Poco::Util::AbstractConfiguration & config_, const String & config_prefix_, const DisksMap & map_)
-    : DiskEncrypted(name_, parseDiskEncryptedSettings(name_, config_, config_prefix_, map_))
+    : DiskEncrypted(name_, parseDiskEncryptedSettings(name_, config_, config_prefix_, map_), config_, config_prefix_)
 {
 }
 
+DiskEncrypted::DiskEncrypted(const String & name_, std::unique_ptr<const DiskEncryptedSettings> settings_,
+                             const Poco::Util::AbstractConfiguration & config_, const String & config_prefix_)
+    : IDisk(name_, config_, config_prefix_)
+    , delegate(settings_->wrapped_disk)
+    , encrypted_name(name_)
+    , disk_path(settings_->disk_path)
+    , disk_absolute_path(settings_->wrapped_disk->getPath() + settings_->disk_path)
+    , current_settings(std::move(settings_))
+{
+    delegate->createDirectories(disk_path);
+}
+
 DiskEncrypted::DiskEncrypted(const String & name_, std::unique_ptr<const DiskEncryptedSettings> settings_)
-    : DiskDecorator(settings_->wrapped_disk)
-    , name(name_)
+    : IDisk(name_)
+    , delegate(settings_->wrapped_disk)
+    , encrypted_name(name_)
     , disk_path(settings_->disk_path)
     , disk_absolute_path(settings_->wrapped_disk->getPath() + settings_->disk_path)
     , current_settings(std::move(settings_))
@@ -223,7 +416,31 @@ ReservationPtr DiskEncrypted::reserve(UInt64 bytes)
     return std::make_unique<DiskEncryptedReservation>(std::static_pointer_cast<DiskEncrypted>(shared_from_this()), std::move(reservation));
 }
 
-void DiskEncrypted::copy(const String & from_path, const std::shared_ptr<IDisk> & to_disk, const String & to_path)
+ReservationPtr DiskEncrypted::reserve(UInt64 bytes, const ReservationConstraints & constraints)
+{
+    auto reservation = delegate->reserve(bytes, constraints);
+    if (!reservation)
+        return {};
+    return std::make_unique<DiskEncryptedReservation>(std::static_pointer_cast<DiskEncrypted>(shared_from_this()), std::move(reservation));
+}
+
+ReservationPtr DiskEncrypted::reserveAndGetUnreservedSpace(
+    UInt64 bytes, const std::optional<ReservationConstraints> & constraints, std::optional<UInt64> & unreserved_space)
+{
+    auto reservation = delegate->reserveAndGetUnreservedSpace(bytes, constraints, unreserved_space);
+    if (!reservation)
+        return {};
+    return std::make_unique<DiskEncryptedReservation>(std::static_pointer_cast<DiskEncrypted>(shared_from_this()), std::move(reservation));
+}
+
+
+void DiskEncrypted::copyDirectoryContent(
+    const String & from_dir,
+    const std::shared_ptr<IDisk> & to_disk,
+    const String & to_dir,
+    const ReadSettings & read_settings,
+    const WriteSettings & write_settings,
+    const std::function<void()> & cancellation_hook)
 {
     /// Check if we can copy the file without deciphering.
     if (isSameDiskType(*this, *to_disk))
@@ -233,78 +450,116 @@ void DiskEncrypted::copy(const String & from_path, const std::shared_ptr<IDisk> 
         {
             auto from_settings = current_settings.get();
             auto to_settings = to_disk_enc->current_settings.get();
-            if (from_settings->keys == to_settings->keys)
+            if (from_settings->all_keys == to_settings->all_keys)
             {
                 /// Keys are the same so we can simply copy the encrypted file.
-                auto wrapped_from_path = wrappedPath(from_path);
+                auto wrapped_from_path = wrappedPath(from_dir);
                 auto to_delegate = to_disk_enc->delegate;
-                auto wrapped_to_path = to_disk_enc->wrappedPath(to_path);
-                delegate->copy(wrapped_from_path, to_delegate, wrapped_to_path);
+                auto wrapped_to_path = to_disk_enc->wrappedPath(to_dir);
+                delegate->copyDirectoryContent(wrapped_from_path, to_delegate, wrapped_to_path, read_settings, write_settings, cancellation_hook);
                 return;
             }
         }
     }
 
     /// Copy the file through buffers with deciphering.
-    copyThroughBuffers(from_path, to_disk, to_path);
+    IDisk::copyDirectoryContent(from_dir, to_disk, to_dir, read_settings, write_settings, cancellation_hook);
 }
 
-std::unique_ptr<ReadBufferFromFileBase> DiskEncrypted::readFile(
-    const String & path,
-    const ReadSettings & settings,
-    std::optional<size_t> size) const
+void DiskEncrypted::copyFile(
+    const String & from_file_path,
+    IDisk & to_disk,
+    const String & to_file_path,
+    const ReadSettings & read_settings,
+    const WriteSettings & write_settings,
+    const std::function<void()> & cancellation_hook)
 {
-    auto wrapped_path = wrappedPath(path);
-    auto buffer = delegate->readFile(wrapped_path, settings, size);
-    if (buffer->eof())
+    /// Check if we can copy the file without deciphering.
+    if (isSameDiskType(*this, to_disk))
     {
-        /// File is empty, that's a normal case, see DiskEncrypted::truncateFile().
-        /// There is no header so we just return `ReadBufferFromString("")`.
-        return std::make_unique<ReadBufferFromFileDecorator>(std::make_unique<ReadBufferFromString>(std::string_view{}), wrapped_path);
-    }
-    auto encryption_settings = current_settings.get();
-    FileEncryption::Header header = readHeader(*buffer);
-    String key = getKey(path, header, *encryption_settings);
-    return std::make_unique<ReadBufferFromEncryptedFile>(settings.local_fs_buffer_size, std::move(buffer), key, header);
-}
-
-std::unique_ptr<WriteBufferFromFileBase> DiskEncrypted::writeFile(const String & path, size_t buf_size, WriteMode mode)
-{
-    auto wrapped_path = wrappedPath(path);
-    FileEncryption::Header header;
-    String key;
-    UInt64 old_file_size = 0;
-    auto settings = current_settings.get();
-    if (mode == WriteMode::Append && exists(path))
-    {
-        old_file_size = getFileSize(path);
-        if (old_file_size)
+        /// Disk type is the same, check if the key is the same too.
+        if (auto * to_disk_enc = typeid_cast<DiskEncrypted *>(&to_disk))
         {
-            /// Append mode: we continue to use the same header.
-            auto read_buffer = delegate->readFile(wrapped_path, ReadSettings().adjustBufferSize(FileEncryption::Header::kSize));
-            header = readHeader(*read_buffer);
-            key = getKey(path, header, *settings);
+            auto from_settings = current_settings.get();
+            auto to_settings = to_disk_enc->current_settings.get();
+            if (from_settings->all_keys == to_settings->all_keys)
+            {
+                /// Keys are the same so we can simply copy the encrypted file.
+                auto wrapped_from_path = wrappedPath(from_file_path);
+                auto to_delegate = to_disk_enc->delegate;
+                auto wrapped_to_path = to_disk_enc->wrappedPath(to_file_path);
+                delegate->copyFile(wrapped_from_path, *to_delegate, wrapped_to_path, read_settings, write_settings, cancellation_hook);
+                return;
+            }
         }
     }
-    if (!old_file_size)
-    {
-        /// Rewrite mode: we generate a new header.
-        key = getCurrentKey(path, *settings);
-        header.algorithm = settings->current_algorithm;
-        header.key_id = settings->current_key_id;
-        header.key_hash = calculateKeyHash(key);
-        header.init_vector = InitVector::random();
-    }
-    auto buffer = delegate->writeFile(wrapped_path, buf_size, mode);
-    return std::make_unique<WriteBufferFromEncryptedFile>(buf_size, std::move(buffer), key, header, old_file_size);
+
+    /// Copy the file through buffers with deciphering.
+    IDisk::copyFile(from_file_path, to_disk, to_file_path, read_settings, write_settings, cancellation_hook);
 }
 
+
+void DiskEncrypted::prepareRead(
+    const String & path,
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint,
+    ReadPipeline & pipeline) const
+{
+    if (read_hint && *read_hint > 0)
+        read_hint = *read_hint + FileEncryption::Header::kSize;
+
+    auto wrapped_path = wrappedPath(path);
+    delegate->prepareRead(wrapped_path, settings, read_hint, pipeline);
+
+    auto encryption_settings = current_settings.get();
+    pipeline.needDecryption(
+        path,
+        settings.local_fs_settings.buffer_size,
+        [encryption_settings](UInt128 key_fingerprint, const String & path_for_logs) -> String
+        {
+            return encryption_settings->findKeyByFingerprint(key_fingerprint, path_for_logs);
+        });
+
+    /// Only cache encryption headers when the backend assigns a fresh blob path to every write
+    /// (`areBlobPathsRandom`): then a rewrite / replace / rename never rebinds an existing path to
+    /// different ciphertext, so the cache can never serve a stale header and needs no invalidation.
+    /// Deterministic-path backends (plain / plain-rewritable, local, web) reuse the path on rewrite
+    /// and are excluded.
+    if (delegate->areBlobPathsRandom())
+    {
+        if (auto global_context = Context::getGlobalContextInstance())
+            if (auto cache = global_context->getEncryptionHeaderCache())
+                pipeline.needEncryptionHeaderCache(std::move(cache));
+    }
+}
 
 size_t DiskEncrypted::getFileSize(const String & path) const
 {
     auto wrapped_path = wrappedPath(path);
     size_t size = delegate->getFileSize(wrapped_path);
     return size > FileEncryption::Header::kSize ? (size - FileEncryption::Header::kSize) : 0;
+}
+
+DirectoryIteratorPtr DiskEncrypted::iterateDirectory(const String & path) const
+{
+    return std::make_unique<DiskEncryptedDirectoryIterator>(delegate->iterateDirectory(wrappedPath(path)), disk_path);
+}
+
+UInt128 DiskEncrypted::getEncryptedFileIV(const String & path) const
+{
+    auto wrapped_path = wrappedPath(path);
+    auto read_buffer = delegate->readFile(wrapped_path, getReadSettings().adjustBufferSize(FileEncryption::Header::kSize));
+    if (read_buffer->eof())
+        return 0;
+    auto header = readHeader(*read_buffer);
+    return header.init_vector.get();
+}
+
+size_t DiskEncrypted::getEncryptedFileSize(size_t unencrypted_size) const
+{
+    if (unencrypted_size)
+        return unencrypted_size + FileEncryption::Header::kSize;
+    return 0;
 }
 
 void DiskEncrypted::truncateFile(const String & path, size_t size)
@@ -319,33 +574,69 @@ SyncGuardPtr DiskEncrypted::getDirectorySyncGuard(const String & path) const
     return delegate->getDirectorySyncGuard(wrapped_path);
 }
 
+std::unordered_map<String, String> DiskEncrypted::getSerializedMetadata(const std::vector<String> & paths) const
+{
+    std::vector<String> wrapped_paths;
+    wrapped_paths.reserve(paths.size());
+    for (const auto & path : paths)
+        wrapped_paths.emplace_back(wrappedPath(path));
+    auto metadata = delegate->getSerializedMetadata(wrapped_paths);
+    std::unordered_map<String, String> res;
+    for (size_t i = 0; i != paths.size(); ++i)
+        res.emplace(paths[i], metadata.at(wrapped_paths.at(i)));
+    return res;
+}
+
 void DiskEncrypted::applyNewSettings(
     const Poco::Util::AbstractConfiguration & config,
-    ContextPtr /*context*/,
+    ContextPtr context,
     const String & config_prefix,
     const DisksMap & disk_map)
 {
     auto new_settings = parseDiskEncryptedSettings(name, config, config_prefix, disk_map);
     if (new_settings->wrapped_disk != delegate)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Сhanging wrapped disk on the fly is not supported. Disk {}", name);
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Changing wrapped disk on the fly is not supported. Disk {}", name);
 
     if (new_settings->disk_path != disk_path)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Сhanging disk path on the fly is not supported. Disk {}", name);
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Changing disk path on the fly is not supported. Disk {}", name);
 
     current_settings.set(std::move(new_settings));
+    IDisk::applyNewSettings(config, context, config_prefix, disk_map);
 }
 
-void registerDiskEncrypted(DiskFactory & factory)
+void registerDiskEncrypted(DiskFactory & factory, bool global_skip_access_check);
+void registerDiskEncrypted(DiskFactory & factory, bool global_skip_access_check)
 {
-    auto creator = [](const String & name,
-                      const Poco::Util::AbstractConfiguration & config,
-                      const String & config_prefix,
-                      ContextPtr /*context*/,
-                      const DisksMap & map) -> DiskPtr
+    auto creator = [global_skip_access_check](
+        const String & name,
+        const Poco::Util::AbstractConfiguration & config,
+        const String & config_prefix,
+        ContextPtr context,
+        const DisksMap & map,
+        bool attach,
+        bool custom_disk) -> DiskPtr
     {
-        return std::make_shared<DiskEncrypted>(name, config, config_prefix, map);
+        bool skip_access_check = config.getBool(config_prefix + ".skip_access_check", false) || global_skip_access_check;
+
+        if (custom_disk && !attach)
+        {
+            DiskPtr wrapped_disk;
+            String path;
+            getDiskAndPathFromConfig(config, config_prefix, map, wrapped_disk, path);
+
+            checkCustomDiskPathIsInsideWrappedDisk(path);
+            if (!wrapped_disk->isRemote())
+                checkCustomLocalDiskPath(wrapped_disk->getPath() + path, context);
+        }
+
+        DiskPtr disk = std::make_shared<DiskEncrypted>(name, config, config_prefix, map);
+        disk->startup(skip_access_check);
+        return disk;
     };
-    factory.registerDiskType("encrypted", creator);
+    factory.registerDiskType("encrypted", creator, Documentation{
+        .description = "Wraps another disk and transparently encrypts and decrypts data using AES, so that data at rest is encrypted on the underlying disk.",
+        .syntax = "disk(type = encrypted, disk = underlying_disk, key = '...')",
+        .related = {"local"}});
 }
 
 }

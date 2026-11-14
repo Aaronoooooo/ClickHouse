@@ -1,6 +1,18 @@
+#if !defined(LEXER_STANDALONE_BUILD)
+
 #include <Parsers/Lexer.h>
-#include <Common/StringUtils/StringUtils.h>
+#include <base/defines.h>
+#include <Common/StringUtils.h>
+#include <Common/UTF8Helpers.h>
 #include <base/find_symbols.h>
+
+#else /// This allows building Lexer without any dependencies or includes for WebAssembly or Emscripten.
+
+#include <Parsers/LexerStandalone.h>
+#include <Parsers/Lexer.h>
+
+#endif
+
 
 namespace DB
 {
@@ -9,8 +21,9 @@ namespace
 {
 
 /// This must be consistent with functions in ReadHelpers.h
-template <char quote, TokenType success_token, TokenType error_token>
-Token quotedString(const char *& pos, const char * const token_begin, const char * const end)
+template <char quote>
+Token quotedString(const char *& pos, const char * const token_begin, const char * const end,
+    TokenType success_token, TokenType error_token)
 {
     ++pos;
     while (true)
@@ -39,8 +52,62 @@ Token quotedString(const char *& pos, const char * const token_begin, const char
             continue;
         }
 
-        __builtin_unreachable();
+        chassert(false);
     }
+}
+
+Token quotedStringWithUnicodeQuotes(const char *& pos, const char * const token_begin, const char * const end,
+    char expected_end_byte, TokenType success_token, TokenType error_token)
+{
+    /// ‘: e2 80 98
+    /// ’: e2 80 99
+    /// “: e2 80 9c
+    /// ”: e2 80 9d
+
+    while (true)
+    {
+        pos = find_first_symbols<'\xE2'>(pos, end);
+        if (pos + 2 >= end)
+            return Token(error_token, token_begin, end);
+
+        if (pos[0] == '\xE2' && pos[1] == '\x80' && pos[2] == expected_end_byte)
+        {
+            pos += 3;
+            return Token(success_token, token_begin, pos);
+        }
+
+        ++pos;
+    }
+}
+
+Token quotedHexOrBinString(const char *& pos, const char * const token_begin, const char * const end)
+{
+    constexpr char quote = '\'';
+
+    chassert(pos[1] == quote);
+
+    bool hex = (*pos == 'x' || *pos == 'X');
+
+    pos += 2;
+
+    if (hex)
+    {
+        while (pos < end && isHexDigit(*pos))
+            ++pos;
+    }
+    else
+    {
+        pos = find_first_not_symbols<'0', '1'>(pos, end);
+    }
+
+    if (pos >= end || *pos != quote)
+    {
+        pos = end;
+        return Token(TokenType::ErrorSingleQuoteIsNotClosed, token_begin, end);
+    }
+
+    ++pos;
+    return Token(TokenType::StringLiteral, token_begin, pos);
 }
 
 }
@@ -49,7 +116,7 @@ Token quotedString(const char *& pos, const char * const token_begin, const char
 Token Lexer::nextToken()
 {
     Token res = nextTokenImpl();
-    if (max_query_size && res.end > begin + max_query_size)
+    if (begin && max_query_size && res.end > begin + max_query_size)
         res.type = TokenType::ErrorMaxQuerySizeExceeded;
     if (res.isSignificant())
         prev_significant_token_type = res.type;
@@ -72,11 +139,11 @@ Token Lexer::nextTokenImpl()
 
     switch (*pos)
     {
-        case ' ': [[fallthrough]];
-        case '\t': [[fallthrough]];
-        case '\n': [[fallthrough]];
-        case '\r': [[fallthrough]];
-        case '\f': [[fallthrough]];
+        case ' ':
+        case '\t':
+        case '\n':
+        case '\r':
+        case '\f':
         case '\v':
         {
             ++pos;
@@ -85,15 +152,15 @@ Token Lexer::nextTokenImpl()
             return Token(TokenType::Whitespace, token_begin, pos);
         }
 
-        case '0': [[fallthrough]];
-        case '1': [[fallthrough]];
-        case '2': [[fallthrough]];
-        case '3': [[fallthrough]];
-        case '4': [[fallthrough]];
-        case '5': [[fallthrough]];
-        case '6': [[fallthrough]];
-        case '7': [[fallthrough]];
-        case '8': [[fallthrough]];
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
         case '9':
         {
             /// The task is not to parse a number or check correctness, but only to skip it.
@@ -104,44 +171,71 @@ Token Lexer::nextTokenImpl()
             if (prev_significant_token_type == TokenType::Dot)
             {
                 ++pos;
-                while (pos < end && isNumericASCII(*pos))
+                while (pos < end && (isNumericASCII(*pos) || isNumberSeparator(false, false, pos, end)))
                     ++pos;
             }
             else
             {
+                bool start_of_block = false;
                 /// 0x, 0b
                 bool hex = false;
                 if (pos + 2 < end && *pos == '0' && (pos[1] == 'x' || pos[1] == 'b' || pos[1] == 'X' || pos[1] == 'B'))
                 {
+                    bool is_valid = false;
                     if (pos[1] == 'x' || pos[1] == 'X')
-                        hex = true;
-                    pos += 2;
+                    {
+                        if (isHexDigit(pos[2]))
+                        {
+                            hex = true;
+                            is_valid = true; // hex
+                        }
+                    }
+                    else if (pos[2] == '0' || pos[2] == '1')
+                        is_valid = true; // bin
+                    if (is_valid)
+                    {
+                        pos += 2;
+                        start_of_block = true;
+                    }
+                    else
+                        ++pos; // consume the leading zero - could be an identifier
                 }
                 else
                     ++pos;
 
-                while (pos < end && (hex ? isHexDigit(*pos) : isNumericASCII(*pos)))
+                while (pos < end && ((hex ? isHexDigit(*pos) : isNumericASCII(*pos)) || isNumberSeparator(start_of_block, hex, pos, end)))
+                {
                     ++pos;
+                    start_of_block = false;
+                }
 
                 /// decimal point
                 if (pos < end && *pos == '.')
                 {
+                    start_of_block = true;
                     ++pos;
-                    while (pos < end && (hex ? isHexDigit(*pos) : isNumericASCII(*pos)))
+                    while (pos < end && ((hex ? isHexDigit(*pos) : isNumericASCII(*pos)) || isNumberSeparator(start_of_block, hex, pos, end)))
+                    {
                         ++pos;
+                        start_of_block = false;
+                    }
                 }
 
                 /// exponentiation (base 10 or base 2)
                 if (pos + 1 < end && (hex ? (*pos == 'p' || *pos == 'P') : (*pos == 'e' || *pos == 'E')))
                 {
+                    start_of_block = true;
                     ++pos;
 
                     /// sign of exponent. It is always decimal.
                     if (pos + 1 < end && (*pos == '-' || *pos == '+'))
                         ++pos;
 
-                    while (pos < end && isNumericASCII(*pos))
+                    while (pos < end && (isNumericASCII(*pos) || isNumberSeparator(start_of_block, false, pos, end)))
+                    {
                         ++pos;
+                        start_of_block = false;
+                    }
                 }
             }
 
@@ -165,11 +259,11 @@ Token Lexer::nextTokenImpl()
         }
 
         case '\'':
-            return quotedString<'\'', TokenType::StringLiteral, TokenType::ErrorSingleQuoteIsNotClosed>(pos, token_begin, end);
+            return quotedString<'\''>(pos, token_begin, end, TokenType::StringLiteral, TokenType::ErrorSingleQuoteIsNotClosed);
         case '"':
-            return quotedString<'"', TokenType::QuotedIdentifier, TokenType::ErrorDoubleQuoteIsNotClosed>(pos, token_begin, end);
+            return quotedString<'"'>(pos, token_begin, end, TokenType::QuotedIdentifier, TokenType::ErrorDoubleQuoteIsNotClosed);
         case '`':
-            return quotedString<'`', TokenType::QuotedIdentifier, TokenType::ErrorBackQuoteIsNotClosed>(pos, token_begin, end);
+            return quotedString<'`'>(pos, token_begin, end, TokenType::QuotedIdentifier, TokenType::ErrorBackQuoteIsNotClosed);
 
         case '(':
             return Token(TokenType::OpeningRoundBracket, token_begin, ++pos);
@@ -200,21 +294,29 @@ Token Lexer::nextTokenImpl()
                     || prev_significant_token_type == TokenType::Number))
                 return Token(TokenType::Dot, token_begin, ++pos);
 
+            bool start_of_block = true;
             ++pos;
-            while (pos < end && isNumericASCII(*pos))
+            while (pos < end && (isNumericASCII(*pos) || isNumberSeparator(start_of_block, false, pos, end)))
+            {
                 ++pos;
+                start_of_block = false;
+            }
 
             /// exponentiation
             if (pos + 1 < end && (*pos == 'e' || *pos == 'E'))
             {
+                start_of_block = true;
                 ++pos;
 
                 /// sign of exponent
                 if (pos + 1 < end && (*pos == '-' || *pos == '+'))
                     ++pos;
 
-                while (pos < end && isNumericASCII(*pos))
+                while (pos < end && (isNumericASCII(*pos) || isNumberSeparator(start_of_block, false, pos, end)))
+                {
                     ++pos;
+                    start_of_block = false;
+                }
             }
 
             return Token(TokenType::Number, token_begin, pos);
@@ -249,36 +351,46 @@ Token Lexer::nextTokenImpl()
                     ++pos;
                     return comment_until_end_of_line();
                 }
-                else
+
+                ++pos;
+
+                /// Nested multiline comments are supported according to the SQL standard.
+                size_t nesting_level = 1;
+
+                while (pos + 2 <= end)
                 {
-                    ++pos;
-
-                    /// Nested multiline comments are supported according to the SQL standard.
-                    size_t nesting_level = 1;
-
-                    while (pos + 2 <= end)
+                    if (pos[0] == '/' && pos[1] == '*')
                     {
-                        if (pos[0] == '/' && pos[1] == '*')
-                        {
-                            pos += 2;
-                            ++nesting_level;
-                        }
-                        else if (pos[0] == '*' && pos[1] == '/')
-                        {
-                            pos += 2;
-                            --nesting_level;
-
-                            if (nesting_level == 0)
-                                return Token(TokenType::Comment, token_begin, pos);
-                        }
-                        else
-                            ++pos;
+                        pos += 2;
+                        ++nesting_level;
                     }
-                    pos = end;
-                    return Token(TokenType::ErrorMultilineCommentIsNotClosed, token_begin, pos);
+                    else if (pos[0] == '*' && pos[1] == '/')
+                    {
+                        pos += 2;
+                        --nesting_level;
+
+                        if (nesting_level == 0)
+                            return Token(TokenType::Comment, token_begin, pos);
+                    }
+                    else
+                        ++pos;
                 }
+                pos = end;
+                return Token(TokenType::ErrorMultilineCommentIsNotClosed, token_begin, pos);
             }
             return Token(TokenType::Slash, token_begin, pos);
+        }
+        case '#':   /// start of single line comment, MySQL style
+        {           /// PostgreSQL has some operators using '#' character.
+                    /// For less ambiguity, we will recognize a comment only if # is followed by whitespace.
+                    /// or #! as a special case for "shebang".
+                    /// #hello - not a comment
+                    /// # hello - a comment
+                    /// #!/usr/bin/clickhouse-local --queries-file - a comment
+            ++pos;
+            if (pos < end && (*pos == ' ' || *pos == '!'))
+                return comment_until_end_of_line();
+            return Token(TokenType::Error, token_begin, pos);
         }
         case '%':
             return Token(TokenType::Percent, token_begin, ++pos);
@@ -289,16 +401,35 @@ Token Lexer::nextTokenImpl()
                 ++pos;
             return Token(TokenType::Equals, token_begin, pos);
         }
-        case '!':   /// !=
+        case '!':   /// !=, !~, !~*
         {
             ++pos;
             if (pos < end && *pos == '=')
                 return Token(TokenType::NotEquals, token_begin, ++pos);
+            if (pos < end && *pos == '~')
+            {
+                ++pos;
+                if (pos < end && *pos == '*')
+                    return Token(TokenType::NotTildeAsterisk, token_begin, ++pos);
+                return Token(TokenType::NotTilde, token_begin, pos);
+            }
             return Token(TokenType::ErrorSingleExclamationMark, token_begin, pos);
         }
-        case '<':   /// <, <=, <>
+        case '~':   /// ~, ~* - regular expression match operators, PostgreSQL-style
         {
             ++pos;
+            if (pos < end && *pos == '*')
+                return Token(TokenType::TildeAsterisk, token_begin, ++pos);
+            return Token(TokenType::Tilde, token_begin, pos);
+        }
+        case '<':   /// <, <=, <>, <=>
+        {
+            ++pos;
+            if (pos + 1 < end && *pos == '=' && *(pos + 1) == '>')
+            {
+                pos += 2;
+                return Token(TokenType::Spaceship, token_begin, pos);
+            }
             if (pos < end && *pos == '=')
                 return Token(TokenType::LessOrEquals, token_begin, ++pos);
             if (pos < end && *pos == '>')
@@ -314,6 +445,8 @@ Token Lexer::nextTokenImpl()
         }
         case '?':
             return Token(TokenType::QuestionMark, token_begin, ++pos);
+        case '^':
+            return Token(TokenType::Caret, token_begin, ++pos);
         case ':':
         {
             ++pos;
@@ -326,7 +459,9 @@ Token Lexer::nextTokenImpl()
             ++pos;
             if (pos < end && *pos == '|')
                 return Token(TokenType::Concatenation, token_begin, ++pos);
-            return Token(TokenType::ErrorSinglePipeMark, token_begin, pos);
+            if (pos < end && *pos == '>')
+                return Token(TokenType::PipeOperator, token_begin, ++pos);
+            return Token(TokenType::PipeMark, token_begin, pos);
         }
         case '@':
         {
@@ -335,36 +470,76 @@ Token Lexer::nextTokenImpl()
                 return Token(TokenType::DoubleAt, token_begin, ++pos);
             return Token(TokenType::At, token_begin, pos);
         }
-
+        case '\\':
+        {
+            ++pos;
+            if (pos < end && *pos == 'G')
+                return Token(TokenType::VerticalDelimiter, token_begin, ++pos);
+            return Token(TokenType::Error, token_begin, pos);
+        }
+        case '\xE2':
+        {
+            /// Mathematical minus symbol, UTF-8
+            if (pos + 3 <= end && pos[1] == '\x88' && pos[2] == '\x92')
+            {
+                pos += 3;
+                return Token(TokenType::Minus, token_begin, pos);
+            }
+            /// Unicode quoted string, ‘Hello’ or “World”.
+            if (pos + 5 < end && pos[0] == '\xE2' && pos[1] == '\x80' && (pos[2] == '\x98' || pos[2] == '\x9C'))
+            {
+                const char expected_end_byte = pos[2] + 1;
+                TokenType success_token = pos[2] == '\x98' ? TokenType::StringLiteral : TokenType::QuotedIdentifier;
+                TokenType error_token = pos[2] == '\x98' ? TokenType::ErrorSingleQuoteIsNotClosed : TokenType::ErrorDoubleQuoteIsNotClosed;
+                pos += 3;
+                return quotedStringWithUnicodeQuotes(pos, token_begin, end, expected_end_byte, success_token, error_token);
+            }
+            /// Other characters starting at E2 can be parsed, see skipWhitespacesUTF8
+            [[fallthrough]];
+        }
         default:
             if (*pos == '$')
             {
-                /// Try to capture dollar sign as start of here doc
+                /// Try to capture a dollar sign as a start of heredoc
 
-                std::string_view token_stream(pos, end - pos);
-                auto heredoc_name_end_position = token_stream.find('$', 1);
-                if (heredoc_name_end_position != std::string::npos)
+                const char * tag_end = find_first_symbols<'$'>(pos + 1, end);
+                if (tag_end != end)
                 {
-                    size_t heredoc_size = heredoc_name_end_position + 1;
-                    std::string_view heredoc = {token_stream.data(), heredoc_size};
+                    size_t heredoc_size = tag_end + 1 - pos;
 
-                    size_t heredoc_end_position = token_stream.find(heredoc, heredoc_size);
-                    if (heredoc_end_position != std::string::npos)
+                    bool is_valid_name = true;
+                    for (const char * name_pos = pos + 1; name_pos < tag_end; ++name_pos)
                     {
+                        if (!isWordCharASCII(*name_pos))
+                        {
+                            is_valid_name = false;
+                            break;
+                        }
+                    }
 
-                        pos += heredoc_end_position;
-                        pos += heredoc_size;
-
-                        return Token(TokenType::HereDoc, token_begin, pos);
+                    if (is_valid_name)
+                    {
+                        size_t heredoc_end_position = std::string_view{tag_end + 1, end}.find(std::string_view{pos, heredoc_size});
+                        if (heredoc_end_position != std::string::npos)
+                        {
+                            pos = tag_end + 1 + heredoc_end_position + heredoc_size;
+                            return Token(TokenType::HereDoc, token_begin, pos);
+                        }
                     }
                 }
 
                 if (((pos + 1 < end && !isWordCharASCII(pos[1])) || pos + 1 == end))
                 {
-                    /// Capture standalone dollar sign
+                    /// Capture a standalone dollar sign
                     return Token(TokenType::DollarSign, token_begin, ++pos);
                 }
             }
+
+            if (pos + 2 < end && pos[1] == '\'' && (*pos == 'x' || *pos == 'b' || *pos == 'X' || *pos == 'B'))
+            {
+                return quotedHexOrBinString(pos, token_begin, end);
+            }
+
             if (isWordCharASCII(*pos) || *pos == '$')
             {
                 ++pos;
@@ -372,18 +547,21 @@ Token Lexer::nextTokenImpl()
                     ++pos;
                 return Token(TokenType::BareWord, token_begin, pos);
             }
-            else
-            {
-                /// We will also skip unicode whitespaces in UTF-8 to support for queries copy-pasted from MS Word and similar.
-                pos = skipWhitespacesUTF8(pos, end);
-                if (pos > token_begin)
-                    return Token(TokenType::Whitespace, token_begin, pos);
-                else
-                    return Token(TokenType::Error, token_begin, ++pos);
-            }
+
+            /// We will also skip unicode whitespaces in UTF-8 to support for queries copy-pasted from MS Word and similar.
+            pos = skipWhitespacesUTF8(pos, end);
+            if (pos > token_begin)
+                return Token(TokenType::Whitespace, token_begin, pos);
+
+            ++pos;
+            while (pos < end && UTF8::isContinuationOctet(*pos))
+                ++pos;
+
+            return Token(TokenType::Error, token_begin, pos);
     }
 }
 
+#if !defined(LEXER_STANDALONE_BUILD)
 
 const char * getTokenName(TokenType type)
 {
@@ -394,8 +572,6 @@ const char * getTokenName(TokenType type)
 APPLY_FOR_TOKENS(M)
 #undef M
     }
-
-    __builtin_unreachable();
 }
 
 
@@ -414,16 +590,57 @@ const char * getErrorTokenDescription(TokenType type)
         case TokenType::ErrorBackQuoteIsNotClosed:
             return "Back quoted string is not closed";
         case TokenType::ErrorSingleExclamationMark:
-            return "Exclamation mark can only occur in != operator";
+            return "Exclamation mark can only occur in !=, !~ and !~* operators";
         case TokenType::ErrorSinglePipeMark:
             return "Pipe symbol could only occur in || operator";
         case TokenType::ErrorWrongNumber:
             return "Wrong number";
         case TokenType::ErrorMaxQuerySizeExceeded:
-            return "Max query size exceeded";
+            return "Max query size exceeded (can be increased with the `max_query_size` setting)";
         default:
             return "Not an error";
     }
 }
+
+#else
+
+#include <Parsers/clickhouse_lexer.h>
+
+extern "C"
+{
+
+size_t clickhouse_lexer_size = sizeof(Lexer);
+
+void clickhouse_lexer_create(void * ptr, const char * begin, const char * end, size_t max_query_size)
+{
+    new(ptr) Lexer(begin, end, max_query_size);
+}
+
+unsigned char clickhouse_lexer_next_token(void * ptr, const char ** out_token_begin, const char ** out_token_end)
+{
+    Token res = reinterpret_cast<Lexer *>(ptr)->nextToken();
+    *out_token_begin = res.begin;
+    *out_token_end = res.end;
+    return static_cast<unsigned char>(res.type);
+}
+
+int clickhouse_lexer_token_is_significant(unsigned char token)
+{
+    return token != static_cast<unsigned char>(TokenType::Whitespace) && token != static_cast<unsigned char>(TokenType::Comment);
+}
+
+int clickhouse_lexer_token_is_error(unsigned char token)
+{
+    return token > static_cast<unsigned char>(TokenType::EndOfStream);
+}
+
+int clickhouse_lexer_token_is_end(unsigned char token)
+{
+    return token == static_cast<unsigned char>(TokenType::EndOfStream);
+}
+
+}
+
+#endif
 
 }

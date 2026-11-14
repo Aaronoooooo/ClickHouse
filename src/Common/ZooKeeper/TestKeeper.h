@@ -3,13 +3,14 @@
 #include <mutex>
 #include <map>
 #include <atomic>
-#include <thread>
 #include <chrono>
 
 #include <Poco/Timespan.h>
 #include <Common/ZooKeeper/IKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperArgs.h>
 #include <Common/ThreadPool.h>
 #include <Common/ConcurrentBoundedQueue.h>
+#include <Common/ZooKeeper/KeeperFeatureFlags.h>
 
 
 namespace Coordination
@@ -33,12 +34,18 @@ using TestKeeperRequestPtr = std::shared_ptr<TestKeeperRequest>;
 class TestKeeper final : public IKeeper
 {
 public:
-    TestKeeper(const String & root_path_, Poco::Timespan operation_timeout_);
+    explicit TestKeeper(const zkutil::ZooKeeperArgs & args_);
     ~TestKeeper() override;
 
     bool isExpired() const override { return expired; }
+    silk::FiberEvent & getExpiredEvent() override;
+    std::optional<int8_t> getConnectedNodeIdx() const override { return 0; }
+    String getConnectedHostPort() const override { return "TestKeeper:0000"; }
+    int64_t getConnectionXid() const override { return 0; }
     int64_t getSessionID() const override { return 0; }
-
+    int64_t getLastZXIDSeen() const override { return 0; }
+    bool isFeatureEnabled(DB::KeeperFeatureFlag flag) const override { return keeper_feature_flags.isEnabled(flag); }
+    const DB::KeeperFeatureFlags * getKeeperFeatureFlags() const override { return &keeper_feature_flags; }
 
     void create(
             const String & path,
@@ -53,35 +60,71 @@ public:
             int32_t version,
             RemoveCallback callback) override;
 
+    void removeRecursive(
+        const String & path,
+        uint32_t remove_nodes_limit,
+        RemoveRecursiveCallback callback) override;
+
+    void listRecursive(
+        const String & path,
+        uint32_t get_children_recursive_nodes_limit,
+        ListRecursiveCallback callback) override;
+
+    void listWithOptions(
+        const String & path,
+        const ListOptions & options,
+        ListWithOptionsCallback callback,
+        WatchCallbackPtrOrEventPtr watch) override;
+
     void exists(
-            const String & path,
-            ExistsCallback callback,
-            WatchCallback watch) override;
+        const String & path,
+        ExistsCallback callback,
+        WatchCallbackPtrOrEventPtr watch) override;
 
     void get(
-            const String & path,
-            GetCallback callback,
-            WatchCallback watch) override;
+        const String & path,
+        GetCallback callback,
+        WatchCallbackPtrOrEventPtr watch) override;
 
     void set(
-            const String & path,
-            const String & data,
-            int32_t version,
-            SetCallback callback) override;
+        const String & path,
+        const String & data,
+        int32_t version,
+        SetCallback callback) override;
 
     void list(
-            const String & path,
-            ListCallback callback,
-            WatchCallback watch) override;
+        const String & path,
+        ListRequestType list_request_type,
+        ListCallback callback,
+        WatchCallbackPtrOrEventPtr watch,
+        bool with_stat,
+        bool with_data) override;
 
     void check(
-            const String & path,
-            int32_t version,
-            CheckCallback callback) override;
+        const String & path,
+        int32_t version,
+        CheckCallback callback) override;
+
+    void sync(
+        const String & path,
+        SyncCallback callback) override;
+
+    void reconfig(
+        std::string_view joining,
+        std::string_view leaving,
+        std::string_view new_members,
+        int32_t version,
+        ReconfigCallback callback) final;
 
     void multi(
-            const Requests & requests,
-            MultiCallback callback) override;
+        const Requests & requests,
+        MultiCallback callback) override;
+
+    void multi(
+        std::span<const RequestPtr> requests,
+        MultiCallback callback) override;
+
+    void getACL(const String & path, GetACLCallback callback) override;
 
     void finalize(const String & reason) override;
 
@@ -91,14 +134,22 @@ public:
         ACLs acls;
         bool is_ephemeral = false;
         bool is_sequental = false;
+        bool is_ttl = false;
+        int64_t ttl = 0;
         Stat stat{};
         int32_t seq_num = 0;
     };
 
     using Container = std::map<std::string, Node>;
 
-    using WatchCallbacks = std::vector<WatchCallback>;
-    using Watches = std::map<String /* path, relative of root_path */, WatchCallbacks>;
+    /// The callbacks of a path's list requests with children stats or data, and their children filter: `ALL` if they differ.
+    struct ListWithDataWatch
+    {
+        WatchCallbacks callbacks;
+        ListRequestType filter = ListRequestType::ALL;
+    };
+
+    using ListWithDataWatches = std::map<String, ListWithDataWatch>;
 
 private:
     using clock = std::chrono::steady_clock;
@@ -107,30 +158,34 @@ private:
     {
         TestKeeperRequestPtr request;
         ResponseCallback callback;
-        WatchCallback watch;
+        WatchCallbackPtrOrEventPtr watch;
         clock::time_point time;
     };
 
     Container container;
 
-    String root_path;
-    ACLs default_acls;
-
-    Poco::Timespan operation_timeout;
+    zkutil::ZooKeeperArgs args;
 
     std::mutex push_request_mutex;
     std::atomic<bool> expired{false};
 
     int64_t zxid = 0;
+    DB::KeeperFeatureFlags keeper_feature_flags;
 
     Watches watches;
-    Watches list_watches;   /// Watches for 'list' request (watches on children).
+    Watches list_watches; /// Watches for 'list' request (watches on children).
+    /// Same for a 'list' request with children stats or data: also fires on a child's data change.
+    ListWithDataWatches list_with_data_watches;
+
+    int64_t last_ttl_cleanup_ms = 0;
 
     using RequestsQueue = ConcurrentBoundedQueue<RequestInfo>;
     RequestsQueue requests_queue{1};
 
     void pushRequest(RequestInfo && request);
+    void exprireRequest(RequestInfo && request);
 
+    void clearExpiredTTLNodes();
 
     ThreadFromGlobalPool processing_thread;
 
@@ -138,4 +193,3 @@ private:
 };
 
 }
-

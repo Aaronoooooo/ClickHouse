@@ -1,4 +1,4 @@
-#include "config_functions.h"
+#include "config.h"
 
 #if USE_S2_GEOMETRY
 
@@ -11,7 +11,7 @@
 #include <Common/NaNUtils.h>
 #include <base/range.h>
 
-#include "s2_fwd.h"
+#include <Functions/s2_fwd.h>
 
 namespace DB
 {
@@ -20,6 +20,7 @@ namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int BAD_ARGUMENTS;
+    extern const int ILLEGAL_COLUMN;
 }
 
 namespace
@@ -35,7 +36,7 @@ namespace
  *
  * This function returns whether a cap contains a point.
  */
-class FunctionS2CapContains : public IFunction
+class FunctionS2CapContains final : public IFunction
 {
 public:
     static constexpr auto name = "s2CapContains";
@@ -53,61 +54,82 @@ public:
     size_t getNumberOfArguments() const override { return 3; }
 
     bool useDefaultImplementationForConstants() const override { return true; }
+    /// A `LowCardinality` dictionary always holds the type's default value at index 0, even when no
+    /// row references it, and `0` is not a valid S2 cell id, so executing on the whole dictionary
+    /// would fail on entirely valid data.
+    bool canBeExecutedOnDefaultArguments() const override { return false; }
 
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    String getSignatureString() const override
     {
-        for (size_t index = 0; index < getNumberOfArguments(); ++index)
-        {
-            const auto * arg = arguments[index].get();
+        return "(UInt64, Float64, UInt64) -> UInt8";
+    }
 
-            /// Radius
-            if (index == 1)
-            {
-                if (!WhichDataType(arg).isFloat64())
-                    throw Exception(
-                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                        "Illegal type {} of argument {} of function {}. Must be Float64",
-                        arg->getName(), 2, getName());
-            }
-            else if (!WhichDataType(arg).isUInt64())
-                throw Exception(
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                    "Illegal type {} of argument {} of function {}. Must be UInt64",
-                    arg->getName(), index + 1, getName());
-        }
-
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
         return std::make_shared<DataTypeUInt8>();
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
-        const auto * col_center = arguments[0].column.get();
-        const auto * col_degrees = arguments[1].column.get();
-        const auto * col_point = arguments[2].column.get();
+        auto non_const_arguments = arguments;
+        for (auto & argument : non_const_arguments)
+            argument.column = argument.column->convertToFullColumnIfConst();
+
+        const auto * col_center = checkAndGetColumn<ColumnUInt64>(non_const_arguments[0].column.get());
+        if (!col_center)
+            throw Exception(
+                ErrorCodes::ILLEGAL_COLUMN,
+                "Illegal type {} of argument {} of function {}. Must be UInt64",
+                arguments[0].type->getName(),
+                1,
+                getName());
+        const auto & data_center = col_center->getData();
+
+        const auto * col_degrees = checkAndGetColumn<ColumnFloat64>(non_const_arguments[1].column.get());
+        if (!col_degrees)
+            throw Exception(
+                ErrorCodes::ILLEGAL_COLUMN,
+                "Illegal type {} of argument {} of function {}. Must be Float64",
+                arguments[1].type->getName(),
+                2,
+                getName());
+        const auto & data_degrees = col_degrees->getData();
+
+
+        const auto * col_point = checkAndGetColumn<ColumnUInt64>(non_const_arguments[2].column.get());
+        if (!col_point)
+            throw Exception(
+                ErrorCodes::ILLEGAL_COLUMN,
+                "Illegal type {} of argument {} of function {}. Must be UInt64",
+                arguments[2].type->getName(),
+                3,
+                getName());
+        const auto & data_point = col_point->getData();
+
 
         auto dst = ColumnUInt8::create();
         auto & dst_data = dst->getData();
         dst_data.reserve(input_rows_count);
 
-        for (const auto row : collections::range(0, input_rows_count))
+        for (size_t row = 0; row < input_rows_count; ++row)
         {
-            const auto center = S2CellId(col_center->getUInt(row));
-            const Float64 degrees = col_degrees->getFloat64(row);
-            const auto point = S2CellId(col_point->getUInt(row));
+            const auto center = S2CellId(data_center[row]);
+            const Float64 degrees = data_degrees[row];
+            const auto point = S2CellId(data_point[row]);
 
             if (isNaN(degrees))
-                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Radius of the cap must not be nan");
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Radius of the cap must not be nan in function {}", getName());
 
             if (std::isinf(degrees))
-                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Radius of the cap must not be infinite");
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Radius of the cap must not be infinite in function {}", getName());
 
             if (!center.is_valid())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Center is not valid");
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Center (id {}) is not valid in function {}", data_center[row], getName());
 
             if (!point.is_valid())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Point is not valid");
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Point (id {}) is not valid in function {}", data_point[row], getName());
 
             S1Angle angle = S1Angle::Degrees(degrees);
             S2Cap cap(center.ToPoint(), angle);
@@ -121,9 +143,24 @@ public:
 
 }
 
-void registerFunctionS2CapContains(FunctionFactory & factory)
+REGISTER_FUNCTION(S2CapContains)
 {
-    factory.registerFunction<FunctionS2CapContains>();
+    FunctionDocumentation::Description description = R"(
+Determines if an S2 cap contains an S2 point. A cap represents a portion of the sphere that has been cut off by a plane. It is defined by a center point and a radius in degrees.
+    )";
+    FunctionDocumentation::Syntax syntax = "s2CapContains(center, degrees, point)";
+    FunctionDocumentation::Arguments arguments = {
+        {"center", "S2 cell identifier of the cap center point.", {"UInt64"}},
+        {"degrees", "Radius of the cap in degrees.", {"Float64"}},
+        {"point", "S2 cell identifier of the point to test.", {"UInt64"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns 1 if the cap contains the point and 0 otherwise.", {"UInt8"}};
+    FunctionDocumentation::Examples examples = {{"Basic usage", "SELECT s2CapContains(1157339245694594829, 1.0, 1157347770437378819)", "1"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {21, 9};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Geo;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionS2CapContains>(documentation);
 }
 
 

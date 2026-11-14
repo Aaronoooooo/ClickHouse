@@ -2,10 +2,15 @@
 
 #include <Parsers/ASTQueryWithOutput.h>
 
+namespace Poco::JSON { class Object; }
 
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+}
 
 /// AST, EXPLAIN or other query with meaning of explanation query instead of execution
 class ASTExplainQuery : public ASTQueryWithOutput
@@ -15,59 +20,15 @@ public:
     {
         ParsedAST, /// 'EXPLAIN AST SELECT ...'
         AnalyzedSyntax, /// 'EXPLAIN SYNTAX SELECT ...'
+        QueryTree, /// 'EXPLAIN QUERY TREE SELECT ...'
         QueryPlan, /// 'EXPLAIN SELECT ...'
         QueryPipeline, /// 'EXPLAIN PIPELINE ...'
         QueryEstimates, /// 'EXPLAIN ESTIMATE ...'
+        TableOverride, /// 'EXPLAIN TABLE OVERRIDE ...'
+        CurrentTransaction, /// 'EXPLAIN CURRENT TRANSACTION'
+        Analyze, /// EXPLAIN ANALYZE ...
+        WhatIf, /// 'EXPLAIN WHATIF SELECT ...'
     };
-
-    explicit ASTExplainQuery(ExplainKind kind_) : kind(kind_) {}
-
-    String getID(char delim) const override { return "Explain" + (delim + toString(kind)); }
-    ExplainKind getKind() const { return kind; }
-    ASTPtr clone() const override
-    {
-        auto res = std::make_shared<ASTExplainQuery>(*this);
-        res->children.clear();
-        res->children.push_back(children[0]->clone());
-        cloneOutputOptions(*res);
-        return res;
-    }
-
-    void setExplainedQuery(ASTPtr query_)
-    {
-        children.emplace_back(query_);
-        query = std::move(query_);
-    }
-
-    void setSettings(ASTPtr settings_)
-    {
-        children.emplace_back(settings_);
-        ast_settings = std::move(settings_);
-    }
-
-    const ASTPtr & getExplainedQuery() const { return query; }
-    const ASTPtr & getSettings() const { return ast_settings; }
-
-protected:
-    void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
-    {
-        settings.ostr << (settings.hilite ? hilite_keyword : "") << toString(kind) << (settings.hilite ? hilite_none : "");
-
-        if (ast_settings)
-        {
-            settings.ostr << ' ';
-            ast_settings->formatImpl(settings, state, frame);
-        }
-
-        settings.ostr << settings.nl_or_ws;
-        query->formatImpl(settings, state, frame);
-    }
-
-private:
-    ExplainKind kind;
-
-    ASTPtr query;
-    ASTPtr ast_settings;
 
     static String toString(ExplainKind kind)
     {
@@ -75,13 +36,216 @@ private:
         {
             case ParsedAST: return "EXPLAIN AST";
             case AnalyzedSyntax: return "EXPLAIN SYNTAX";
+            case QueryTree: return "EXPLAIN QUERY TREE";
             case QueryPlan: return "EXPLAIN";
             case QueryPipeline: return "EXPLAIN PIPELINE";
             case QueryEstimates: return "EXPLAIN ESTIMATE";
+            case TableOverride: return "EXPLAIN TABLE OVERRIDE";
+            case CurrentTransaction: return "EXPLAIN CURRENT TRANSACTION";
+            case Analyze: return "EXPLAIN ANALYZE";
+            case WhatIf: return "EXPLAIN WHATIF";
+        }
+    }
+
+    static ExplainKind fromString(const String & str)
+    {
+        if (str == "EXPLAIN AST")
+            return ParsedAST;
+        if (str == "EXPLAIN SYNTAX")
+            return AnalyzedSyntax;
+        if (str == "EXPLAIN QUERY TREE")
+            return QueryTree;
+        if (str == "EXPLAIN" || str == "EXPLAIN PLAN")
+            return QueryPlan;
+        if (str == "EXPLAIN PIPELINE")
+            return QueryPipeline;
+        if (str == "EXPLAIN ESTIMATE")
+            return QueryEstimates;
+        if (str == "EXPLAIN TABLE OVERRIDE")
+            return TableOverride;
+        if (str == "EXPLAIN CURRENT TRANSACTION")
+            return CurrentTransaction;
+        if (str == "EXPLAIN ANALYZE")
+            return Analyze;
+        if (str == "EXPLAIN WHATIF")
+            return WhatIf;
+
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown explain kind '{}'", str);
+    }
+
+    explicit ASTExplainQuery(ExplainKind kind_) : kind(kind_) {}
+
+    String getID(char delim) const override { return "Explain" + (delim + toString(kind)); }
+    ExplainKind getKind() const { return kind; }
+    ASTPtr clone() const override
+    {
+        auto res = make_intrusive<ASTExplainQuery>(*this);
+
+        /// Re-add the named children explicitly, in the same order `ParserExplainQuery`
+        /// produces them, so that the clone has the same `getTreeHash` as a freshly parsed
+        /// AST. The parser parses the EXPLAIN-level settings before the explained query
+        /// (e.g. `EXPLAIN header = 1 SELECT 1` is parsed as `children = [ast_settings, query]`),
+        /// so `ast_settings` must come before `query`.
+        res->children.clear();
+        res->query = nullptr;
+        res->ast_settings = nullptr;
+        res->table_function = nullptr;
+        res->table_override = nullptr;
+
+        if (ast_settings)
+            res->setSettings(ast_settings->clone(), settings_text);
+        if (query)
+            res->setExplainedQuery(query->clone());
+        if (table_function)
+            res->setTableFunction(table_function->clone());
+        if (table_override)
+            res->setTableOverride(table_override->clone());
+
+        cloneOutputOptions(*res);
+        return res;
+    }
+
+    void setExplainKind(ExplainKind kind_) { kind = kind_; }
+
+    void setExplainedQuery(ASTPtr query_)
+    {
+        children.emplace_back(query_);
+        query = std::move(query_);
+    }
+
+    /** `settings_text_` is the SETTINGS clause as written in the query, which only the parser knows.
+      * `ParserSubquery` rewrites `(EXPLAIN <kind> <settings> SELECT ...)` into
+      * `viewExplain('<kind>', '<settings>', (SELECT ...))`, which needs the settings as a string,
+      * and a build with no formatter has nowhere else to get one - see `astText`.
+      */
+    void setSettings(ASTPtr settings_, String settings_text_ = {})
+    {
+        children.emplace_back(settings_);
+        ast_settings = std::move(settings_);
+        settings_text = std::move(settings_text_);
+    }
+
+    void setTableFunction(ASTPtr table_function_)
+    {
+        children.emplace_back(table_function_);
+        table_function = std::move(table_function_);
+    }
+
+    void setTableOverride(ASTPtr table_override_)
+    {
+        children.emplace_back(table_override_);
+        table_override = std::move(table_override_);
+    }
+
+    const ASTPtr & getExplainedQuery() const { return query; }
+
+    /// Replace the explained query, keeping the `children` entry in sync (the explained query is
+    /// stored both in `query` and in `children`, see `setExplainedQuery`).
+    void replaceExplainedQuery(ASTPtr query_)
+    {
+        for (auto & child : children)
+        {
+            if (child == query)
+            {
+                child = query_;
+                break;
+            }
+        }
+        query = std::move(query_);
+    }
+
+    const ASTPtr & getSettings() const { return ast_settings; }
+    /// Empty unless this query came from the parser - see `setSettings`.
+    const String & getSettingsText() const { return settings_text; }
+    const ASTPtr & getTableFunction() const { return table_function; }
+    const ASTPtr & getTableOverride() const { return table_override; }
+
+    QueryKind getQueryKind() const override { return QueryKind::Explain; }
+
+    void writeJSON(WriteBuffer & out) const override;
+    void readJSON(const Poco::JSON::Object & json) override;
+
+protected:
+    void formatQueryImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
+    {
+        ostr << toString(kind);
+
+        if (ast_settings)
+        {
+            ostr << ' ';
+            ast_settings->format(ostr, settings, state, frame);
         }
 
-        __builtin_unreachable();
+        if (query)
+        {
+            ostr << settings.nl_or_ws;
+
+            /// Trailing output options belong to the EXPLAIN only if the inner query cannot take them on re-parse.
+            /// EXPLAIN AST accepts any parenthesized query except one the subquery parser reads; other kinds parenthesize only a SELECT.
+            bool need_parens = false;
+            if (frame.has_trailing_output_options)
+            {
+                const auto inner_kind = query->getQueryKind();
+                const auto * inner_output = dynamic_cast<const ASTQueryWithOutput *>(query.get());
+                if (kind == ParsedAST)
+                {
+                    bool parsed_as_subquery = inner_kind == QueryKind::Select;
+                    if (const auto * inner_explain = query->as<ASTExplainQuery>())
+                    {
+                        const auto & explained = inner_explain->getExplainedQuery();
+                        parsed_as_subquery = inner_explain->getKind() == ParsedAST || !explained
+                            || explained->getQueryKind() == QueryKind::Select;
+                    }
+                    need_parens = !inner_output || !parsed_as_subquery;
+                    /// A bare inner query takes INTO OUTFILE only if it has no output options, FORMAT or SETTINGS only if it lacks that clause.
+                    if (!need_parens)
+                    {
+                        if (out_file)
+                            need_parens = !inner_output->hasOutputOptions();
+                        else if (format_ast)
+                            need_parens = !inner_output->format_ast;
+                        else if (settings_ast)
+                            need_parens = !inner_output->settings_ast;
+                    }
+                }
+                else
+                    need_parens = !inner_output && inner_kind == QueryKind::Select;
+            }
+
+            if (need_parens)
+            {
+                FormatStateStacked frame_nested = frame;
+                frame_nested.parent_has_trailing_settings = false;
+                frame_nested.has_trailing_output_options = false;
+                ostr << "(";
+                query->format(ostr, settings, state, frame_nested);
+                ostr << ")";
+            }
+            else
+                query->format(ostr, settings, state, frame);
+        }
+        if (table_function)
+        {
+            ostr << settings.nl_or_ws;
+            table_function->format(ostr, settings, state, frame);
+        }
+        if (table_override)
+        {
+            ostr << settings.nl_or_ws;
+            table_override->format(ostr, settings, state, frame);
+        }
     }
+
+private:
+    ExplainKind kind;
+
+    ASTPtr query;
+    ASTPtr ast_settings;
+    String settings_text;
+
+    /// Used by EXPLAIN TABLE OVERRIDE
+    ASTPtr table_function;
+    ASTPtr table_override;
 };
 
 }

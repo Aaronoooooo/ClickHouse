@@ -3,7 +3,7 @@
 #include <Functions/FunctionHelpers.h>
 #include <Functions/IFunction.h>
 #include <base/find_symbols.h>
-#include <Common/StringUtils/StringUtils.h>
+#include <Common/StringUtils.h>
 
 
 /** A function to extract text from HTML or XHTML.
@@ -53,7 +53,7 @@
   *
   * Usage example:
   *
-  * SELECT extractTextFromHTML(html) FROM url('https://yandex.ru/', RawBLOB, 'html String')
+  * SELECT extractTextFromHTML(html) FROM url('https://github.com/ClickHouse/ClickHouse', RawBLOB, 'html String')
   *
   * - ClickHouse has embedded web browser.
   */
@@ -64,22 +64,21 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
 }
 
 namespace
 {
 
-inline bool startsWith(const char * s, const char * end, const char * prefix)
+inline bool startsWith(const char * s, const char * end, const std::string_view prefix)
 {
-    return s + strlen(prefix) < end && 0 == memcmp(s, prefix, strlen(prefix));
+    return s + prefix.length() < end && 0 == memcmp(s, prefix.data(), prefix.length());
 }
 
-inline bool checkAndSkip(const char * __restrict & s, const char * end, const char * prefix)
+inline bool checkAndSkip(const char * __restrict & s, const char * end, const std::string_view prefix)
 {
     if (startsWith(s, end, prefix))
     {
-        s += strlen(prefix);
+        s += prefix.length();
         return true;
     }
     return false;
@@ -138,7 +137,7 @@ bool processCDATA(const char * __restrict & src, const char * end, char * __rest
     return true;
 }
 
-bool processElementAndSkipContent(const char * __restrict & src, const char * end, const char * tag_name)
+bool processElementAndSkipContent(const char * __restrict & src, const char * end, const std::string_view tag_name)
 {
     const auto * old_src = src;
 
@@ -291,7 +290,7 @@ size_t extract(const char * __restrict src, size_t size, char * __restrict dst)
 }
 
 
-class FunctionExtractTextFromHTML : public IFunction
+class FunctionExtractTextFromHTML final : public IFunction
 {
 public:
     static constexpr auto name = "extractTextFromHTML";
@@ -302,19 +301,16 @@ public:
     bool useDefaultImplementationForConstants() const override { return true; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    String getSignatureString() const override
     {
-        if (!isString(arguments[0]))
-            throw Exception(
-                "Illegal type " + arguments[0]->getName() + " of argument of function " + getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-        return arguments[0];
+        return "(String) -> String";
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t rows) const override
     {
         const ColumnString * src = checkAndGetColumn<ColumnString>(arguments[0].column.get());
         if (!src)
-             throw Exception("First argument for function " + getName() + " must be string.", ErrorCodes::ILLEGAL_COLUMN);
+             throw Exception(ErrorCodes::ILLEGAL_COLUMN, "First argument for function {} must be string.", getName());
 
         const ColumnString::Chars & src_chars = src->getChars();
         const ColumnString::Offsets & src_offsets = src->getOffsets();
@@ -336,13 +332,10 @@ public:
 
             res_offset += extract(
                 reinterpret_cast<const char *>(&src_chars[src_offset]),
-                next_src_offset - src_offset - 1,
+                next_src_offset - src_offset,
                 reinterpret_cast<char *>(&res_chars[res_offset]));
 
-            res_chars[res_offset] = 0;
-            ++res_offset;
             res_offsets[i] = res_offset;
-
             src_offset = next_src_offset;
         }
 
@@ -351,9 +344,52 @@ public:
     }
 };
 
-void registerFunctionExtractTextFromHTML(FunctionFactory & factory)
+REGISTER_FUNCTION(ExtractTextFromHTML)
 {
-    factory.registerFunction<FunctionExtractTextFromHTML>();
+    FunctionDocumentation::Description description = R"(
+Extracts text content from HTML or XHTML.
+
+This function removes HTML tags, comments, and script/style elements, leaving only the text content. It handles:
+- Removal of all HTML/XML tags
+- Removal of comments (`<!-- -->`)
+- Removal of script and style elements with their content
+- Processing of CDATA sections (copied verbatim)
+- Proper whitespace handling and normalization
+
+Note: HTML entities are not decoded and should be processed with a separate function if needed.
+)";
+    FunctionDocumentation::Syntax syntax = "extractTextFromHTML(html)";
+    FunctionDocumentation::Arguments arguments = {
+        {"html", "String containing HTML content to extract text from.", {"String"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the extracted text content with normalized whitespace.", {"String"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        R"(
+SELECT extractTextFromHTML('
+<html>
+    <head><title>Page Title</title></head>
+    <body>
+        <p>Hello <b>World</b>!</p>
+        <script>alert("test");</script>
+        <!-- comment -->
+    </body>
+</html>
+');
+        )",
+        R"(
+┌─extractTextFromHTML('\n<html>\n    <head><title>Page Title</title></head>\n    <body>\n        <p>Hello <b>World</b>!</p>\n        <script>alert("test");</script>\n        <!-- comment -->\n    </body>\n</html>\n')─┐
+│ Page Title Hello World !                                                                                                                                                                                               │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {21, 3};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::String;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionExtractTextFromHTML>(documentation);
 }
 
 }

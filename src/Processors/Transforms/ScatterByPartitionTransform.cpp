@@ -1,0 +1,267 @@
+#include <Columns/IColumn.h>
+#include <Core/ColumnNumbers.h>
+#include <Interpreters/castColumn.h>
+#include <Processors/Port.h>
+#include <Processors/Transforms/AggregatingTransform.h>
+#include <Processors/Transforms/ScatterByPartitionTransform.h>
+#include <Common/Exception.h>
+#include <Common/HashTable/Hash.h>
+#include <Common/MapToRange.h>
+#include <Common/PODArray.h>
+#include <Common/randomSeed.h>
+
+#include <algorithm>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
+ScatterByPartitionTransform::ScatterByPartitionTransform(SharedHeader header, size_t output_size_, ColumnNumbers key_columns_, DataTypes hash_cast_types_)
+    : IProcessor(InputPorts{header}, OutputPorts{output_size_, header})
+    , output_size(output_size_)
+    , key_columns(std::move(key_columns_))
+    , hash_cast_types(std::move(hash_cast_types_))
+    , hash(0)
+{
+    if (!hash_cast_types.empty() && hash_cast_types.size() != key_columns.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "ScatterByPartitionTransform: hash_cast_types size ({}) does not match key columns size ({})",
+            hash_cast_types.size(), key_columns.size());
+
+    hash_input_types.reserve(key_columns.size());
+    for (const auto & column_number : key_columns)
+        hash_input_types.push_back(header->getByPosition(column_number).type);
+}
+
+std::shared_ptr<ScatterByPartitionTransform> ScatterByPartitionTransform::createRoundRobin(SharedHeader header, size_t output_size_, size_t start_bucket)
+{
+    auto transform = std::make_shared<ScatterByPartitionTransform>(std::move(header), output_size_, ColumnNumbers{});
+    transform->round_robin_bucket = start_bucket % output_size_;
+    return transform;
+}
+
+std::shared_ptr<ScatterByPartitionTransform> ScatterByPartitionTransform::createRandom(SharedHeader header, size_t output_size_)
+{
+    auto transform = std::make_shared<ScatterByPartitionTransform>(std::move(header), output_size_, ColumnNumbers{});
+    transform->random_generator = std::make_unique<pcg64>(randomSeed());
+    return transform;
+}
+
+IProcessor::Status ScatterByPartitionTransform::prepare()
+{
+    auto & input = getInputs().front();
+
+    /// Check all outputs are finished or ready to get data.
+
+    bool all_finished = true;
+    for (auto & output : outputs)
+    {
+        if (output.isFinished())
+            continue;
+
+        all_finished = false;
+    }
+
+    if (all_finished)
+    {
+        input.close();
+        return Status::Finished;
+    }
+
+    /// work() runs without the executor's graph lock, so it must not change port state; that happens here.
+    if (has_output_chunks && !pushOutputChunks())
+    {
+        input.setNotNeeded();
+        return Status::PortFull;
+    }
+
+    /// Try get chunk from input.
+
+    if (input.isFinished())
+    {
+        for (auto & output : outputs)
+            output.finish();
+
+        return Status::Finished;
+    }
+
+    /// Request input only while an unfinished output needs data. Downstream processors may delay
+    /// requesting data until their other inputs are ready.
+    if (std::none_of(outputs.begin(), outputs.end(), [](const auto & output) { return !output.isFinished() && output.canPush(); }))
+    {
+        input.setNotNeeded();
+        return Status::PortFull;
+    }
+
+    input.setNeeded();
+    if (!input.hasData())
+        return Status::NeedData;
+
+    chunk = input.pull();
+    was_output_processed.assign(output_size, false);
+
+    return Status::Ready;
+}
+
+void ScatterByPartitionTransform::work()
+{
+    generateOutputChunks();
+    has_output_chunks = true;
+}
+
+bool ScatterByPartitionTransform::pushOutputChunks()
+{
+    bool all_outputs_processed = true;
+
+    size_t chunk_number = 0;
+    for (auto & output : outputs)
+    {
+        auto & was_processed = was_output_processed[chunk_number];
+        auto & output_chunk = output_chunks[chunk_number];
+        ++chunk_number;
+
+        if (was_processed)
+            continue;
+
+        /// A finished output never becomes pushable again, so waiting for one would wedge the
+        /// pipeline forever.
+        if (output.isFinished())
+            continue;
+
+        if (output_chunk.getNumRows() == 0 && output_chunk.getChunkInfos().empty())
+        {
+            /// Avoid pushing empty data chunks downstream.
+            was_processed = true;
+            continue;
+        }
+
+        if (!output.canPush())
+        {
+            all_outputs_processed = false;
+            continue;
+        }
+
+        output.push(std::move(output_chunk));
+        was_processed = true;
+    }
+
+    if (!all_outputs_processed)
+        return false;
+
+    has_output_chunks = false;
+    output_chunks.clear();
+    return true;
+}
+
+void ScatterByPartitionTransform::generateOutputChunks()
+{
+    auto num_rows = chunk.getNumRows();
+    const auto & columns = chunk.getColumns();
+
+    output_chunks.resize(output_size);
+
+    if (round_robin_bucket)
+    {
+        /// The chunk is moved whole so its ChunkInfo (e.g. aggregation metadata) survives.
+        output_chunks[*round_robin_bucket] = std::move(chunk);
+        *round_robin_bucket = (*round_robin_bucket + 1) % output_size;
+        return;
+    }
+
+    /// A rowless chunk with a `ChunkInfo` is a marker for the consumer (e.g. a watermark of a streaming read),
+    /// which applies to every partition. The scatter below would lose it, so it is sent to all outputs.
+    if (num_rows == 0 && !chunk.getChunkInfos().empty())
+    {
+        for (auto & output_chunk : output_chunks)
+            output_chunk = chunk.clone();
+        return;
+    }
+
+    if (random_generator && num_rows > 0)
+    {
+        /// A uniformly random output for every row (the bias of the multiply-shift reduction is negligible).
+        selector.resize(num_rows);
+        for (auto & output_index : selector)
+            output_index = static_cast<UInt64>((static_cast<unsigned __int128>((*random_generator)()) * output_size) >> 64);
+
+        for (const auto & column : columns)
+        {
+            auto filtered_columns = column->scatter(output_size, selector);
+            for (size_t i = 0; i < output_size; ++i)
+                output_chunks[i].addColumn(std::move(filtered_columns[i]));
+        }
+
+        /// A chunk without columns: only the number of rows matters.
+        if (columns.empty())
+        {
+            VectorWithMemoryTracking<size_t> counts(output_size);
+            for (auto output_index : selector)
+                ++counts[output_index];
+            for (size_t i = 0; i < output_size; ++i)
+                output_chunks[i] = Chunk(Columns{}, counts[i]);
+        }
+        return;
+    }
+
+    /// Special case for 0 key columns. It is an unlikely but still valid case.
+    if (key_columns.empty())
+    {
+        /// Put all rows into the first bucket
+        if (output_size > 0)
+            output_chunks[0] = Chunk(columns, num_rows);
+        /// All other buckets are empty
+        if (output_size > 1)
+        {
+            Chunk empty_chunk(chunk.cloneEmptyColumns(), 0);
+            for (size_t i = 1; i < output_size; ++i)
+                output_chunks[i] = Chunk(empty_chunk.getColumns(), 0);
+        }
+
+        return;
+    }
+
+    chassert(!columns.empty());
+
+    /// Cast to size_t to select the (count, value) overload of `assign`: on Darwin `UInt64` is
+    /// `unsigned long long` while `size_t` is `unsigned long`, so without the cast the iterator-pair
+    /// overload would be deduced and fail to compile.
+    hash.assign(static_cast<size_t>(num_rows), WEAK_HASH32_INITIAL_VALUE);
+
+    for (size_t i = 0; i < key_columns.size(); ++i)
+    {
+        const auto & column = columns[key_columns[i]];
+        const auto & cast_type = hash_cast_types.empty() ? nullptr : hash_cast_types[i];
+        if (cast_type && !cast_type->equals(*hash_input_types[i]))
+        {
+            auto casted = castColumn({column, hash_input_types[i], ""}, cast_type);
+            casted->computeHashInto(0, num_rows, hash.data(), false);
+        }
+        else
+            column->computeHashInto(0, num_rows, hash.data(), false);
+    }
+
+    selector.resize(num_rows);
+    mapToRange(hash.data(), num_rows, static_cast<UInt32>(output_size), selector.data());
+
+    for (const auto & column : columns)
+    {
+        auto filtered_columns = column->scatter(output_size, selector);
+        for (size_t i = 0; i < output_size; ++i)
+            output_chunks[i].addColumn(std::move(filtered_columns[i]));
+    }
+
+    /// A shuffle of partial aggregation states splits a chunk by the keys, and the merge on the other
+    /// side needs the bucket number of each part. A two-level bucket is a function of the key, so the
+    /// part keeps a correct bucket number. Empty parts stay without it so they are not sent.
+    if (auto aggregated_info = chunk.getChunkInfos().get<AggregatedChunkInfo>())
+    {
+        for (auto & output_chunk : output_chunks)
+            if (output_chunk.getNumRows() > 0)
+                output_chunk.getChunkInfos().add(std::make_shared<AggregatedChunkInfo>(*aggregated_info));
+    }
+}
+
+}

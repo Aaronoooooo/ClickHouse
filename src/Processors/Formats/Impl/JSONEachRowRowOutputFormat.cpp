@@ -1,7 +1,9 @@
 #include <IO/WriteHelpers.h>
-#include <IO/WriteBufferValidUTF8.h>
 #include <Processors/Formats/Impl/JSONEachRowRowOutputFormat.h>
+#include <Processors/Port.h>
 #include <Formats/FormatFactory.h>
+#include <Formats/JSONUtils.h>
+#include <Core/Block.h>
 
 
 namespace DB
@@ -10,100 +12,59 @@ namespace DB
 
 JSONEachRowRowOutputFormat::JSONEachRowRowOutputFormat(
     WriteBuffer & out_,
-    const Block & header_,
-    const RowOutputFormatParams & params_,
-    const FormatSettings & settings_)
-        : IRowOutputFormat(header_, out_, params_),
-            settings(settings_)
+    SharedHeader header_,
+    const FormatSettings & settings_,
+    bool pretty_json_)
+    : RowOutputFormatWithExceptionHandlerAdaptor<RowOutputFormatWithUTF8ValidationAdaptor, bool>(
+        header_, out_, settings_.json.valid_output_on_exception, settings_.json.validate_utf8)
+    , pretty_json(pretty_json_)
+    , settings(settings_)
 {
-    const auto & sample = getPort(PortKind::Main).getHeader();
-    size_t columns = sample.columns();
-    fields.resize(columns);
-
-    for (size_t i = 0; i < columns; ++i)
-    {
-        WriteBufferFromString buf(fields[i]);
-        writeJSONString(sample.getByPosition(i).name, buf, settings);
-    }
+    ostr = RowOutputFormatWithExceptionHandlerAdaptor::getWriteBufferPtr();
+    fields = JSONUtils::makeNamesValidJSONStrings(getPort(PortKind::Main).getHeader().getNames(), settings, settings.json.validate_utf8);
 }
 
 
 void JSONEachRowRowOutputFormat::writeField(const IColumn & column, const ISerialization & serialization, size_t row_num)
 {
-    writeString(fields[field_number], out);
-    writeChar(':', out);
-
-    if (settings.json.serialize_as_strings)
-    {
-        WriteBufferFromOwnString buf;
-
-        serialization.serializeText(column, row_num, buf, settings);
-        writeJSONString(buf.str(), out, settings);
-    }
-    else
-        serialization.serializeTextJSON(column, row_num, out, settings);
-
+    JSONUtils::writeFieldFromColumn(column, serialization, row_num, settings.json.serialize_as_strings, settings, *ostr, fields[field_number], pretty_json ? 1 : 0, pretty_json ? " " : "", pretty_json);
     ++field_number;
 }
 
 
 void JSONEachRowRowOutputFormat::writeFieldDelimiter()
 {
-    writeChar(',', out);
+    writeChar(',', *ostr);
+    if (pretty_json)
+        writeChar('\n', *ostr);
 }
 
 
 void JSONEachRowRowOutputFormat::writeRowStartDelimiter()
 {
-    writeChar('{', out);
+    writeChar('{', *ostr);
+    if (pretty_json)
+        writeChar('\n', *ostr);
 }
 
 
 void JSONEachRowRowOutputFormat::writeRowEndDelimiter()
 {
-    // Why do we need this weird `if`?
-    //
-    // The reason is the formatRow function that is broken with respect to
-    // row-between delimiters. It should not write them, but it does, and then
-    // hacks around it by having a special formatRowNoNewline version, which, as
-    // you guessed, removes the newline from the end of row. But the row-between
-    // delimiter goes into a second row, so it turns out to be in the beginning
-    // of the line, and the removal doesn't work. There is also a second bug --
-    // the row-between delimiter in this format is written incorrectly. In fact,
-    // it is not written at all, and the newline is written in a row-end
-    // delimiter ("}\n" instead of the correct "}"). With these two bugs
-    // combined, the test 01420_format_row works perfectly.
-    //
-    // A proper implementation of formatRow would use IRowOutputFormat directly,
-    // and not write row-between delimiters, instead of using IOutputFormat
-    // processor and its crutch row callback. This would require exposing
-    // IRowOutputFormat, which we don't do now, but which can be generally useful
-    // for other cases such as parallel formatting, that also require a control
-    // flow different from the usual IOutputFormat.
-    //
-    // I just don't have time or energy to redo all of this, but I need to
-    // support JSON array output here, which requires proper ",\n" row-between
-    // delimiters. For compatibility, I preserve the bug in case of non-array
-    // output.
+    if (pretty_json)
+        writeChar('\n', *ostr);
+
     if (settings.json.array_of_rows)
-    {
-        writeCString("}", out);
-    }
+        writeChar('}', *ostr);
     else
-    {
-        writeCString("}\n", out);
-    }
+        writeCString("}\n", *ostr);
     field_number = 0;
 }
 
 
 void JSONEachRowRowOutputFormat::writeRowBetweenDelimiter()
 {
-    // We preserve an existing bug here for compatibility. See the comment above.
     if (settings.json.array_of_rows)
-    {
-        writeCString(",\n", out);
-    }
+        writeCString(",\n", *ostr);
 }
 
 
@@ -111,47 +72,264 @@ void JSONEachRowRowOutputFormat::writePrefix()
 {
     if (settings.json.array_of_rows)
     {
-        writeCString("[\n", out);
+        writeCString("[\n", *ostr);
     }
 }
 
 
 void JSONEachRowRowOutputFormat::writeSuffix()
 {
-    if (settings.json.array_of_rows)
+    if (!exception_message.empty())
     {
-        writeCString("\n]\n", out);
+        if (haveWrittenData())
+            writeRowBetweenDelimiter();
+        writeRowStartDelimiter();
+        JSONUtils::writeException(exception_message, *ostr, settings, pretty_json ? 1 : 0);
+        writeRowEndDelimiter();
     }
+
+    if (settings.json.array_of_rows)
+        writeCString("\n]\n", *ostr);
 }
 
+void JSONEachRowRowOutputFormat::resetFormatterImpl()
+{
+    RowOutputFormatWithExceptionHandlerAdaptor::resetFormatterImpl();
+    ostr = RowOutputFormatWithExceptionHandlerAdaptor::getWriteBufferPtr();
+}
 
+void registerOutputFormatJSONEachRow(FormatFactory & factory);
 void registerOutputFormatJSONEachRow(FormatFactory & factory)
 {
-    factory.registerOutputFormat("JSONEachRow", [](
-        WriteBuffer & buf,
-        const Block & sample,
-        const RowOutputFormatParams & params,
-        const FormatSettings & _format_settings)
+    auto register_function = [&](const String & format, bool serialize_as_strings, bool pretty_json)
     {
-        FormatSettings settings = _format_settings;
-        settings.json.serialize_as_strings = false;
-        return std::make_shared<JSONEachRowRowOutputFormat>(buf, sample, params,
-            settings);
-    });
-    factory.markOutputFormatSupportsParallelFormatting("JSONEachRow");
+        factory.registerOutputFormat(format, [serialize_as_strings, pretty_json](
+            WriteBuffer & buf,
+            const Block & sample,
+            const FormatSettings & _format_settings,
+            FormatFilterInfoPtr /*format_filter_info*/)
+        {
+            FormatSettings settings = _format_settings;
+            settings.json.serialize_as_strings = serialize_as_strings;
+            return std::make_shared<JSONEachRowRowOutputFormat>(buf, std::make_shared<const Block>(sample), settings, pretty_json);
+        });
+        factory.markOutputFormatSupportsParallelFormatting(format);
+        /// With output_format_json_array_of_rows all rows form one JSON array.
+        factory.registerAppendSupportChecker(format, [](const FormatSettings & settings) { return !settings.json.array_of_rows; });
+        factory.setContentType(format, [](const std::optional<FormatSettings> & settings)
+        {
+            return settings && settings->json.array_of_rows ? "application/json; charset=UTF-8" : "application/x-ndjson; charset=UTF-8";
+        });
+        /// The field names are emitted as JSON object keys every row via `makeNamesValidJSONStrings`
+        /// with `output_format_json_validate_utf8`. When validation is off, a name that is not valid
+        /// UTF-8 (a quoted alias with arbitrary bytes) makes the keys, and hence the output, non-textual.
+        /// The row values can synthesize further object keys from named `Tuple` element names (see
+        /// `tupleElementNamesMayProduceRawBytesInJSON`) - except when the values are serialized as
+        /// strings (`JSONStringsEachRow`), where a `Tuple` value is written in its plain text form,
+        /// which carries no element names - but that plain text form writes the `Bool`
+        /// representations verbatim (see `boolRepresentationsMayProduceRawBytesInJSONStrings`).
+        /// All of this is knowable from the header and the settings, so the text framings reject or
+        /// base64-encode accordingly.
+        factory.registerOutputFormatMayProduceRawBytesChecker(
+            format,
+            [serialize_as_strings](const FormatSettings & settings, const Block & header)
+            {
+                return JSONUtils::namesMayProduceRawBytesInJSON(header.getNames(), settings, settings.json.validate_utf8)
+                    || (!serialize_as_strings
+                        && JSONUtils::tupleElementNamesMayProduceRawBytesInJSON(header, settings, settings.json.validate_utf8))
+                    || (serialize_as_strings
+                        && JSONUtils::boolRepresentationsMayProduceRawBytesInJSONStrings(header, settings, settings.json.validate_utf8));
+            });
+    };
 
-    factory.registerOutputFormat("JSONStringsEachRow", [](
-        WriteBuffer & buf,
-        const Block & sample,
-        const RowOutputFormatParams & params,
-        const FormatSettings & _format_settings)
-    {
-        FormatSettings settings = _format_settings;
-        settings.json.serialize_as_strings = true;
-        return std::make_shared<JSONEachRowRowOutputFormat>(buf, sample, params,
-            settings);
-    });
-    factory.markOutputFormatSupportsParallelFormatting("JSONStringEachRow");
+    register_function("JSONEachRow", false, false);
+    register_function("PrettyJSONEachRow", false, true);
+    register_function("JSONLines", false, false);
+    register_function("PrettyJSONLines", false, true);
+    register_function("NDJSON", false, false);
+    register_function("PrettyNDJSON", false, true);
+    register_function("JSONL", false, false);
+    register_function("JSONStringsEachRow", true, false);
+
+    /// `registerOutputFormat` auto-registers a file extension equal to the (lower-cased) format name,
+    /// so registering `JSONL` for output above re-points the `jsonl` extension to the `JSONL` format,
+    /// undoing the explicit `jsonl` -> `JSONEachRow` mapping from `registerInputFormatJSONEachRow`.
+    /// Re-assert it here (this function runs after the input one) so that files with a `.jsonl`
+    /// extension are still resolved to the canonical `JSONEachRow` format.
+    factory.registerFileExtension("jsonl", "JSONEachRow");
+
+    factory.setDocumentation("PrettyJSONEachRow", Documentation{
+        .description = R"DOCS_MD(
+| Input | Output | Alias                             |
+|-------|--------|-----------------------------------|
+| ✗     | ✔      | `PrettyJSONLines`, `PrettyNDJSON` |
+
+## Description {#description}
+
+Differs from [JSONEachRow](/reference/formats/JSON/JSONEachRow) only in that JSON is pretty formatted with new line delimiters and 4 space indents.
+
+## Example usage {#example-usage}
+### Reading data {#reading-data}
+
+Read data using the `PrettyJSONEachRow` format:
+
+```sql
+SELECT *
+FROM football
+FORMAT PrettyJSONEachRow
+```
+
+The output will be in JSON format:
+
+```json
+{
+    "date": "2022-04-30",
+    "season": 2021,
+    "home_team": "Sutton United",
+    "away_team": "Bradford City",
+    "home_team_goals": 1,
+    "away_team_goals": 4
+}
+{
+    "date": "2022-04-30",
+    "season": 2021,
+    "home_team": "Swindon Town",
+    "away_team": "Barrow",
+    "home_team_goals": 2,
+    "away_team_goals": 1
+}
+{
+    "date": "2022-04-30",
+    "season": 2021,
+    "home_team": "Tranmere Rovers",
+    "away_team": "Oldham Athletic",
+    "home_team_goals": 2,
+    "away_team_goals": 0
+}
+{
+    "date": "2022-05-02",
+    "season": 2021,
+    "home_team": "Port Vale",
+    "away_team": "Newport County",
+    "home_team_goals": 1,
+    "away_team_goals": 2
+}
+{
+    "date": "2022-05-02",
+    "season": 2021,
+    "home_team": "Salford City",
+    "away_team": "Mansfield Town",
+    "home_team_goals": 2,
+    "away_team_goals": 2
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Barrow",
+    "away_team": "Northampton Town",
+    "home_team_goals": 1,
+    "away_team_goals": 3
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Bradford City",
+    "away_team": "Carlisle United",
+    "home_team_goals": 2,
+    "away_team_goals": 0
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Bristol Rovers",
+    "away_team": "Scunthorpe United",
+    "home_team_goals": 7,
+    "away_team_goals": 0
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Exeter City",
+    "away_team": "Port Vale",
+    "home_team_goals": 0,
+    "away_team_goals": 1
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Harrogate Town A.F.C.",
+    "away_team": "Sutton United",
+    "home_team_goals": 0,
+    "away_team_goals": 2
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Hartlepool United",
+    "away_team": "Colchester United",
+    "home_team_goals": 0,
+    "away_team_goals": 2
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Leyton Orient",
+    "away_team": "Tranmere Rovers",
+    "home_team_goals": 0,
+    "away_team_goals": 1
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Mansfield Town",
+    "away_team": "Forest Green Rovers",
+    "home_team_goals": 2,
+    "away_team_goals": 2
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Newport County",
+    "away_team": "Rochdale",
+    "home_team_goals": 0,
+    "away_team_goals": 2
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Oldham Athletic",
+    "away_team": "Crawley Town",
+    "home_team_goals": 3,
+    "away_team_goals": 3
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Stevenage Borough",
+    "away_team": "Salford City",
+    "home_team_goals": 4,
+    "away_team_goals": 2
+}
+{
+    "date": "2022-05-07",
+    "season": 2021,
+    "home_team": "Walsall",
+    "away_team": "Swindon Town",
+    "home_team_goals": 0,
+    "away_team_goals": 3
+}  
+```
+
+## Format settings {#format-settings}
+)DOCS_MD"});
+
+    factory.setDocumentation("PrettyJSONLines", Documentation{
+        .description = "An alias for the `PrettyJSONEachRow` format. See the `PrettyJSONEachRow` entry for the full documentation.",
+        .related = {"PrettyJSONEachRow"}});
+
+    factory.setDocumentation("PrettyNDJSON", Documentation{
+        .description = "An alias for the `PrettyJSONEachRow` format. See the `PrettyJSONEachRow` entry for the full documentation.",
+        .related = {"PrettyJSONEachRow"}});
 }
 
 }

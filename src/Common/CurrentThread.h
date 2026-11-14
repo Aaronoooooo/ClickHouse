@@ -1,11 +1,16 @@
 #pragma once
 
+#include <Core/Block.h>
+#include <Core/LogsLevel.h>
 #include <Interpreters/Context_fwd.h>
-#include <Common/ThreadStatus.h>
-#include <base/StringRef.h>
+#include <base/defines.h>
+#include <Common/ConcurrentBoundedQueue.h>
+#include <Common/IThrottler.h>
+#include <Common/FiberLocal.h>
+#include <Common/Scheduler/ResourceLink.h>
 
 #include <memory>
-#include <string>
+#include <string_view>
 
 
 namespace ProfileEvents
@@ -23,6 +28,24 @@ class QueryStatus;
 struct Progress;
 class InternalTextLogsQueue;
 
+class ThreadStatus;
+class ThreadGroup;
+class ResourceSchedulingContext;
+class MemoryPressureMonitor;
+using ThreadGroupPtr = std::shared_ptr<ThreadGroup>;
+using InternalProfileEventsQueue = ConcurrentBoundedQueue<Block>;
+using InternalProfileEventsQueuePtr = std::shared_ptr<InternalProfileEventsQueue>;
+
+/**
+ * We use **constinit** here to tell the compiler the current_thread variable is initialized.
+ * If we didn't help the compiler, then it would most likely add a check before every use of the variable to initialize it if needed.
+ * Instead it will trust that we are doing the right thing (and we do initialize it to nullptr) and emit more optimal code.
+ * This is noticeable in functions like CurrentMemoryTracker::free and CurrentMemoryTracker::allocImpl
+ * See also:
+ * - https://en.cppreference.com/w/cpp/language/constinit
+ * - https://github.com/ClickHouse/ClickHouse/pull/40078
+ */
+extern constinit FiberLocal<ThreadStatus *, FiberLocalSlot::CURRENT_THREAD> current_thread;
 
 /** Collection of static methods to work with thread-local objects.
   * Allows to attach and detach query/process (thread group) to a thread
@@ -39,70 +62,183 @@ public:
     static ThreadStatus & get();
 
     /// Group to which belongs current thread
-    static ThreadGroupStatusPtr getGroup();
+    static ThreadGroupPtr getGroup();
+    /// Same as `getGroup() != nullptr`, but doesn't touch the reference counter of the group, which
+    /// is shared by all threads of the query: it is called on every log message, even a disabled one.
+    static bool hasGroup();
+
+    /// MemoryTracker for user that owns current thread if any
+
+    /// Adjust counters in MemoryTracker hierarchy if untracked_memory is not 0.
+    static void flushUntrackedMemory();
 
     /// A logs queue used by TCPHandler to pass logs to a client
     static void attachInternalTextLogsQueue(const std::shared_ptr<InternalTextLogsQueue> & logs_queue,
                                             LogsLevel client_logs_level);
     static std::shared_ptr<InternalTextLogsQueue> getInternalTextLogsQueue();
 
+    /// Hides the log records of the current thread from the client while alive: detaches the
+    /// internal text logs queue (`send_logs_level`) of the current thread and of its thread group,
+    /// and restores it on exit, so a thread attaching to the group within the scope stays detached
+    /// too. The records still reach the server-side logs. For sections whose diagnostics may carry
+    /// data the client's user has no right to see.
+    struct HideLogsFromClientScope : private boost::noncopyable
+    {
+        HideLogsFromClientScope();
+        ~HideLogsFromClientScope();
+
+    private:
+        std::shared_ptr<InternalTextLogsQueue> logs_queue_to_restore;
+        LogsLevel client_logs_level_to_restore = LogsLevel::none;
+        bool restore = false;
+    };
+
     static void attachInternalProfileEventsQueue(const InternalProfileEventsQueuePtr & queue);
     static InternalProfileEventsQueuePtr getInternalProfileEventsQueue();
 
-    static void setFatalErrorCallback(std::function<void()> callback);
+    static void attachQueryForLog(const String & query_);
 
     /// Makes system calls to update ProfileEvents that contain info from rusage and taskstats
     static void updatePerformanceCounters();
+    static void updatePerformanceCountersIfNeeded();
 
     static ProfileEvents::Counters & getProfileEvents();
     static MemoryTracker * getMemoryTracker();
+
+    /// The current query's memory-pressure monitor when in a thread group, else the global monitor.
+    static MemoryPressureMonitor & getMemoryPressureMonitor();
 
     /// Update read and write rows (bytes) statistics (used in system.query_thread_log)
     static void updateProgressIn(const Progress & value);
     static void updateProgressOut(const Progress & value);
 
-    /// Query management:
-
-    /// Call from master thread as soon as possible (e.g. when thread accepted connection)
-    static void initializeQuery();
-
     /// You must call one of these methods when create a query child thread:
     /// Add current thread to a group associated with the thread group
-    static void attachTo(const ThreadGroupStatusPtr & thread_group);
+    static void attachToGroup(const ThreadGroupPtr & thread_group);
     /// Is useful for a ThreadPool tasks
-    static void attachToIfDetached(const ThreadGroupStatusPtr & thread_group);
+    static void attachToGroupIfDetached(const ThreadGroupPtr & thread_group);
+
+    /// Non-master threads call this method in destructor automatically
+    static void detachFromGroupIfNotDetached();
 
     /// Update ProfileEvents and dumps info to system.query_thread_log
     static void finalizePerformanceCounters();
 
     /// Returns a non-empty string if the thread is attached to a query
-    static StringRef getQueryId()
+
+    /// Returns attached query context or nullptr if there is no query context
+    static ContextPtr tryGetQueryContext();
+
+    static std::string_view getQueryId();
+
+    /// Throws the real cancellation cause of the current query (`TIMEOUT_EXCEEDED`, or an exception
+    /// stored by `QueryStatus::cancelQuery`) if it has been cancelled. No-op otherwise.
+    static void checkIfNotCancelled();
+
+    // For IO Scheduling
+    static void attachReadResource(ResourceLink link);
+    static void detachReadResource();
+    static ResourceLink getReadResourceLink();
+    static void attachWriteResource(ResourceLink link);
+    static void detachWriteResource();
+    static ResourceLink getWriteResourceLink();
+
+    // For IO Throttling
+    static void attachReadThrottler(const ThrottlerPtr & throttler);
+    static void detachReadThrottler();
+    static ThrottlerPtr getReadThrottler();
+    static void attachWriteThrottler(const ThrottlerPtr & throttler);
+    static void detachWriteThrottler();
+    static ThrottlerPtr getWriteThrottler();
+
+    /// Scoped attach/detach of IO resource links
+    struct IOSchedulingScope : private boost::noncopyable
     {
-        if (unlikely(!current_thread))
-            return {};
-        return current_thread->getQueryId();
-    }
+        IOSchedulingScope(ResourceLink read_resource_link, ResourceLink write_resource_link)
+        {
+            readResource(read_resource_link);
+            writeResource(write_resource_link);
+        }
 
-    /// Non-master threads call this method in destructor automatically
-    static void detachQuery();
-    static void detachQueryIfNotDetached();
+        explicit IOSchedulingScope(const IOSchedulingSettings & settings)
+            : IOSchedulingScope(settings.read_resource_link, settings.write_resource_link)
+        {}
 
-    /// Initializes query with current thread as master thread in constructor, and detaches it in destructor
-    struct QueryScope
-    {
-        explicit QueryScope(ContextMutablePtr query_context);
-        ~QueryScope();
+        ~IOSchedulingScope()
+        {
+            if (read_resource_attached)
+                detachReadResource();
+            if (write_resource_attached)
+                detachWriteResource();
+        }
 
-        void logPeakMemoryUsage();
-        bool log_peak_memory_usage_in_destructor = true;
+    private:
+        void readResource(ResourceLink link)
+        {
+            if (link)
+            {
+                attachReadResource(link);
+                read_resource_attached = true;
+            }
+        }
+
+        void writeResource(ResourceLink link)
+        {
+            if (link)
+            {
+                attachWriteResource(link);
+                write_resource_attached = true;
+            }
+        }
+
+        bool read_resource_attached = false;
+        bool write_resource_attached = false;
     };
 
-private:
-    static void defaultThreadDeleter();
+    /// Scoped attach/detach of read throttler
+    struct ReadThrottlingScope : private boost::noncopyable
+    {
+        explicit ReadThrottlingScope(const ThrottlerPtr & read_throttler_)
+        {
+            if (read_throttler_)
+            {
+                attachReadThrottler(read_throttler_);
+                read_throttler_attached = true;
+            }
+        }
 
-    /// Sets query_context for current thread group
-    /// Can by used only through QueryScope
-    static void attachQueryContext(ContextPtr query_context);
+        ~ReadThrottlingScope()
+        {
+            if (read_throttler_attached)
+                detachReadThrottler();
+        }
+
+    private:
+        bool read_throttler_attached = false;
+    };
+
+    /// Scoped attach/detach of write throttler
+    struct WriteThrottlingScope : private boost::noncopyable
+    {
+        explicit WriteThrottlingScope(const ThrottlerPtr & write_throttler_)
+        {
+            if (write_throttler_)
+            {
+                attachWriteThrottler(write_throttler_);
+                write_throttler_attached = true;
+            }
+        }
+
+        ~WriteThrottlingScope()
+        {
+            if (write_throttler_attached)
+                detachWriteThrottler();
+        }
+
+    private:
+        bool write_throttler_attached = false;
+    };
+
 };
 
 }

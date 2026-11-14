@@ -1,19 +1,23 @@
-#include "FlatDictionary.h"
+#include <memory>
+#include <Dictionaries/FlatDictionary.h>
 
 #include <Core/Defines.h>
 #include <Common/HashTable/HashMap.h>
 #include <Common/HashTable/HashSet.h>
+#include <Common/ArenaUtils.h>
+#include <Dictionaries/DictionarySourceHelpers.h>
 
 #include <DataTypes/DataTypesDecimal.h>
 #include <IO/WriteHelpers.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/MaskOperations.h>
 #include <Functions/FunctionHelpers.h>
 
 #include <QueryPipeline/QueryPipelineBuilder.h>
-#include <Processors/Executors/PullingPipelineExecutor.h>
 
-#include <Dictionaries//DictionarySource.h>
+#include <Dictionaries/DictionarySource.h>
+#include <Dictionaries/DictionaryPipelineExecutor.h>
 #include <Dictionaries/DictionaryFactory.h>
 #include <Dictionaries/HierarchyDictionariesUtils.h>
 
@@ -31,29 +35,31 @@ FlatDictionary::FlatDictionary(
     const StorageID & dict_id_,
     const DictionaryStructure & dict_struct_,
     DictionarySourcePtr source_ptr_,
-    const DictionaryLifetime dict_lifetime_,
     Configuration configuration_,
     BlockPtr update_field_loaded_block_)
     : IDictionary(dict_id_)
     , dict_struct(dict_struct_)
     , source_ptr{std::move(source_ptr_)}
-    , dict_lifetime(dict_lifetime_)
     , configuration(configuration_)
     , loaded_keys(configuration.initial_array_size, false)
     , update_field_loaded_block(std::move(update_field_loaded_block_))
 {
     createAttributes();
     loadData();
+    buildHierarchyParentToChildIndexIfNeeded();
     calculateBytesAllocated();
 }
 
 ColumnPtr FlatDictionary::getColumn(
-        const std::string & attribute_name,
-        const DataTypePtr & result_type,
-        const Columns & key_columns,
-        const DataTypes &,
-        const ColumnPtr & default_values_column) const
+    const std::string & attribute_name,
+    const DataTypePtr & attribute_type,
+    const Columns & key_columns,
+    const DataTypes & key_types [[maybe_unused]],
+    DefaultOrFilter default_or_filter) const
 {
+    bool is_short_circuit = std::holds_alternative<RefFilter>(default_or_filter);
+    chassert(is_short_circuit || std::holds_alternative<RefDefault>(default_or_filter));
+
     ColumnPtr result;
 
     PaddedPODArray<UInt64> backup_storage;
@@ -61,7 +67,7 @@ ColumnPtr FlatDictionary::getColumn(
 
     auto size = ids.size();
 
-    const auto & dictionary_attribute = dict_struct.getAttribute(attribute_name, result_type);
+    const auto & dictionary_attribute = dict_struct.getAttribute(attribute_name, attribute_type);
 
     size_t attribute_index = dict_struct.attribute_name_to_index.find(attribute_name)->second;
     const auto & attribute = attributes[attribute_index];
@@ -83,61 +89,171 @@ ColumnPtr FlatDictionary::getColumn(
         using ValueType = DictionaryValueType<AttributeType>;
         using ColumnProvider = DictionaryAttributeColumnProvider<AttributeType>;
 
-        DictionaryDefaultValueExtractor<AttributeType> default_value_extractor(dictionary_attribute.null_value, default_values_column);
-
         auto column = ColumnProvider::getColumn(dictionary_attribute, size);
 
-        if constexpr (std::is_same_v<ValueType, Array>)
+        if (is_short_circuit)
         {
-            auto * out = column.get();
+            IColumn::Filter & default_mask = std::get<RefFilter>(default_or_filter).get();
 
-            getItemsImpl<ValueType, false>(
-                attribute,
-                ids,
-                [&](size_t, const Array & value, bool) { out->insert(value); },
-                default_value_extractor);
-        }
-        else if constexpr (std::is_same_v<ValueType, StringRef>)
-        {
-            auto * out = column.get();
+            if constexpr (std::is_same_v<ValueType, Array>)
+            {
+                auto * out = column.get();
 
-            if (is_attribute_nullable)
-                getItemsImpl<ValueType, true>(
-                    attribute,
-                    ids,
-                    [&](size_t row, const StringRef value, bool is_null)
-                    {
-                        (*vec_null_map_to)[row] = is_null;
-                        out->insertData(value.data, value.size);
-                    },
-                    default_value_extractor);
+                getItemsShortCircuitImpl<ValueType, false>(
+                    attribute, ids, [&](size_t, const Array & value, bool) { out->insert(value); }, default_mask);
+            }
+            else if constexpr (std::is_same_v<ValueType, Map>)
+            {
+                auto * out = column.get();
+
+                getItemsShortCircuitImpl<ValueType, false>(
+                    attribute, ids, [&](size_t, const Map & value, bool) { out->insert(value); }, default_mask);
+            }
+            else if constexpr (std::is_same_v<ValueType, Object>)
+            {
+                auto * out = column.get();
+
+                if (is_attribute_nullable)
+                    getItemsShortCircuitImpl<ValueType, true>(
+                        attribute,
+                        ids,
+                        [&](size_t row, const Object & value, bool is_null)
+                        {
+                            (*vec_null_map_to)[row] = is_null;
+                            out->insert(value);
+                        },
+                        default_mask);
+                else
+                    getItemsShortCircuitImpl<ValueType, false>(
+                        attribute, ids, [&](size_t, const Object & value, bool) { out->insert(value); }, default_mask);
+            }
+            else if constexpr (std::is_same_v<ValueType, std::string_view>)
+            {
+                auto * out = column.get();
+
+                if (is_attribute_nullable)
+                    getItemsShortCircuitImpl<ValueType, true>(
+                        attribute,
+                        ids,
+                        [&](size_t row, std::string_view value, bool is_null)
+                        {
+                            (*vec_null_map_to)[row] = is_null;
+                            out->insertData(value.data(), value.size());
+                        },
+                        default_mask);
+                else
+                    getItemsShortCircuitImpl<ValueType, false>(
+                        attribute, ids, [&](size_t, std::string_view value, bool) { out->insertData(value.data(), value.size()); }, default_mask);
+            }
             else
-                getItemsImpl<ValueType, false>(
-                    attribute,
-                    ids,
-                    [&](size_t, const StringRef value, bool) { out->insertData(value.data, value.size); },
-                    default_value_extractor);
+            {
+                auto & out = column->getData();
+
+                if (is_attribute_nullable)
+                    getItemsShortCircuitImpl<ValueType, true>(
+                        attribute,
+                        ids,
+                        [&](size_t row, const auto value, bool is_null)
+                        {
+                            (*vec_null_map_to)[row] = is_null;
+                            out[row] = value;
+                        },
+                        default_mask);
+                else
+                    getItemsShortCircuitImpl<ValueType, false>(
+                        attribute, ids, [&](size_t row, const auto value, bool) { out[row] = value; }, default_mask);
+            }
         }
         else
         {
-            auto & out = column->getData();
+            const ColumnPtr & default_values_column = std::get<RefDefault>(default_or_filter).get();
 
-            if (is_attribute_nullable)
-                getItemsImpl<ValueType, true>(
-                    attribute,
-                    ids,
-                    [&](size_t row, const auto value, bool is_null)
-                    {
-                        (*vec_null_map_to)[row] = is_null;
-                        out[row] = value;
-                    },
-                    default_value_extractor);
-            else
+            DictionaryDefaultValueExtractor<AttributeType> default_value_extractor(
+                dictionary_attribute.null_value, default_values_column);
+
+            if constexpr (std::is_same_v<ValueType, Array>)
+            {
+                auto * out = column.get();
+
                 getItemsImpl<ValueType, false>(
                     attribute,
                     ids,
-                    [&](size_t row, const auto value, bool) { out[row] = value; },
+                    [&](size_t, const Array & value, bool) { out->insert(value); },
                     default_value_extractor);
+            }
+            else if constexpr (std::is_same_v<ValueType, Map>)
+            {
+                auto * out = column.get();
+
+                getItemsImpl<ValueType, false>(
+                    attribute,
+                    ids,
+                    [&](size_t, const Map & value, bool) { out->insert(value); },
+                    default_value_extractor);
+            }
+            else if constexpr (std::is_same_v<ValueType, Object>)
+            {
+                auto * out = column.get();
+
+                if (is_attribute_nullable)
+                    getItemsImpl<ValueType, true>(
+                        attribute,
+                        ids,
+                        [&](size_t row, const Object & value, bool is_null)
+                        {
+                            (*vec_null_map_to)[row] = is_null;
+                            out->insert(value);
+                        },
+                        default_value_extractor);
+                else
+                    getItemsImpl<ValueType, false>(
+                        attribute,
+                        ids,
+                        [&](size_t, const Object & value, bool) { out->insert(value); },
+                        default_value_extractor);
+            }
+            else if constexpr (std::is_same_v<ValueType, std::string_view>)
+            {
+                auto * out = column.get();
+
+                if (is_attribute_nullable)
+                    getItemsImpl<ValueType, true>(
+                        attribute,
+                        ids,
+                        [&](size_t row, std::string_view value, bool is_null)
+                        {
+                            (*vec_null_map_to)[row] = is_null;
+                            out->insertData(value.data(), value.size());
+                        },
+                        default_value_extractor);
+                else
+                    getItemsImpl<ValueType, false>(
+                        attribute,
+                        ids,
+                        [&](size_t, std::string_view value, bool) { out->insertData(value.data(), value.size()); },
+                        default_value_extractor);
+            }
+            else
+            {
+                auto & out = column->getData();
+
+                if (is_attribute_nullable)
+                    getItemsImpl<ValueType, true>(
+                        attribute,
+                        ids,
+                        [&](size_t row, const auto value, bool is_null)
+                        {
+                            (*vec_null_map_to)[row] = is_null;
+                            out[row] = value;
+                        },
+                        default_value_extractor);
+                else
+                    getItemsImpl<ValueType, false>(
+                        attribute,
+                        ids,
+                        [&](size_t row, const auto value, bool) { out[row] = value; },
+                        default_value_extractor);
+            }
         }
 
         result = std::move(column);
@@ -146,7 +262,7 @@ ColumnPtr FlatDictionary::getColumn(
     callOnDictionaryAttributeType(attribute.type, type_call);
 
     if (attribute.is_nullable_set)
-        result = ColumnNullable::create(std::move(result), std::move(col_null_map_to));
+        result = ColumnNullable::create(result, std::move(col_null_map_to));
 
     return result;
 }
@@ -184,7 +300,11 @@ ColumnPtr FlatDictionary::getHierarchy(ColumnPtr key_column, const DataTypePtr &
     const auto & dictionary_attribute = dict_struct.attributes[hierarchical_attribute_index];
     const auto & hierarchical_attribute = attributes[hierarchical_attribute_index];
 
-    const UInt64 null_value = dictionary_attribute.null_value.get<UInt64>();
+    std::optional<UInt64> null_value;
+
+    if (!dictionary_attribute.null_value.isNull())
+        null_value = dictionary_attribute.null_value.safeGet<UInt64>();
+
     const ContainerType<UInt64> & parent_keys = std::get<ContainerType<UInt64>>(hierarchical_attribute.container);
 
     auto is_key_valid_func = [&, this](auto & key) { return key < loaded_keys.size() && loaded_keys[key]; };
@@ -193,13 +313,26 @@ ColumnPtr FlatDictionary::getHierarchy(ColumnPtr key_column, const DataTypePtr &
 
     auto get_parent_key_func = [&, this](auto & hierarchy_key)
     {
+        std::optional<UInt64> result;
+
         bool is_key_valid = hierarchy_key < loaded_keys.size() && loaded_keys[hierarchy_key];
-        std::optional<UInt64> result = is_key_valid ? std::make_optional(parent_keys[hierarchy_key]) : std::nullopt;
-        keys_found += result.has_value();
+
+        if (!is_key_valid)
+            return result;
+
+        if (unlikely(hierarchical_attribute.is_nullable_set) && hierarchical_attribute.is_nullable_set->find(hierarchy_key))
+            return result;
+
+        UInt64 parent_key = parent_keys[hierarchy_key];
+        if (null_value && *null_value == parent_key)
+            return result;
+
+        result = parent_key;
+        keys_found += 1;
         return result;
     };
 
-    auto dictionary_hierarchy_array = getKeysHierarchyArray(keys, null_value, is_key_valid_func, get_parent_key_func);
+    auto dictionary_hierarchy_array = getKeysHierarchyArray(keys, is_key_valid_func, get_parent_key_func);
 
     query_count.fetch_add(keys.size(), std::memory_order_relaxed);
     found_count.fetch_add(keys_found, std::memory_order_relaxed);
@@ -222,7 +355,11 @@ ColumnUInt8::Ptr FlatDictionary::isInHierarchy(
     const auto & dictionary_attribute = dict_struct.attributes[hierarchical_attribute_index];
     const auto & hierarchical_attribute = attributes[hierarchical_attribute_index];
 
-    const UInt64 null_value = dictionary_attribute.null_value.get<UInt64>();
+    std::optional<UInt64> null_value;
+
+    if (!dictionary_attribute.null_value.isNull())
+        null_value = dictionary_attribute.null_value.safeGet<UInt64>();
+
     const ContainerType<UInt64> & parent_keys = std::get<ContainerType<UInt64>>(hierarchical_attribute.container);
 
     auto is_key_valid_func = [&, this](auto & key) { return key < loaded_keys.size() && loaded_keys[key]; };
@@ -231,13 +368,26 @@ ColumnUInt8::Ptr FlatDictionary::isInHierarchy(
 
     auto get_parent_key_func = [&, this](auto & hierarchy_key)
     {
+        std::optional<UInt64> result;
+
         bool is_key_valid = hierarchy_key < loaded_keys.size() && loaded_keys[hierarchy_key];
-        std::optional<UInt64> result = is_key_valid ? std::make_optional(parent_keys[hierarchy_key]) : std::nullopt;
-        keys_found += result.has_value();
+
+        if (!is_key_valid)
+            return result;
+
+        if (unlikely(hierarchical_attribute.is_nullable_set) && hierarchical_attribute.is_nullable_set->find(hierarchy_key))
+            return result;
+
+        UInt64 parent_key = parent_keys[hierarchy_key];
+        if (null_value && *null_value == parent_key)
+            return result;
+
+        result = parent_keys[hierarchy_key];
+        keys_found += 1;
         return result;
     };
 
-    auto result = getKeysIsInHierarchyColumn(keys, keys_in, null_value, is_key_valid_func, get_parent_key_func);
+    auto result = getKeysIsInHierarchyColumn(keys, keys_in, is_key_valid_func, get_parent_key_func);
 
     query_count.fetch_add(keys.size(), std::memory_order_relaxed);
     found_count.fetch_add(keys_found, std::memory_order_relaxed);
@@ -245,30 +395,46 @@ ColumnUInt8::Ptr FlatDictionary::isInHierarchy(
     return result;
 }
 
-ColumnPtr FlatDictionary::getDescendants(
-    ColumnPtr key_column,
-    const DataTypePtr &,
-    size_t level) const
+DictionaryHierarchyParentToChildIndexPtr FlatDictionary::getHierarchicalIndex() const
 {
-    PaddedPODArray<UInt64> keys_backup;
-    const auto & keys = getColumnVectorData(this, key_column, keys_backup);
+    if (hierarhical_index)
+        return hierarhical_index;
 
     size_t hierarchical_attribute_index = *dict_struct.hierarchical_attribute_index;
     const auto & hierarchical_attribute = attributes[hierarchical_attribute_index];
     const ContainerType<UInt64> & parent_keys = std::get<ContainerType<UInt64>>(hierarchical_attribute.container);
 
-    HashMap<UInt64, PaddedPODArray<UInt64>> parent_to_child;
+    DictionaryHierarchicalParentToChildIndex::ParentToChildIndex parent_to_child;
+    parent_to_child.reserve(element_count);
 
-    for (size_t i = 0; i < parent_keys.size(); ++i)
+    UInt64 child_keys_size = static_cast<UInt64>(parent_keys.size());
+
+    for (UInt64 child_key = 0; child_key < child_keys_size; ++child_key)
     {
-        auto parent_key = parent_keys[i];
+        if (!loaded_keys[child_key])
+            continue;
 
-        if (loaded_keys[i])
-            parent_to_child[parent_key].emplace_back(static_cast<UInt64>(i));
+        if (unlikely(hierarchical_attribute.is_nullable_set) && hierarchical_attribute.is_nullable_set->find(child_key))
+            continue;
+
+        auto parent_key = parent_keys[child_key];
+        parent_to_child[parent_key].emplace_back(child_key);
     }
 
-    size_t keys_found;
-    auto result = getKeysDescendantsArray(keys, parent_to_child, level, keys_found);
+    return std::make_shared<DictionaryHierarchicalParentToChildIndex>(parent_to_child);
+}
+
+ColumnPtr FlatDictionary::getDescendants(
+    ColumnPtr key_column,
+    const DataTypePtr &,
+    size_t level,
+    DictionaryHierarchicalParentToChildIndexPtr parent_to_child_index) const
+{
+    PaddedPODArray<UInt64> keys_backup;
+    const auto & keys = getColumnVectorData(this, key_column, keys_backup);
+
+    size_t keys_found = 0;
+    auto result = getKeysDescendantsArray(keys, *parent_to_child_index, level, keys_found);
 
     query_count.fetch_add(keys.size(), std::memory_order_relaxed);
     found_count.fetch_add(keys_found, std::memory_order_relaxed);
@@ -290,63 +456,96 @@ void FlatDictionary::blockToAttributes(const Block & block)
     const auto keys_column = block.safeGetByPosition(0).column;
 
     DictionaryKeysArenaHolder<DictionaryKeyType::Simple> arena_holder;
-    DictionaryKeysExtractor<DictionaryKeyType::Simple> keys_extractor({ keys_column }, arena_holder.getComplexKeyArena());
-    auto keys = keys_extractor.extractAllKeys();
+    DictionaryKeysExtractor<DictionaryKeyType::Simple> keys_extractor({ keys_column }, arena_holder.getComplexKeyArena()); /// NOLINT(readability-static-accessed-through-instance)
+    size_t keys_size = keys_extractor.getKeysSize();
 
-    HashSet<UInt64> already_processed_keys;
+    static constexpr size_t key_offset = 1;
 
-    size_t key_offset = 1;
-    for (size_t attribute_index = 0; attribute_index < attributes.size(); ++attribute_index)
+    size_t attributes_size = attributes.size();
+
+    if (unlikely(attributes_size == 0))
+    {
+        for (size_t i = 0; i < keys_size; ++i)
+        {
+            auto key = keys_extractor.extractCurrentKey();
+
+            if (unlikely(key >= configuration.max_array_size))
+                throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
+                    "{}: identifier should be less than {}",
+                    getFullName(),
+                    configuration.max_array_size);
+
+            if (key >= loaded_keys.size())
+            {
+                const size_t elements_count = key + 1;
+                loaded_keys.resize(elements_count, false);
+            }
+
+            loaded_keys[key] = true;
+
+            keys_extractor.rollbackCurrentKey();
+        }
+
+        return;
+    }
+
+    for (size_t attribute_index = 0; attribute_index < attributes_size; ++attribute_index)
     {
         const IColumn & attribute_column = *block.safeGetByPosition(attribute_index + key_offset).column;
         Attribute & attribute = attributes[attribute_index];
 
-        for (size_t i = 0; i < keys.size(); ++i)
+        for (size_t i = 0; i < keys_size; ++i)
         {
-            auto key = keys[i];
-
-            if (already_processed_keys.find(key) != nullptr)
-                continue;
-
-            already_processed_keys.insert(key);
+            auto key = keys_extractor.extractCurrentKey();
 
             setAttributeValue(attribute, key, attribute_column[i]);
-            ++element_count;
+            keys_extractor.rollbackCurrentKey();
         }
 
-        already_processed_keys.clear();
+        keys_extractor.reset();
     }
 }
 
 void FlatDictionary::updateData()
 {
+    BlockIO io = source_ptr->loadUpdatedAll();
+
     if (!update_field_loaded_block || update_field_loaded_block->rows() == 0)
     {
-        QueryPipeline pipeline(source_ptr->loadUpdatedAll());
+        update_field_loaded_block.reset();
 
-        PullingPipelineExecutor executor(pipeline);
-        Block block;
-        while (executor.pull(block))
+        io.executeWithCallbacks([&]()
         {
-            /// We are using this to keep saved data if input stream consists of multiple blocks
-            if (!update_field_loaded_block)
-                update_field_loaded_block = std::make_shared<DB::Block>(block.cloneEmpty());
+            DictionaryPipelineExecutor executor(io.pipeline, configuration.use_async_executor);
+            io.pipeline.setConcurrencyControl(false);
 
-            for (size_t column_index = 0; column_index < block.columns(); ++column_index)
+            Block block;
+            while (executor.pull(block))
             {
-                const IColumn & update_column = *block.getByPosition(column_index).column.get();
-                MutableColumnPtr saved_column = update_field_loaded_block->getByPosition(column_index).column->assumeMutable();
-                saved_column->insertRangeFrom(update_column, 0, update_column.size());
+                if (!block.rows())
+                    continue;
+
+                removeSpecialColumnRepresentations(block);
+
+                /// We are using this to keep saved data if input stream consists of multiple blocks
+                if (!update_field_loaded_block)
+                    update_field_loaded_block = std::make_shared<DB::Block>(block.cloneEmpty());
+
+                for (size_t column_index = 0; column_index < block.columns(); ++column_index)
+                {
+                    const IColumn & update_column = *block.getByPosition(column_index).column.get();
+                    MutableColumnPtr saved_column = update_field_loaded_block->getByPosition(column_index).column->assumeMutable();
+                    saved_column->insertRangeFrom(update_column, 0, update_column.size());
+                }
             }
-        }
+        });
     }
     else
     {
-        Pipe pipe(source_ptr->loadUpdatedAll());
-        mergeBlockWithPipe<DictionaryKeyType::Simple>(
+        update_field_loaded_block = std::make_shared<Block>(mergeBlockWithPipe<DictionaryKeyType::Simple>(
             dict_struct.getKeysSize(),
             *update_field_loaded_block,
-            std::move(pipe));
+            std::move(io)));
     }
 
     if (update_field_loaded_block)
@@ -357,18 +556,38 @@ void FlatDictionary::loadData()
 {
     if (!source_ptr->hasUpdateField())
     {
-        QueryPipeline pipeline(source_ptr->loadAll());
-        PullingPipelineExecutor executor(pipeline);
+        BlockIO io = source_ptr->loadAll();
 
-        Block block;
-        while (executor.pull(block))
-            blockToAttributes(block);
+        io.executeWithCallbacks([&]()
+        {
+            DictionaryPipelineExecutor executor(io.pipeline, configuration.use_async_executor);
+            io.pipeline.setConcurrencyControl(false);
+
+            Block block;
+            while (executor.pull(block))
+                blockToAttributes(block);
+        });
     }
     else
         updateData();
 
+    element_count = 0;
+
+    size_t loaded_keys_size = loaded_keys.size();
+    for (size_t i = 0; i < loaded_keys_size; ++i)
+        element_count += loaded_keys[i];
+
     if (configuration.require_nonempty && 0 == element_count)
-        throw Exception(ErrorCodes::DICTIONARY_IS_EMPTY, "{}: dictionary source is empty and 'require_nonempty' property is set.", full_name);
+        throw Exception(ErrorCodes::DICTIONARY_IS_EMPTY, "{}: dictionary source is empty and 'require_nonempty' property is set.", getFullName());
+}
+
+void FlatDictionary::buildHierarchyParentToChildIndexIfNeeded()
+{
+    if (!dict_struct.hierarchical_attribute_index)
+        return;
+
+    if (dict_struct.attributes[*dict_struct.hierarchical_attribute_index].bidirectional)
+        hierarhical_index = getHierarchicalIndex();
 }
 
 void FlatDictionary::calculateBytesAllocated()
@@ -391,15 +610,22 @@ void FlatDictionary::calculateBytesAllocated()
                 /// It is not accurate calculations
                 bytes_allocated += sizeof(Array) * container.size();
             }
+            else if constexpr (std::is_same_v<ValueType, Map>)
+            {
+                /// It is not accurate calculations
+                bytes_allocated += sizeof(Map) * container.size();
+            }
+            else if constexpr (std::is_same_v<ValueType, Object>)
+            {
+                /// It is not accurate calculations
+                bytes_allocated += sizeof(Object) * container.size();
+            }
             else
             {
                 bytes_allocated += container.allocated_bytes();
             }
 
             bucket_count = container.capacity();
-
-            if constexpr (std::is_same_v<ValueType, StringRef>)
-                bytes_allocated += sizeof(Arena) + attribute.string_arena->size();
         };
 
         callOnDictionaryAttributeType(attribute.type, type_call);
@@ -407,26 +633,31 @@ void FlatDictionary::calculateBytesAllocated()
         bytes_allocated += sizeof(attribute.is_nullable_set);
 
         if (attribute.is_nullable_set.has_value())
-            bytes_allocated = attribute.is_nullable_set->getBufferSizeInBytes();
+            bytes_allocated += attribute.is_nullable_set->getBufferSizeInBytes();
     }
 
     if (update_field_loaded_block)
         bytes_allocated += update_field_loaded_block->allocatedBytes();
+
+    if (hierarhical_index)
+    {
+        hierarchical_index_bytes_allocated = hierarhical_index->getSizeInBytes();
+        bytes_allocated += hierarchical_index_bytes_allocated;
+    }
+
+    bytes_allocated += string_arena.allocatedBytes();
 }
 
 FlatDictionary::Attribute FlatDictionary::createAttribute(const DictionaryAttribute & dictionary_attribute)
 {
     auto is_nullable_set = dictionary_attribute.is_nullable ? std::make_optional<NullableSet>() : std::optional<NullableSet>{};
-    Attribute attribute{dictionary_attribute.underlying_type, std::move(is_nullable_set), {}, {}};
+    Attribute attribute{.is_nullable_set = std::move(is_nullable_set), .container = {}, .type = dictionary_attribute.underlying_type};
 
     auto type_call = [&](const auto & dictionary_attribute_type)
     {
         using Type = std::decay_t<decltype(dictionary_attribute_type)>;
         using AttributeType = typename Type::AttributeType;
         using ValueType = DictionaryValueType<AttributeType>;
-
-        if constexpr (std::is_same_v<ValueType, StringRef>)
-            attribute.string_arena = std::make_unique<Arena>();
 
         attribute.container.emplace<ContainerType<ValueType>>(configuration.initial_array_size, ValueType());
     };
@@ -474,14 +705,48 @@ void FlatDictionary::getItemsImpl(
     found_count.fetch_add(keys_found, std::memory_order_relaxed);
 }
 
+template <typename AttributeType, bool is_nullable, typename ValueSetter>
+void FlatDictionary::getItemsShortCircuitImpl(
+    const Attribute & attribute, const PaddedPODArray<UInt64> & keys, ValueSetter && set_value, IColumn::Filter & default_mask) const
+{
+    const auto rows = keys.size();
+    default_mask.resize(rows);
+    const auto & container = std::get<ContainerType<AttributeType>>(attribute.container);
+    size_t keys_found = 0;
+
+    for (size_t row = 0; row < rows; ++row)
+    {
+        const auto key = keys[row];
+
+        if (key < loaded_keys.size() && loaded_keys[key])
+        {
+            keys_found++;
+            default_mask[row] = 0;
+
+            if constexpr (is_nullable)
+                set_value(row, container[key], attribute.is_nullable_set->find(key) != nullptr);
+            else
+                set_value(row, container[key], false);
+        }
+        else
+        {
+            default_mask[row] = 1;
+            set_value(row, AttributeType{}, true);
+        }
+    }
+
+    query_count.fetch_add(rows, std::memory_order_relaxed);
+    found_count.fetch_add(keys_found, std::memory_order_relaxed);
+}
+
 template <typename T>
 void FlatDictionary::resize(Attribute & attribute, UInt64 key)
 {
     if (key >= configuration.max_array_size)
         throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
             "{}: identifier should be less than {}",
-            full_name,
-            toString(configuration.max_array_size));
+            getFullName(),
+            configuration.max_array_size);
 
     auto & container = std::get<ContainerType<T>>(attribute.container);
 
@@ -490,26 +755,11 @@ void FlatDictionary::resize(Attribute & attribute, UInt64 key)
         const size_t elements_count = key + 1; //id=0 -> elements_count=1
         loaded_keys.resize(elements_count, false);
 
-        if constexpr (std::is_same_v<T, Array>)
+        if constexpr (std::is_same_v<T, Array> || std::is_same_v<T, Map> || std::is_same_v<T, Object>)
             container.resize(elements_count, T{});
         else
             container.resize_fill(elements_count, T{});
     }
-}
-
-template <typename T>
-void FlatDictionary::setAttributeValueImpl(Attribute & attribute, UInt64 key, const T & value)
-{
-    auto & array = std::get<ContainerType<T>>(attribute.container);
-    array[key] = value;
-    loaded_keys[key] = true;
-}
-
-template <>
-void FlatDictionary::setAttributeValueImpl<String>(Attribute & attribute, UInt64 key, const String & value)
-{
-    const auto * string_in_arena = attribute.string_arena->insert(value.data(), value.size());
-    setAttributeValueImpl(attribute, key, StringRef{string_in_arena, value.size()});
 }
 
 void FlatDictionary::setAttributeValue(Attribute & attribute, const UInt64 key, const Field & value)
@@ -522,17 +772,27 @@ void FlatDictionary::setAttributeValue(Attribute & attribute, const UInt64 key, 
 
         resize<ValueType>(attribute, key);
 
-        if (attribute.is_nullable_set)
+        if (attribute.is_nullable_set && value.isNull())
         {
-            if (value.isNull())
-            {
-                attribute.is_nullable_set->insert(key);
-                loaded_keys[key] = true;
-                return;
-            }
+            attribute.is_nullable_set->insert(key);
+            loaded_keys[key] = true;
+            return;
         }
 
-        setAttributeValueImpl<AttributeType>(attribute, key, value.get<AttributeType>());
+        auto & attribute_value = value.safeGet<AttributeType>();
+
+        auto & container = std::get<ContainerType<ValueType>>(attribute.container);
+        loaded_keys[key] = true;
+
+        if constexpr (std::is_same_v<ValueType, std::string_view>)
+        {
+            auto arena_value = copyStringInArena(string_arena, attribute_value);
+            container[key] = arena_value;
+        }
+        else
+        {
+            container[key] = static_cast<ValueType>(attribute_value);
+        }
     };
 
     callOnDictionaryAttributeType(attribute.type, type_call);
@@ -549,22 +809,17 @@ Pipe FlatDictionary::read(const Names & column_names, size_t max_block_size, siz
         if (loaded_keys[key_index])
             keys.push_back(key_index);
 
-    ColumnsWithTypeAndName key_columns = {ColumnWithTypeAndName(getColumnFromPODArray(keys), std::make_shared<DataTypeUInt64>(), dict_struct.id->name)};
+    auto keys_column = getColumnFromPODArray(std::move(keys));
+    ColumnsWithTypeAndName key_columns = {ColumnWithTypeAndName(keys_column, std::make_shared<DataTypeUInt64>(), dict_struct.id->name)};
 
     std::shared_ptr<const IDictionary> dictionary = shared_from_this();
-    auto coordinator = std::make_shared<DictionarySourceCoordinator>(dictionary, column_names, std::move(key_columns), max_block_size);
+    auto coordinator =std::make_shared<DictionarySourceCoordinator>(dictionary, column_names, std::move(key_columns), max_block_size);
+    auto result = coordinator->read(num_streams);
 
-    Pipes pipes;
-
-    for (size_t i = 0; i < num_streams; ++i)
-    {
-        auto source = std::make_shared<DictionarySource>(coordinator);
-        pipes.emplace_back(Pipe(std::move(source)));
-    }
-
-    return Pipe::unitePipes(std::move(pipes));
+    return result;
 }
 
+void registerDictionaryFlat(DictionaryFactory & factory);
 void registerDictionaryFlat(DictionaryFactory & factory)
 {
     auto create_layout = [=](const std::string & full_name,
@@ -588,21 +843,66 @@ void registerDictionaryFlat(DictionaryFactory & factory)
         static constexpr size_t default_max_array_size = 500000;
 
         String dictionary_layout_prefix = config_prefix + ".layout" + ".flat";
+        const DictionaryLifetime dict_lifetime{config, config_prefix + ".lifetime"};
 
         FlatDictionary::Configuration configuration
         {
             .initial_array_size = config.getUInt64(dictionary_layout_prefix + ".initial_array_size", default_initial_array_size),
             .max_array_size = config.getUInt64(dictionary_layout_prefix + ".max_array_size", default_max_array_size),
-            .require_nonempty = config.getBool(config_prefix + ".require_nonempty", false)
+            .require_nonempty = config.getBool(config_prefix + ".require_nonempty", false),
+            .dict_lifetime = dict_lifetime
         };
 
         const auto dict_id = StorageID::fromDictionaryConfig(config, config_prefix);
-        const DictionaryLifetime dict_lifetime{config, config_prefix + ".lifetime"};
 
-        return std::make_unique<FlatDictionary>(dict_id, dict_struct, std::move(source_ptr), dict_lifetime, std::move(configuration));
+        return std::make_unique<FlatDictionary>(dict_id, dict_struct, std::move(source_ptr), configuration);
     };
 
-    factory.registerLayout("flat", create_layout, false);
+    factory.registerLayout("flat", create_layout, false, false, Documentation{
+        .description = R"DOCS_MD(
+# flat dictionary layout
+
+With the `flat` layout, the dictionary is completely stored in memory in the form of flat arrays.
+The amount of memory used is proportional to the size of the largest key (in space used).
+
+<Tip>
+This layout type provides the best performance among all available methods of storing a dictionary.
+</Tip>
+
+The dictionary key has the [UInt64](/reference/data-types/int-uint) type and the value is limited to `max_array_size` (by default — 500,000).
+If a larger key is discovered when creating the dictionary, ClickHouse throws an exception and does not create the dictionary.
+The initial size of dictionary flat arrays are controlled by the `initial_array_size` setting (by default — 1024).
+
+All types of sources are supported.
+When updating the dictionary, data (from a file or from a table) is read in its entirety.
+
+Configuration example:
+
+<Tabs>
+<Tab title="DDL">
+
+```sql
+LAYOUT(FLAT(INITIAL_ARRAY_SIZE 50000 MAX_ARRAY_SIZE 5000000))
+```
+
+</Tab>
+<Tab title="Configuration file">
+
+```xml
+<layout>
+  <flat>
+    <initial_array_size>50000</initial_array_size>
+    <max_array_size>5000000</max_array_size>
+  </flat>
+</layout>
+```
+
+</Tab>
+</Tabs>
+<br/>
+)DOCS_MD",
+        .syntax = "LAYOUT(FLAT([INITIAL_ARRAY_SIZE n] [MAX_ARRAY_SIZE n]))",
+        .related = {"hashed"}});
 }
 
 

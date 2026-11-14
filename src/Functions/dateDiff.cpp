@@ -1,10 +1,12 @@
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Common/IntervalKind.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnsDateTime.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnDecimal.h>
-
+#include <Formats/FormatSettings.h>
 #include <Functions/IFunction.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionFactory.h>
@@ -16,6 +18,7 @@
 
 #include <base/find_symbols.h>
 
+#include <tuple>
 #include <type_traits>
 
 
@@ -24,8 +27,6 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int ILLEGAL_COLUMN;
     extern const int BAD_ARGUMENTS;
 }
@@ -33,164 +34,101 @@ namespace ErrorCodes
 namespace
 {
 
-/** dateDiff('unit', t1, t2, [timezone])
-  * t1 and t2 can be Date or DateTime
-  *
-  * If timezone is specified, it applied to both arguments.
-  * If not, timezones from datatypes t1 and t2 are used.
-  * If that timezones are not the same, the result is unspecified.
-  *
-  * Timezone matters because days can have different length.
-  */
-class FunctionDateDiff : public IFunction
+/// The components of a value below a unit, most significant first: tuples of them compare lexicographically.
+auto belowMicrosecond(const DateTimeComponentsWithFractionalPart & c) { return std::tie(c.nanosecond); }
+auto belowMillisecond(const DateTimeComponentsWithFractionalPart & c) { return std::tie(c.microsecond, c.nanosecond); }
+auto belowSecond(const DateTimeComponentsWithFractionalPart & c) { return std::tie(c.millisecond, c.microsecond, c.nanosecond); }
+auto belowMinute(const DateTimeComponentsWithFractionalPart & c) { return std::tie(c.time.second, c.millisecond, c.microsecond, c.nanosecond); }
+auto belowHour(const DateTimeComponentsWithFractionalPart & c) { return std::tie(c.time.minute, c.time.second, c.millisecond, c.microsecond, c.nanosecond); }
+auto belowDay(const DateTimeComponentsWithFractionalPart & c) { return std::tie(c.time.hour, c.time.minute, c.time.second, c.millisecond, c.microsecond, c.nanosecond); }
+auto belowMonth(const DateTimeComponentsWithFractionalPart & c) { return std::tie(c.date.day, c.time.hour, c.time.minute, c.time.second, c.millisecond, c.microsecond, c.nanosecond); }
+auto belowYear(const DateTimeComponentsWithFractionalPart & c) { return std::tie(c.date.month, c.date.day, c.time.hour, c.time.minute, c.time.second, c.millisecond, c.microsecond, c.nanosecond); }
+
+class DateDiffImpl
 {
-    using ColumnDateTime64 = ColumnDecimal<DateTime64>;
 public:
-    static constexpr auto name = "dateDiff";
-    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionDateDiff>(); }
+    using ColumnDateTime64 = ColumnDecimal<DateTime64>;
 
-    String getName() const override
-    {
-        return name;
-    }
+    DateDiffImpl(const String & name_, bool is_diff_) : name(name_), is_diff(is_diff_) {}
 
-    bool isVariadic() const override { return true; }
-    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
-    size_t getNumberOfArguments() const override { return 0; }
-
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
-    {
-        if (arguments.size() != 3 && arguments.size() != 4)
-            throw Exception("Number of arguments for function " + getName() + " doesn't match: passed "
-                + toString(arguments.size()) + ", should be 3 or 4",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
-
-        if (!isString(arguments[0]))
-            throw Exception("First argument for function " + getName() + " (unit) must be String",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-        if (!isDate(arguments[1]) && !isDateTime(arguments[1]) && !isDateTime64(arguments[1]))
-            throw Exception("Second argument for function " + getName() + " must be Date or DateTime",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-        if (!isDate(arguments[2]) && !isDateTime(arguments[2]) && !isDateTime64(arguments[2]))
-            throw Exception("Third argument for function " + getName() + " must be Date or DateTime",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-        if (arguments.size() == 4 && !isString(arguments[3]))
-            throw Exception("Fourth argument for function " + getName() + " (timezone) must be String",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-        return std::make_shared<DataTypeInt64>();
-    }
-
-    bool useDefaultImplementationForConstants() const override { return true; }
-    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0, 3}; }
-
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
-    {
-        const auto * unit_column = checkAndGetColumnConst<ColumnString>(arguments[0].column.get());
-        if (!unit_column)
-            throw Exception("First argument for function " + getName() + " must be constant String", ErrorCodes::ILLEGAL_COLUMN);
-
-        String unit = Poco::toLower(unit_column->getValue<String>());
-
-        const IColumn & x = *arguments[1].column;
-        const IColumn & y = *arguments[2].column;
-
-        size_t rows = input_rows_count;
-        auto res = ColumnInt64::create(rows);
-
-        const auto & timezone_x = extractTimeZoneFromFunctionArguments(arguments, 3, 1);
-        const auto & timezone_y = extractTimeZoneFromFunctionArguments(arguments, 3, 2);
-
-        if (unit == "year" || unit == "yy" || unit == "yyyy")
-            dispatchForColumns<ToRelativeYearNumImpl>(x, y, timezone_x, timezone_y, res->getData());
-        else if (unit == "quarter" || unit == "qq" || unit == "q")
-            dispatchForColumns<ToRelativeQuarterNumImpl>(x, y, timezone_x, timezone_y, res->getData());
-        else if (unit == "month" || unit == "mm" || unit == "m")
-            dispatchForColumns<ToRelativeMonthNumImpl>(x, y, timezone_x, timezone_y, res->getData());
-        else if (unit == "week" || unit == "wk" || unit == "ww")
-            dispatchForColumns<ToRelativeWeekNumImpl>(x, y, timezone_x, timezone_y, res->getData());
-        else if (unit == "day" || unit == "dd" || unit == "d")
-            dispatchForColumns<ToRelativeDayNumImpl>(x, y, timezone_x, timezone_y, res->getData());
-        else if (unit == "hour" || unit == "hh")
-            dispatchForColumns<ToRelativeHourNumImpl>(x, y, timezone_x, timezone_y, res->getData());
-        else if (unit == "minute" || unit == "mi" || unit == "n")
-            dispatchForColumns<ToRelativeMinuteNumImpl>(x, y, timezone_x, timezone_y, res->getData());
-        else if (unit == "second" || unit == "ss" || unit == "s")
-            dispatchForColumns<ToRelativeSecondNumImpl>(x, y, timezone_x, timezone_y, res->getData());
-        else
-            throw Exception("Function " + getName() + " does not support '" + unit + "' unit", ErrorCodes::BAD_ARGUMENTS);
-
-        return res;
-    }
-
-private:
     template <typename Transform>
     void dispatchForColumns(
-        const IColumn & x, const IColumn & y,
+        const IColumn & col_x, const IColumn & col_y,
         const DateLUTImpl & timezone_x, const DateLUTImpl & timezone_y,
+        size_t input_rows_count,
         ColumnInt64::Container & result) const
     {
-        if (const auto * x_vec_16 = checkAndGetColumn<ColumnUInt16>(&x))
-            dispatchForSecondColumn<Transform>(*x_vec_16, y, timezone_x, timezone_y, result);
-        else if (const auto * x_vec_32 = checkAndGetColumn<ColumnUInt32>(&x))
-            dispatchForSecondColumn<Transform>(*x_vec_32, y, timezone_x, timezone_y, result);
-        else if (const auto * x_vec_64 = checkAndGetColumn<ColumnDateTime64>(&x))
-            dispatchForSecondColumn<Transform>(*x_vec_64, y, timezone_x, timezone_y, result);
-        else if (const auto * x_const_16 = checkAndGetColumnConst<ColumnUInt16>(&x))
-            dispatchConstForSecondColumn<Transform>(x_const_16->getValue<UInt16>(), y, timezone_x, timezone_y, result);
-        else if (const auto * x_const_32 = checkAndGetColumnConst<ColumnUInt32>(&x))
-            dispatchConstForSecondColumn<Transform>(x_const_32->getValue<UInt32>(), y, timezone_x, timezone_y, result);
-        else if (const auto * x_const_64 = checkAndGetColumnConst<ColumnDateTime64>(&x))
-            dispatchConstForSecondColumn<Transform>(x_const_64->getValue<DecimalField<DateTime64>>(), y, timezone_x, timezone_y, result);
+        if (const auto * x_vec_16 = checkAndGetColumn<ColumnDate>(&col_x))
+            dispatchForSecondColumn<Transform>(*x_vec_16, col_y, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * x_vec_32 = checkAndGetColumn<ColumnDateTime>(&col_x))
+            dispatchForSecondColumn<Transform>(*x_vec_32, col_y, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * x_vec_32_s = checkAndGetColumn<ColumnDate32>(&col_x))
+            dispatchForSecondColumn<Transform>(*x_vec_32_s, col_y, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * x_vec_64 = checkAndGetColumn<ColumnDateTime64>(&col_x))
+            dispatchForSecondColumn<Transform>(*x_vec_64, col_y, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * x_const_16 = checkAndGetColumnConst<ColumnDate>(&col_x))
+            dispatchConstForSecondColumn<Transform>(x_const_16->getValue<UInt16>(), col_y, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * x_const_32 = checkAndGetColumnConst<ColumnDateTime>(&col_x))
+            dispatchConstForSecondColumn<Transform>(x_const_32->getValue<UInt32>(), col_y, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * x_const_32_s = checkAndGetColumnConst<ColumnDate32>(&col_x))
+            dispatchConstForSecondColumn<Transform>(x_const_32_s->getValue<Int32>(), col_y, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * x_const_64 = checkAndGetColumnConst<ColumnDateTime64>(&col_x))
+            dispatchConstForSecondColumn<Transform>(x_const_64->getValue<DecimalField<DateTime64>>(), col_y, timezone_x, timezone_y, input_rows_count, result);
         else
-            throw Exception("Illegal column for first argument of function " + getName() + ", must be Date, DateTime or DateTime64", ErrorCodes::ILLEGAL_COLUMN);
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column for first argument of function {}, must be Date, Date32, DateTime or DateTime64", name);
     }
 
     template <typename Transform, typename LeftColumnType>
     void dispatchForSecondColumn(
-        const LeftColumnType & x, const IColumn & y,
+        const LeftColumnType & x, const IColumn & col_y,
         const DateLUTImpl & timezone_x, const DateLUTImpl & timezone_y,
+        size_t input_rows_count,
         ColumnInt64::Container & result) const
     {
-        if (const auto * y_vec_16 = checkAndGetColumn<ColumnUInt16>(&y))
-            vectorVector<Transform>(x, *y_vec_16, timezone_x, timezone_y, result);
-        else if (const auto * y_vec_32 = checkAndGetColumn<ColumnUInt32>(&y))
-            vectorVector<Transform>(x, *y_vec_32, timezone_x, timezone_y, result);
-        else if (const auto * y_vec_64 = checkAndGetColumn<ColumnDateTime64>(&y))
-            vectorVector<Transform>(x, *y_vec_64, timezone_x, timezone_y, result);
-        else if (const auto * y_const_16 = checkAndGetColumnConst<ColumnUInt16>(&y))
-            vectorConstant<Transform>(x, y_const_16->getValue<UInt16>(), timezone_x, timezone_y, result);
-        else if (const auto * y_const_32 = checkAndGetColumnConst<ColumnUInt32>(&y))
-            vectorConstant<Transform>(x, y_const_32->getValue<UInt32>(), timezone_x, timezone_y, result);
-        else if (const auto * y_const_64 = checkAndGetColumnConst<ColumnDateTime64>(&y))
-            vectorConstant<Transform>(x, y_const_64->getValue<DecimalField<DateTime64>>(), timezone_x, timezone_y, result);
+        if (const auto * y_vec_16 = checkAndGetColumn<ColumnDate>(&col_y))
+            vectorVector<Transform>(x, *y_vec_16, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_vec_32 = checkAndGetColumn<ColumnDateTime>(&col_y))
+            vectorVector<Transform>(x, *y_vec_32, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_vec_32_s = checkAndGetColumn<ColumnDate32>(&col_y))
+            vectorVector<Transform>(x, *y_vec_32_s, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_vec_64 = checkAndGetColumn<ColumnDateTime64>(&col_y))
+            vectorVector<Transform>(x, *y_vec_64, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_const_16 = checkAndGetColumnConst<ColumnDate>(&col_y))
+            vectorConstant<Transform>(x, y_const_16->getValue<UInt16>(), timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_const_32 = checkAndGetColumnConst<ColumnDateTime>(&col_y))
+            vectorConstant<Transform>(x, y_const_32->getValue<UInt32>(), timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_const_32_s = checkAndGetColumnConst<ColumnDate32>(&col_y))
+            vectorConstant<Transform>(x, y_const_32_s->getValue<Int32>(), timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_const_64 = checkAndGetColumnConst<ColumnDateTime64>(&col_y))
+            vectorConstant<Transform>(x, y_const_64->getValue<DecimalField<DateTime64>>(), timezone_x, timezone_y, input_rows_count, result);
         else
-            throw Exception("Illegal column for second argument of function " + getName() + ", must be Date or DateTime", ErrorCodes::ILLEGAL_COLUMN);
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column for second argument of function {}, must be Date, Date32, DateTime or DateTime64", name);
     }
 
     template <typename Transform, typename T1>
     void dispatchConstForSecondColumn(
-        T1 x, const IColumn & y,
+        T1 x, const IColumn & col_y,
         const DateLUTImpl & timezone_x, const DateLUTImpl & timezone_y,
+        size_t input_rows_count,
         ColumnInt64::Container & result) const
     {
-        if (const auto * y_vec_16 = checkAndGetColumn<ColumnUInt16>(&y))
-            constantVector<Transform>(x, *y_vec_16, timezone_x, timezone_y, result);
-        else if (const auto * y_vec_32 = checkAndGetColumn<ColumnUInt32>(&y))
-            constantVector<Transform>(x, *y_vec_32, timezone_x, timezone_y, result);
-        else if (const auto * y_vec_64 = checkAndGetColumn<ColumnDateTime64>(&y))
-            constantVector<Transform>(x, *y_vec_64, timezone_x, timezone_y, result);
+        if (const auto * y_vec_16 = checkAndGetColumn<ColumnDate>(&col_y))
+            constantVector<Transform>(x, *y_vec_16, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_vec_32 = checkAndGetColumn<ColumnDateTime>(&col_y))
+            constantVector<Transform>(x, *y_vec_32, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_vec_32_s = checkAndGetColumn<ColumnDate32>(&col_y))
+            constantVector<Transform>(x, *y_vec_32_s, timezone_x, timezone_y, input_rows_count, result);
+        else if (const auto * y_vec_64 = checkAndGetColumn<ColumnDateTime64>(&col_y))
+            constantVector<Transform>(x, *y_vec_64, timezone_x, timezone_y, input_rows_count, result);
         else
-            throw Exception("Illegal column for second argument of function " + getName() + ", must be Date or DateTime", ErrorCodes::ILLEGAL_COLUMN);
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column for second argument of function {}, must be Date, Date32, DateTime or DateTime64", name);
     }
 
     template <typename Transform, typename LeftColumnType, typename RightColumnType>
     void vectorVector(
         const LeftColumnType & x, const RightColumnType & y,
         const DateLUTImpl & timezone_x, const DateLUTImpl & timezone_y,
+        size_t input_rows_count,
         ColumnInt64::Container & result) const
     {
         const auto & x_data = x.getData();
@@ -198,14 +136,15 @@ private:
 
         const auto transform_x = TransformDateTime64<Transform>(getScale(x));
         const auto transform_y = TransformDateTime64<Transform>(getScale(y));
-        for (size_t i = 0, size = x.size(); i < size; ++i)
-                result[i] = calculate(transform_x, transform_y, x_data[i], y_data[i], timezone_x, timezone_y);
+        for (size_t i = 0; i < input_rows_count; ++i)
+            result[i] = calculate(transform_x, transform_y, x_data[i], y_data[i], timezone_x, timezone_y);
     }
 
     template <typename Transform, typename LeftColumnType, typename T2>
     void vectorConstant(
         const LeftColumnType & x, T2 y,
         const DateLUTImpl & timezone_x, const DateLUTImpl & timezone_y,
+        size_t input_rows_count,
         ColumnInt64::Container & result) const
     {
         const auto & x_data = x.getData();
@@ -213,7 +152,7 @@ private:
         const auto transform_y = TransformDateTime64<Transform>(getScale(y));
         const auto y_value = stripDecimalFieldValue(y);
 
-        for (size_t i = 0, size = x.size(); i < size; ++i)
+        for (size_t i = 0; i < input_rows_count; ++i)
             result[i] = calculate(transform_x, transform_y, x_data[i], y_value, timezone_x, timezone_y);
     }
 
@@ -221,6 +160,7 @@ private:
     void constantVector(
         T1 x, const RightColumnType & y,
         const DateLUTImpl & timezone_x, const DateLUTImpl & timezone_y,
+        size_t input_rows_count,
         ColumnInt64::Container & result) const
     {
         const auto & y_data = y.getData();
@@ -228,15 +168,112 @@ private:
         const auto transform_y = TransformDateTime64<Transform>(getScale(y));
         const auto x_value = stripDecimalFieldValue(x);
 
-        for (size_t i = 0, size = y.size(); i < size; ++i)
+        for (size_t i = 0; i < input_rows_count; ++i)
             result[i] = calculate(transform_x, transform_y, x_value, y_data[i], timezone_x, timezone_y);
     }
 
     template <typename TransformX, typename TransformY, typename T1, typename T2>
     Int64 calculate(const TransformX & transform_x, const TransformY & transform_y, T1 x, T2 y, const DateLUTImpl & timezone_x, const DateLUTImpl & timezone_y) const
     {
-        return Int64(transform_y.execute(y, timezone_y))
-             - Int64(transform_x.execute(x, timezone_x));
+        auto res = static_cast<Int64>(
+            static_cast<UInt64>(transform_y.execute(y, timezone_y))
+            - static_cast<UInt64>(transform_x.execute(x, timezone_x)));
+
+        if (is_diff)
+        {
+            return res;
+        }
+        else
+        {
+            /// Adjust res:
+            DateTimeComponentsWithFractionalPart a_comp;
+            DateTimeComponentsWithFractionalPart b_comp;
+            Int64 adjust_value = 0;
+            /// Compare the ticks in a common scale. In 128 bits, because nanoseconds overflow 64 bits past 2262.
+            const bool x_is_first = static_cast<__int128>(toTicks(x, timezone_x)) * transform_y.getScaleMultiplier()
+                <= static_cast<__int128>(toTicks(y, timezone_y)) * transform_x.getScaleMultiplier();
+
+            if (x_is_first)
+            {
+                a_comp = TransformDateTime64<ToDateTimeComponentsImpl>(transform_x.getScaleMultiplier()).execute(x, timezone_x);
+                b_comp = TransformDateTime64<ToDateTimeComponentsImpl>(transform_y.getScaleMultiplier()).execute(y, timezone_y);
+                adjust_value = -1;
+            }
+            else
+            {
+                a_comp = TransformDateTime64<ToDateTimeComponentsImpl>(transform_y.getScaleMultiplier()).execute(y, timezone_y);
+                b_comp = TransformDateTime64<ToDateTimeComponentsImpl>(transform_x.getScaleMultiplier()).execute(x, timezone_x);
+                adjust_value = 1;
+            }
+
+            if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeYearNumImpl<ResultPrecision::Extended>>>)
+            {
+                if (belowYear(a_comp) > belowYear(b_comp))
+                    res += adjust_value;
+            }
+            else if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeQuarterNumImpl<ResultPrecision::Extended>>>)
+            {
+                if (std::tuple_cat(std::tuple((a_comp.date.month - 1) % 3), belowMonth(a_comp))
+                    > std::tuple_cat(std::tuple((b_comp.date.month - 1) % 3), belowMonth(b_comp)))
+                    res += adjust_value;
+            }
+            else if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeMonthNumImpl<ResultPrecision::Extended>>>)
+            {
+                if (belowMonth(a_comp) > belowMonth(b_comp))
+                    res += adjust_value;
+            }
+            else if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeWeekNumImpl<ResultPrecision::Extended>>>)
+            {
+                auto a_day_of_week = TransformDateTime64<ToDayOfWeekImpl>(transform_x.getScaleMultiplier()).execute(x, static_cast<UInt8>(0), timezone_x);
+                auto b_day_of_week = TransformDateTime64<ToDayOfWeekImpl>(transform_y.getScaleMultiplier()).execute(y, static_cast<UInt8>(0), timezone_y);
+                if (!x_is_first)
+                    std::swap(a_day_of_week, b_day_of_week);
+                if (std::tuple_cat(std::tuple(a_day_of_week), belowDay(a_comp))
+                    > std::tuple_cat(std::tuple(b_day_of_week), belowDay(b_comp)))
+                    res += adjust_value;
+            }
+            else if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeDayNumImpl<ResultPrecision::Extended>>>)
+            {
+                if (belowDay(a_comp) > belowDay(b_comp))
+                    res += adjust_value;
+            }
+            else if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeHourNumImpl<ResultPrecision::Extended>>>)
+            {
+                if (belowHour(a_comp) > belowHour(b_comp))
+                    res += adjust_value;
+            }
+            else if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeMinuteNumImpl<ResultPrecision::Extended>>>)
+            {
+                if (belowMinute(a_comp) > belowMinute(b_comp))
+                    res += adjust_value;
+            }
+            else if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeSecondNumImpl<ResultPrecision::Extended>>>)
+            {
+                if (belowSecond(a_comp) > belowSecond(b_comp))
+                    res += adjust_value;
+            }
+            else if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeSubsecondNumImpl<millisecond_multiplier>>>)
+            {
+                if (belowMillisecond(a_comp) > belowMillisecond(b_comp))
+                    res += adjust_value;
+            }
+            else if constexpr (std::is_same_v<TransformX, TransformDateTime64<ToRelativeSubsecondNumImpl<microsecond_multiplier>>>)
+            {
+                if (belowMicrosecond(a_comp) > belowMicrosecond(b_comp))
+                    res += adjust_value;
+            }
+            return res;
+        }
+    }
+
+    /// The value in ticks of its own scale; seconds for the types without a scale.
+    template <typename T>
+    static Int64 toTicks(T v, const DateLUTImpl & time_zone)
+    {
+        if constexpr (std::is_same_v<T, DateTime64>)
+            return v.value;
+        else
+            return ToRelativeSecondNumImpl<ResultPrecision::Extended>::execute(v, time_zone);
     }
 
     template <typename T>
@@ -257,14 +294,344 @@ private:
         else
             return v;
     }
+private:
+    String name;
+    bool is_diff;
+};
+
+
+/** dateDiff('unit', t1, t2[, timezone])
+  * age('unit', t1, t2[, timezone])
+  * t1 and t2 can be Date, Date32, DateTime or DateTime64
+  *
+  * If timezone is specified, it is applied to both arguments.
+  * If not, timezones from datatypes t1 and t2 are used.
+  * If those timezones are not the same, the result is unspecified.
+  *
+  * The timezone matters because days can have different lengths.
+  */
+class FunctionDateDiff final : public IFunction
+{
+public:
+    FunctionDateDiff(const char * name_, bool is_relative_)
+        : function_name(name_), impl{function_name, is_relative_} {}
+
+    static FunctionPtr create(const char * name, bool is_relative)
+    {
+        return std::make_shared<FunctionDateDiff>(name, is_relative);
+    }
+
+    String getName() const override { return function_name; }
+
+    bool isVariadic() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+    size_t getNumberOfArguments() const override { return 0; }
+    bool useDefaultImplementationForConstants() const override { return true; }
+    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0, 3}; }
+
+    String getSignatureString() const override
+    {
+        return "(const String, DateOrDateTime, DateOrDateTime, [const String]) -> Int64";
+    }
+
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
+        return std::make_shared<DataTypeInt64>();
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        const auto * col_unit = checkAndGetColumnConst<ColumnString>(arguments[0].column.get());
+        if (!col_unit)
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "First argument for function {} must be constant String", getName());
+
+        String unit = Poco::toLower(col_unit->getValue<String>());
+
+        const IColumn & col_x = *arguments[1].column;
+        const IColumn & col_y = *arguments[2].column;
+
+        auto col_res = ColumnInt64::create(input_rows_count);
+
+        const auto & timezone_x = extractTimeZoneFromFunctionArguments(arguments, 3, 1);
+        const auto & timezone_y = extractTimeZoneFromFunctionArguments(arguments, 3, 2);
+
+        if (unit == "year" || unit == "years" || unit == "yy" || unit == "yyyy")
+            impl.template dispatchForColumns<ToRelativeYearNumImpl<ResultPrecision::Extended>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "quarter" || unit == "quarters" || unit == "qq" || unit == "q")
+            impl.template dispatchForColumns<ToRelativeQuarterNumImpl<ResultPrecision::Extended>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "month" || unit == "months" || unit == "mm" || unit == "m")
+            impl.template dispatchForColumns<ToRelativeMonthNumImpl<ResultPrecision::Extended>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "week" || unit == "weeks" || unit == "wk" || unit == "ww")
+            impl.template dispatchForColumns<ToRelativeWeekNumImpl<ResultPrecision::Extended>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "day" || unit == "days" || unit == "dd" || unit == "d")
+            impl.template dispatchForColumns<ToRelativeDayNumImpl<ResultPrecision::Extended>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "hour" || unit == "hours" || unit == "hh" || unit == "h")
+            impl.template dispatchForColumns<ToRelativeHourNumImpl<ResultPrecision::Extended>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "minute" || unit == "minutes" || unit == "mi" || unit == "n")
+            impl.template dispatchForColumns<ToRelativeMinuteNumImpl<ResultPrecision::Extended>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "second" || unit == "seconds" || unit == "ss" || unit == "s")
+            impl.template dispatchForColumns<ToRelativeSecondNumImpl<ResultPrecision::Extended>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "millisecond" || unit == "milliseconds" || unit == "ms")
+            impl.template dispatchForColumns<ToRelativeSubsecondNumImpl<millisecond_multiplier>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "microsecond" || unit == "microseconds" || unit == "us" || unit == "u")
+            impl.template dispatchForColumns<ToRelativeSubsecondNumImpl<microsecond_multiplier>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else if (unit == "nanosecond" || unit == "nanoseconds" || unit == "ns")
+            impl.template dispatchForColumns<ToRelativeSubsecondNumImpl<nanosecond_multiplier>>(col_x, col_y, timezone_x, timezone_y, input_rows_count, col_res->getData());
+        else
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function {} does not support '{}' unit", getName(), unit);
+
+        return col_res;
+    }
+private:
+    const char * function_name;
+    DateDiffImpl impl;
+};
+
+
+/** timeDiff(t1, t2)
+  * t1 and t2 can be Date or DateTime
+  */
+class FunctionTimeDiff final : public IFunction
+{
+    using ColumnDateTime64 = ColumnDecimal<DateTime64>;
+public:
+    static constexpr auto name = "timeDiff";
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionTimeDiff>(); }
+
+    String getName() const override { return name; }
+    bool useDefaultImplementationForConstants() const override { return true; }
+    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {}; }
+    bool isVariadic() const override { return false; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+    size_t getNumberOfArguments() const override { return 2; }
+
+    String getSignatureString() const override
+    {
+        return "(DateOrDateTime, DateOrDateTime) -> Int64";
+    }
+
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
+        return std::make_shared<DataTypeInt64>();
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        const IColumn & col_x = *arguments[0].column;
+        const IColumn & col_y = *arguments[1].column;
+
+        auto col_res = ColumnInt64::create(input_rows_count);
+
+        impl.dispatchForColumns<ToRelativeSecondNumImpl<ResultPrecision::Extended>>(col_x, col_y, DateLUT::instance(), DateLUT::instance(), input_rows_count, col_res->getData());
+
+        return col_res;
+    }
+private:
+    DateDiffImpl impl{name, true};
 };
 
 }
 
-void registerFunctionDateDiff(FunctionFactory & factory)
+REGISTER_FUNCTION(DateDiff)
 {
-    factory.registerFunction<FunctionDateDiff>(FunctionFactory::CaseInsensitive);
+    FunctionDocumentation::Description description = R"(
+Returns the count of the specified `unit` boundaries crossed between the `startdate` and the `enddate`.
+The difference is calculated using relative units. For example, the difference between 2021-12-29 and 2022-01-01 is 3 days for unit day
+(see [`toRelativeDayNum`](#toRelativeDayNum)), 1 month for unit month (see [`toRelativeMonthNum`](#toRelativeMonthNum)) and 1 year for unit year
+(see [`toRelativeYearNum`](#toRelativeYearNum)).
+
+If the unit `week` was specified, then `dateDiff` assumes that weeks start on Monday.
+Note that this behavior is different from that of function `toWeek()` in which weeks start by default on Sunday.
+
+For an alternative to `dateDiff`, see function [`age`](#age).
+    )";
+    FunctionDocumentation::Syntax syntax = R"(
+dateDiff(unit, startdate, enddate[, timezone])
+    )";
+    FunctionDocumentation::Arguments arguments =
+    {
+        {"unit", R"(The type of interval for result.
+
+| Unit        | Possible values                           |
+|-------------|-------------------------------------------|
+| nanosecond  | `nanosecond`, `nanoseconds`, `ns`         |
+| microsecond | `microsecond`, `microseconds`, `us`, `u`  |
+| millisecond | `millisecond`, `milliseconds`, `ms`       |
+| second      | `second`, `seconds`, `ss`, `s`            |
+| minute      | `minute`, `minutes`, `mi`, `n`            |
+| hour        | `hour`, `hours`, `hh`, `h`                |
+| day         | `day`, `days`, `dd`, `d`                  |
+| week        | `week`, `weeks`, `wk`, `ww`               |
+| month       | `month`, `months`, `mm`, `m`              |
+| quarter     | `quarter`, `quarters`, `qq`, `q`          |
+| year        | `year`, `years`, `yyyy`, `yy`             |
+)"},
+        {"startdate", "The first time value to subtract (the subtrahend).", {"Date", "Date32", "DateTime", "DateTime64"}},
+        {"enddate", "The second time value to subtract from (the minuend).", {"Date", "Date32", "DateTime", "DateTime64"}},
+        {"timezone", "Optional. Timezone name. If specified, it is applied to both `startdate` and `enddate`. If not specified, timezones of `startdate` and `enddate` are used. If they are not the same, the result is unspecified.", {"String"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the difference between `enddate` and `startdate` expressed in `unit`.", {"Int64"}};
+    FunctionDocumentation::Examples examples =
+    {
+        {"Calculate date difference in hours", R"(
+SELECT dateDiff('hour', toDateTime('2018-01-01 22:00:00'), toDateTime('2018-01-02 23:00:00')) AS res
+        )",
+        R"(
+┌─res─┐
+│  25 │
+└─────┘
+        )"},
+        {"Calculate date difference in different units", R"(
+SELECT
+    toDate('2022-01-01') AS e,
+    toDate('2021-12-29') AS s,
+    dateDiff('day', s, e) AS day_diff,
+    dateDiff('month', s, e) AS month_diff,
+    dateDiff('year', s, e) AS year_diff
+        )",
+        R"(
+┌──────────e─┬──────────s─┬─day_diff─┬─month_diff─┬─year_diff─┐
+│ 2022-01-01 │ 2021-12-29 │        3 │          1 │         1 │
+└────────────┴────────────┴──────────┴────────────┴───────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {23, 4};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::DateAndTime;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction("dateDiff",
+        [](ContextPtr){ return FunctionDateDiff::create("dateDiff", true); },
+        documentation, FunctionFactory::Case::Insensitive);
+    factory.registerAlias("date_diff", "dateDiff");
+    factory.registerAlias("DATE_DIFF", "dateDiff");
+    factory.registerAlias("timestampDiff", "dateDiff");
+    factory.registerAlias("timestamp_diff", "dateDiff");
+    factory.registerAlias("TIMESTAMP_DIFF", "dateDiff");
+}
+
+REGISTER_FUNCTION(TimeDiff)
+{
+    FunctionDocumentation::Description description = R"(
+Returns the difference between two dates or dates with time values in seconds.
+The difference is calculated as `enddate` - `startdate`.
+
+This function is equivalent to `dateDiff('second', startdate, enddate)`.
+
+For calculating time differences in other units (hours, days, months, etc.), use the [`dateDiff`](#dateDiff) function instead.
+    )";
+    FunctionDocumentation::Syntax syntax = R"(
+timeDiff(startdate, enddate)
+    )";
+    FunctionDocumentation::Arguments arguments =
+    {
+        {"startdate", "The first time value to subtract (the subtrahend).", {"Date", "Date32", "DateTime", "DateTime64"}},
+        {"enddate", "The second time value to subtract from (the minuend).", {"Date", "Date32", "DateTime", "DateTime64"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the difference between `enddate` and `startdate` expressed in seconds.", {"Int64"}};
+    FunctionDocumentation::Examples examples =
+    {
+        {"Calculate time difference in seconds", R"(
+SELECT timeDiff(toDateTime('2018-01-01 22:00:00'), toDateTime('2018-01-02 23:00:00')) AS res
+        )",
+        R"(
+┌───res─┐
+│ 90000 │
+└───────┘
+        )"},
+        {"Calculate time difference and convert to hours", R"(
+SELECT timeDiff(toDateTime('2018-01-01 22:00:00'), toDateTime('2018-01-02 23:00:00')) / 3600 AS hours
+        )",
+        R"(
+┌─hours─┐
+│    25 │
+└───────┘
+        )"},
+        {"Equivalent to dateDiff with seconds", R"(
+SELECT
+    timeDiff(toDateTime('2021-12-29'), toDateTime('2022-01-01')) AS time_diff_result,
+    dateDiff('second', toDateTime('2021-12-29'), toDateTime('2022-01-01')) AS date_diff_result
+        )",
+        R"(
+┌─time_diff_result─┬─date_diff_result─┐
+│           259200 │           259200 │
+└──────────────────┴──────────────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {23, 4};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::DateAndTime;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionTimeDiff>(documentation, FunctionFactory::Case::Insensitive);
+}
+
+REGISTER_FUNCTION(Age)
+{
+    FunctionDocumentation::Description description = R"(
+Returns the unit component of the difference between `startdate` and `enddate`.
+The difference is calculated using a precision of 1 nanosecond.
+
+For example, the difference between 2021-12-29 and 2022-01-01 is 3 days for the day unit,
+0 months for the month unit, and 0 years for the year unit.
+
+For an alternative to age, see function [`dateDiff`](#dateDiff).
+    )";
+    FunctionDocumentation::Syntax syntax = R"(
+age('unit', startdate, enddate[, timezone])
+    )";
+    FunctionDocumentation::Arguments arguments =
+    {
+        {"unit", R"(The type of interval for result.
+
+| Unit        | Possible values                          |
+|-------------|------------------------------------------|
+| nanosecond  | `nanosecond`, `nanoseconds`, `ns`        |
+| microsecond | `microsecond`, `microseconds`, `us`, `u` |
+| millisecond | `millisecond`, `milliseconds`, `ms`      |
+| second      | `second`, `seconds`, `ss`, `s`           |
+| minute      | `minute`, `minutes`, `mi`, `n`           |
+| hour        | `hour`, `hours`, `hh`, `h`               |
+| day         | `day`, `days`, `dd`, `d`                 |
+| week        | `week`, `weeks`, `wk`, `ww`              |
+| month       | `month`, `months`, `mm`, `m`             |
+| quarter     | `quarter`, `quarters`, `qq`, `q`         |
+| year        | `year`, `years`, `yyyy`, `yy`            |
+)"},
+        {"startdate", "The first time value to subtract (the subtrahend).", {"Date", "Date32", "DateTime", "DateTime64"}},
+        {"enddate", "The second time value to subtract from (the minuend).", {"Date", "Date32", "DateTime", "DateTime64"}},
+        {"timezone", "Optional. Timezone name. If specified, it is applied to both startdate and enddate. If not specified, timezones of startdate and enddate are used. If they are not the same, the result is unspecified.", {"String"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the difference between enddate and startdate expressed in unit.", {"Int32"}};
+    FunctionDocumentation::Examples examples =
+    {
+        {"Calculate age in hours", R"(
+SELECT age('hour', toDateTime('2018-01-01 22:30:00'), toDateTime('2018-01-02 23:00:00'))
+        )",
+        R"(
+┌─age('hour', toDateTime('2018-01-01 22:30:00'), toDateTime('2018-01-02 23:00:00'))─┐
+│                                                                                24 │
+└───────────────────────────────────────────────────────────────────────────────────┘
+        )"},
+        {"Calculate age in different units", R"(
+SELECT
+    toDate('2022-01-01') AS e,
+    toDate('2021-12-29') AS s,
+    age('day', s, e) AS day_age,
+    age('month', s, e) AS month_age,
+    age('year', s, e) AS year_age
+        )",
+        R"(
+┌──────────e─┬──────────s─┬─day_age─┬─month_age─┬─year_age─┐
+│ 2022-01-01 │ 2021-12-29 │       3 │         0 │        0 │
+└────────────┴────────────┴─────────┴───────────┴──────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {23, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::DateAndTime;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction("age",
+        [](ContextPtr){ return FunctionDateDiff::create("age", false); },
+        documentation, FunctionFactory::Case::Insensitive);
 }
 
 }
-

@@ -7,13 +7,17 @@ namespace DB
 /** Takes stream already sorted by `x` and finishes sorting it by (`x`, `y`).
  *  During sorting only chunks with rows that equal by `x` saved in RAM.
  * */
-class FinishSortingTransform : public SortingTransform
+class FinishSortingTransform final : public SortingTransform
 {
 public:
     /// limit - if not 0, allowed to return just first 'limit' rows in sorted order.
-    FinishSortingTransform(const Block & header, const SortDescription & description_sorted_,
+    FinishSortingTransform(
+        SharedHeader header,
+        const SortDescription & description_sorted_,
         const SortDescription & description_to_sort_,
-        size_t max_merged_block_size_, UInt64 limit_);
+        size_t max_merged_block_size_,
+        UInt64 limit_,
+        bool increase_sort_description_compile_attempts);
 
     String getName() const override { return "FinishSortingTransform"; }
 
@@ -22,7 +26,7 @@ protected:
     void generate() override;
 
 private:
-    SortDescription description_sorted;
+    SortDescriptionWithPositions description_with_positions;
 
     Chunk tail_chunk;
 };

@@ -1,6 +1,6 @@
 #pragma once
 #include <Columns/ColumnString.h>
-
+#include <Common/TargetSpecific.h>
 
 namespace DB
 {
@@ -8,60 +8,53 @@ namespace DB
 template <char not_case_lower_bound, char not_case_upper_bound>
 struct LowerUpperImpl
 {
-    static void vector(const ColumnString::Chars & data,
+    static void vector(
+        const ColumnString::Chars & data,
         const ColumnString::Offsets & offsets,
         ColumnString::Chars & res_data,
-        ColumnString::Offsets & res_offsets)
+        ColumnString::Offsets & res_offsets,
+        size_t /*input_rows_count*/)
     {
-        res_data.resize(data.size());
+        res_data.resize_exact(data.size());
         res_offsets.assign(offsets);
         array(data.data(), data.data() + data.size(), res_data.data());
     }
 
-    static void vectorFixed(const ColumnString::Chars & data, size_t /*n*/, ColumnString::Chars & res_data)
+    static void vectorFixed(const ColumnString::Chars & data, size_t /*n*/, ColumnString::Chars & res_data, size_t /*input_rows_count*/)
     {
-        res_data.resize(data.size());
+        res_data.resize_exact(data.size());
         array(data.data(), data.data() + data.size(), res_data.data());
     }
 
+    static void vectorRaw(const UInt8 * src, const UInt8 * src_end, UInt8 * dst)
+    {
+        array(src, src_end, dst);
+    }
+
 private:
+    MULTITARGET_FUNCTION_X86_V4(
+    MULTITARGET_FUNCTION_HEADER(static void NO_INLINE), arrayImpl, MULTITARGET_FUNCTION_BODY((const UInt8 * __restrict src, const UInt8 * src_end, UInt8 * __restrict dst) /// NOLINT
+    {
+        constexpr UInt8 flip_case_mask = 'A' ^ 'a';
+
+        /// Selecting the mask rather than the result keeps the vectorizer on `vpand`, not the 2-uop `vpblendvb`.
+        for (; src < src_end; ++src, ++dst)
+        {
+            const UInt8 c = *src;
+            *dst = c ^ ((c >= not_case_lower_bound && c <= not_case_upper_bound) ? flip_case_mask : UInt8(0));
+        }
+    }))
+
     static void array(const UInt8 * src, const UInt8 * src_end, UInt8 * dst)
     {
-        const auto flip_case_mask = 'A' ^ 'a';
-
-#ifdef __SSE2__
-        const auto bytes_sse = sizeof(__m128i);
-        const auto src_end_sse = src_end - (src_end - src) % bytes_sse;
-
-        const auto v_not_case_lower_bound = _mm_set1_epi8(not_case_lower_bound - 1);
-        const auto v_not_case_upper_bound = _mm_set1_epi8(not_case_upper_bound + 1);
-        const auto v_flip_case_mask = _mm_set1_epi8(flip_case_mask);
-
-        for (; src < src_end_sse; src += bytes_sse, dst += bytes_sse)
+#if USE_X86_64_MULTITARGET_CODE
+        if (isArchSupported(TargetArch::x86_64_v4))
         {
-            /// load 16 sequential 8-bit characters
-            const auto chars = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src));
-
-            /// find which 8-bit sequences belong to range [case_lower_bound, case_upper_bound]
-            const auto is_not_case
-                = _mm_and_si128(_mm_cmpgt_epi8(chars, v_not_case_lower_bound), _mm_cmplt_epi8(chars, v_not_case_upper_bound));
-
-            /// keep `flip_case_mask` only where necessary, zero out elsewhere
-            const auto xor_mask = _mm_and_si128(v_flip_case_mask, is_not_case);
-
-            /// flip case by applying calculated mask
-            const auto cased_chars = _mm_xor_si128(chars, xor_mask);
-
-            /// store result back to destination
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst), cased_chars);
+            arrayImpl_x86_64_v4(src, src_end, dst);
+            return;
         }
 #endif
-
-        for (; src < src_end; ++src, ++dst)
-            if (*src >= not_case_lower_bound && *src <= not_case_upper_bound)
-                *dst = *src ^ flip_case_mask;
-            else
-                *dst = *src;
+        arrayImpl(src, src_end, dst);
     }
 };
 

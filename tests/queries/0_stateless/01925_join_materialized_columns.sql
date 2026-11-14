@@ -34,7 +34,7 @@ SELECT * FROM t1 ALL JOIN t2 ON t1.dt = t2.dt ORDER BY t1.time, t2.time;
 SELECT '-';
 SELECT * FROM t1 ALL JOIN t2 USING (dt) ORDER BY t1.time, t2.time;
 SELECT '-';
-SELECT * FROM t1 JOIN t2 ON t1.dt1 = t2.dt2 ORDER BY t1.time, t2.time;
+SELECT * FROM t1 JOIN t2 ON t1.dt1 = t2.dt2 ORDER BY t1.time, t1.dimension_1, t2.time, t2.dimension_2;
 SELECT '-';
 SELECT * FROM t1 JOIN t2 ON t1.foo = t2.bar WHERE t2.aliascol2 == 'fact2t1_val2';
 SELECT '-';
@@ -51,5 +51,7 @@ SELECT t1.time as talias FROM t1 JOIN t2 ON talias = t2.time;
 SELECT t1.time as talias FROM t1 JOIN t2 ON talias = t2.time_alias;
 SELECT t2.time as talias FROM t1 JOIN t2 ON t1.time = talias;
 SELECT t2.time as talias FROM t1 JOIN t2 ON t1.time_alias = talias;
-SELECT time as talias FROM t1 JOIN t2 ON t1.time = talias; -- { serverError AMBIGUOUS_COLUMN_NAME }
-SELECT time as talias FROM t1 JOIN t2 ON talias = t2.time; -- { serverError AMBIGUOUS_COLUMN_NAME }
+SELECT time as talias FROM t1 JOIN t2 ON talias = t2.time;
+
+SELECT time as talias FROM t1 JOIN t2 ON t1.time = talias ORDER BY ALL;
+SELECT * FROM t1 JOIN t2 ON t1.time = t2.time AND NULL ORDER BY ALL;

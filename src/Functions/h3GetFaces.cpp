@@ -1,4 +1,4 @@
-#include "config_functions.h"
+#include <Functions/h3Common.h>
 
 #if USE_H3
 
@@ -9,49 +9,61 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/IFunction.h>
 #include <Common/typeid_cast.h>
+#include <Common/VectorWithMemoryTracking.h>
 #include <base/range.h>
-
-#include <h3api.h>
 
 
 namespace DB
 {
 namespace ErrorCodes
 {
-extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+extern const int ILLEGAL_COLUMN;
 }
 
 namespace
 {
 
-class FunctionH3GetFaces : public IFunction
+class FunctionH3GetFaces final : public IFunction
 {
 public:
     static constexpr auto name = "h3GetFaces";
 
-    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionH3GetFaces>(); }
+    H3Validator validator;
+
+    explicit FunctionH3GetFaces(const ContextPtr & context) : validator(context) {}
+
+    static FunctionPtr create(ContextPtr context) { return std::make_shared<FunctionH3GetFaces>(context); }
 
     std::string getName() const override { return name; }
 
     size_t getNumberOfArguments() const override { return 1; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    /// A `LowCardinality` dictionary always holds the type's default value at index 0, even when no
+    /// row references it, and `0` is not a valid H3 index, so executing on the whole dictionary would
+    /// fail on entirely valid data.
+    bool canBeExecutedOnDefaultArguments() const override { return !validator.throw_on_error; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    String getSignatureString() const override
     {
-        const auto * arg = arguments[0].get();
-        if (!WhichDataType(arg).isUInt64())
-            throw Exception(
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                "Illegal type {} of argument {} of function {}. Must be UInt64",
-                arg->getName(), 1, getName());
-
-        return std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt8>());
+        return "(UInt64) -> Array(UInt8)";
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
-        const auto * column = checkAndGetColumn<ColumnUInt64>(arguments[0].column.get());
+        auto non_const_arguments = arguments;
+        for (auto & argument : non_const_arguments)
+            argument.column = argument.column->convertToFullColumnIfConst();
+
+        const auto * column = checkAndGetColumn<ColumnUInt64>(non_const_arguments[0].column.get());
+        if (!column)
+            throw Exception(
+                ErrorCodes::ILLEGAL_COLUMN,
+                "Illegal type {} of argument {} of function {}. Must be UInt64.",
+                arguments[0].type->getName(),
+                1,
+                getName());
+
         const auto & data = column->getData();
 
         auto result_column_data = ColumnUInt8::create();
@@ -62,24 +74,30 @@ public:
         result_offsets.resize(input_rows_count);
 
         auto current_offset = 0;
-        std::vector<int> faces;
+        VectorWithMemoryTracking<int> faces;
 
-        for (size_t row = 0; row < input_rows_count; row++)
+        for (size_t row = 0; row < input_rows_count; ++row)
         {
-            int max_faces = maxFaceCount(data[row]);
+            if (!validator.validateCell(data[row]))
+            {
+                result_offsets[row] = current_offset;
+                continue;
+            }
+
+            int max_faces = 0;
+            maxFaceCount(data[row], &max_faces);
 
             faces.resize(max_faces);
 
-            // function name h3GetFaces (v3.x) changed to getIcosahedronFaces (v4.0.0).
             getIcosahedronFaces(data[row], faces.data());
 
-            for (int i = 0; i < max_faces; i++)
+            for (int i = 0; i < max_faces; ++i)
             {
                 // valid icosahedron faces are represented by integers 0-19
                 if (faces[i] >= 0 && faces[i] <= 19)
                 {
                     ++current_offset;
-                    result_data.emplace_back(faces[i]);
+                    result_data.emplace_back(static_cast<UInt8>(faces[i]));
                 }
             }
 
@@ -93,9 +111,34 @@ public:
 
 }
 
-void registerFunctionH3GetFaces(FunctionFactory & factory)
+REGISTER_FUNCTION(H3GetFaces)
 {
-    factory.registerFunction<FunctionH3GetFaces>();
+    FunctionDocumentation::Description description = R"(
+Returns [icosahedron](https://en.wikipedia.org/wiki/Icosahedron) faces intersected by a given [H3](#h3-index) index.
+    )";
+    FunctionDocumentation::Syntax syntax = "h3GetFaces(index)";
+    FunctionDocumentation::Arguments arguments = {
+        {"index", "Hexagon index number.", {"UInt64"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {
+        "Returns an array containing the indices (0-19) of the icosahedron faces that the H3 index intersects with.",
+        {"Array(UInt8)"}
+    };
+    FunctionDocumentation::Examples examples = {
+        {
+            "Get icosahedron faces for an H3 index",
+            "SELECT h3GetFaces(599686042433355775) AS faces",
+            R"(
+┌─faces─┐
+│ [7]   │
+└───────┘
+            )"
+        }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {21, 11};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Geo;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction<FunctionH3GetFaces>(documentation);
 }
 
 }

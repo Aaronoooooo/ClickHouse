@@ -1,18 +1,20 @@
 #pragma once
 
-#include "config_core.h"
+#include "config.h"
 
 #if USE_SQLITE
 #include <Core/Names.h>
 #include <Databases/DatabasesCommon.h>
-#include <Parsers/ASTCreateQuery.h>
 
 #include <sqlite3.h>
 
 
 namespace DB
 {
-class DatabaseSQLite final : public IDatabase, WithContext
+struct AlterCommand;
+class ASTStorage;
+
+class DatabaseSQLite final : public DatabaseWithAltersOnDiskBase, WithContext
 {
 public:
     using SQLitePtr = std::shared_ptr<sqlite3>;
@@ -22,25 +24,20 @@ public:
 
     String getEngineName() const override { return "SQLite"; }
 
-    bool canContainMergeTreeTables() const override { return false; }
-
-    bool canContainDistributedTables() const override { return false; }
-
     bool shouldBeEmptyOnDetach() const override { return false; }
 
     bool isTableExist(const String & name, ContextPtr context) const override;
 
     StoragePtr tryGetTable(const String & name, ContextPtr context) const override;
 
-    DatabaseTablesIteratorPtr getTablesIterator(ContextPtr context, const FilterByNameFunction & filter_by_table_name) const override;
+    DatabaseTablesIteratorPtr getTablesIterator(ContextPtr context, const FilterByNameFunction & filter_by_table_name, bool skip_not_loaded) const override;
 
     bool empty() const override;
-
-    ASTPtr getCreateDatabaseQuery() const override;
 
     void shutdown() override {}
 
 protected:
+    ASTPtr getCreateDatabaseQueryImpl() const override TSA_REQUIRES(mutex);
     ASTPtr getCreateTableQueryImpl(const String & table_name, ContextPtr context, bool throw_on_error) const override;
 
 private:
@@ -48,15 +45,17 @@ private:
 
     String database_path;
 
-    mutable SQLitePtr sqlite_db;
+    LoggerPtr log;
 
-    Poco::Logger * log;
+    /// Every metadata operation runs on a connection opened for that operation; see the comment in the
+    /// definition. The connection never creates a missing database file.
+    SQLitePtr openConnection() const;
 
-    bool checkSQLiteTable(const String & table_name) const;
+    static bool checkSQLiteTable(sqlite3 * sqlite_db, const String & table_name);
 
-    NameSet fetchTablesList() const;
+    static NameSet fetchTablesList(sqlite3 * sqlite_db);
 
-    StoragePtr fetchTable(const String & table_name, ContextPtr context, bool table_checked) const;
+    StoragePtr fetchTable(const SQLitePtr & sqlite_db, const String & table_name, ContextPtr context, bool table_checked) const TSA_REQUIRES(mutex);
 
 };
 

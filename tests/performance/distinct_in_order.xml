@@ -1,0 +1,39 @@
+<test>
+    <!-- high cardinality -->
+    <create_query>CREATE TABLE distinct_cardinality_high (high UInt64, medium UInt64, low UInt64) ENGINE MergeTree() ORDER BY (high, medium)</create_query>
+    <fill_query>INSERT INTO distinct_cardinality_high SELECT number % 1e6, number % 1e4, number % 1e2 FROM numbers_mt(1e8)</fill_query>
+    <fill_query>OPTIMIZE TABLE distinct_cardinality_high FINAL</fill_query>
+
+    <query>SELECT DISTINCT high FROM distinct_cardinality_high FORMAT Null</query>
+    <query>SELECT DISTINCT high, medium FROM distinct_cardinality_high FORMAT Null</query>
+
+    <query>SELECT DISTINCT high, medium FROM distinct_cardinality_high ORDER BY high, medium FORMAT Null</query>
+    <query>SELECT DISTINCT high, medium FROM distinct_cardinality_high ORDER BY high FORMAT Null</query>
+
+    <drop_query>DROP TABLE IF EXISTS distinct_cardinality_high</drop_query>
+
+    <!-- low cardinality -->
+    <create_query>CREATE TABLE distinct_cardinality_low (low UInt64, medium UInt64, high UInt64) ENGINE MergeTree() ORDER BY (low, medium)</create_query>
+    <fill_query>INSERT INTO distinct_cardinality_low SELECT number % 1e2, number % 1e4, number % 1e6 FROM numbers_mt(1e8)</fill_query>
+    <fill_query>OPTIMIZE TABLE distinct_cardinality_low FINAL</fill_query>
+
+    <query>SELECT DISTINCT low FROM distinct_cardinality_low FORMAT Null</query>
+    <query>SELECT DISTINCT low, medium FROM distinct_cardinality_low FORMAT Null</query>
+
+    <query>SELECT DISTINCT low, medium FROM distinct_cardinality_low ORDER BY low, medium FORMAT Null</query>
+    <query>SELECT DISTINCT low, medium FROM distinct_cardinality_low ORDER BY low FORMAT Null</query>
+
+    <drop_query>DROP TABLE IF EXISTS distinct_cardinality_low</drop_query>
+
+    <!-- hashed non-prefix key (UInt64 and String) over ranges of 1 and 4 rows -->
+    <create_query>CREATE TABLE distinct_in_order_small_ranges (k4 UInt64, k UInt64, a UInt64, s String) ENGINE MergeTree() ORDER BY (k4, k)</create_query>
+    <fill_query>INSERT INTO distinct_in_order_small_ranges SELECT intDiv(number, 4), number, number % 1000, toString(number % 1000) FROM numbers_mt(5e6)</fill_query>
+    <fill_query>OPTIMIZE TABLE distinct_in_order_small_ranges FINAL</fill_query>
+
+    <query>SELECT DISTINCT k4, k, a, s FROM distinct_in_order_small_ranges FORMAT Null</query>
+    <query>SELECT DISTINCT k4, a, s FROM distinct_in_order_small_ranges FORMAT Null</query>
+    <query>SELECT DISTINCT k4, k, a, s FROM distinct_in_order_small_ranges ORDER BY k4, k FORMAT Null</query>
+    <query>SELECT DISTINCT k4, a, s FROM distinct_in_order_small_ranges ORDER BY k4 FORMAT Null</query>
+
+    <drop_query>DROP TABLE IF EXISTS distinct_in_order_small_ranges</drop_query>
+</test>

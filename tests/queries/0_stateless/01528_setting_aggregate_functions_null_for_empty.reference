@@ -14,3 +14,4 @@
 45
 10
 10
+SELECT sumIf(1, greater(number, 0))\nFROM numbers(10)\nWHERE 0

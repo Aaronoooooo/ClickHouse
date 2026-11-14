@@ -1,16 +1,13 @@
 #pragma once
 
 #include <set>
-#include <map>
 #include <list>
 #include <mutex>
-#include <thread>
 #include <atomic>
 #include <boost/noncopyable.hpp>
 #include <Poco/Event.h>
 #include <base/types.h>
-#include <base/logger_useful.h>
-#include <Core/BackgroundSchedulePool.h>
+#include <Core/BackgroundSchedulePoolTaskHolder.h>
 #include <Storages/CheckResults.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 
@@ -19,6 +16,27 @@ namespace DB
 
 class StorageReplicatedMergeTree;
 
+struct ReplicatedCheckResult
+{
+    enum Action
+    {
+        None,
+
+        Cancelled,
+        DoNothing,
+        RecheckLater,
+
+        DetachUnexpected,
+        TryFetchMissing,
+    };
+
+    CheckResult status;
+    Action action = None;
+
+    bool exists_in_zookeeper{};
+    MergeTreeDataPartPtr part;
+    time_t recheck_after_seconds = 0;
+};
 
 /** Checks the integrity of the parts requested for validation.
   *
@@ -30,36 +48,12 @@ class StorageReplicatedMergeTree;
 class ReplicatedMergeTreePartCheckThread
 {
 public:
-    ReplicatedMergeTreePartCheckThread(StorageReplicatedMergeTree & storage_);
+    explicit ReplicatedMergeTreePartCheckThread(StorageReplicatedMergeTree & storage_);
     ~ReplicatedMergeTreePartCheckThread();
 
     /// Processing of the queue to be checked is done in the background thread, which you must first start.
     void start();
     void stop();
-
-    /// Don't create more than one instance of this object simultaneously.
-    struct TemporarilyStop : private boost::noncopyable
-    {
-        ReplicatedMergeTreePartCheckThread * parent;
-
-        TemporarilyStop(ReplicatedMergeTreePartCheckThread * parent_) : parent(parent_)
-        {
-            parent->stop();
-        }
-
-        TemporarilyStop(TemporarilyStop && old) : parent(old.parent)
-        {
-            old.parent = nullptr;
-        }
-
-        ~TemporarilyStop()
-        {
-            if (parent)
-                parent->start();
-        }
-    };
-
-    TemporarilyStop temporarilyStop() { return TemporarilyStop(this); }
 
     /// Add a part (for which there are suspicions that it is missing, damaged or not needed) in the queue for check.
     /// delay_to_check_seconds - check no sooner than the specified number of seconds.
@@ -68,41 +62,49 @@ public:
     /// Get the number of parts in the queue for check.
     size_t size() const;
 
-    /// Check part by name
-    CheckResult checkPart(const String & part_name);
+    /// Check part by name.
+    /// A part check that `stop` interrupted did not learn anything about the part. The background thread just
+    /// drops such a result, but a foreground `CHECK TABLE` must fail instead of reporting the part as broken,
+    /// so it passes `throw_if_cancelled` and gets `ABORTED`.
+    CheckResult checkPartAndFix(
+        const String & part_name,
+        std::optional<time_t> * recheck_after = nullptr,
+        bool throw_on_broken_projection = true,
+        bool throw_if_cancelled = false);
 
+    ReplicatedCheckResult checkPartImpl(const String & part_name, bool throw_on_broken_projection);
+
+    /// Pause parts check in a thread-safe way.
+    /// The returned guard can be safely destroyed from any thread.
+    BackgroundSchedulePoolPausableTask::PauseHolderPtr temporaryPause();
+
+    /// Can be called only while holding a BackgroundSchedulePoolTaskBlocker guard.
     void cancelRemovedPartsCheck(const MergeTreePartInfo & drop_range_info);
 
 private:
+    BackgroundSchedulePoolTaskHolder & getTask();
+
     void run();
 
-    /// Search for missing part and queue fetch if possible. Otherwise
-    /// remove part from zookeeper and queue.
-    void searchForMissingPartAndFetchIfPossible(const String & part_name, bool exists_in_zookeeper);
+    bool onPartIsLostForever(const String & part_name);
 
     std::pair<bool, MergeTreeDataPartPtr> findLocalPart(const String & part_name);
 
-    enum MissingPartSearchResult
-    {
-        /// We found this part on other replica, let's fetch it.
-        FoundAndNeedFetch,
-        /// We found covering part or source part with same min and max block number
-        /// don't need to fetch because we should do it during normal queue processing.
-        FoundAndDontNeedFetch,
-        /// Covering part not found anywhere and exact part_name doesn't found on other
-        /// replicas.
-        LostForever,
-    };
-
     /// Search for missing part on other replicas or covering part on all replicas (including our replica).
-    MissingPartSearchResult searchForMissingPartOnOtherReplicas(const String & part_name);
+    /// Returns false if the part is lost forever.
+    bool searchForMissingPartOnOtherReplicas(const String & part_name) const;
 
     StorageReplicatedMergeTree & storage;
     String log_name;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     using StringSet = std::set<String>;
-    using PartToCheck = std::pair<String, time_t>;    /// The name of the part and the minimum time to check (or zero, if not important).
+    struct PartToCheck
+    {
+        using TimePoint = std::chrono::steady_clock::time_point;
+        String name;
+        TimePoint time;
+    };
     using PartsToCheckQueue = std::list<PartToCheck>;
 
     /** Parts for which you want to check one of two:
@@ -114,9 +116,16 @@ private:
     StringSet parts_set;
     PartsToCheckQueue parts_queue;
 
+    /// Serializes cancelRemovedPartsCheck against another such call and against enqueuePart.
+    /// cancelRemovedPartsCheck drops parts_mutex while removing parts from ZooKeeper; without this
+    /// mutex a concurrent cancel or enqueue could mutate parts_queue in that gap and break the
+    /// recheck invariant. Lock order: cancel_removed_parts_mutex before parts_mutex.
+    std::mutex cancel_removed_parts_mutex;
+
     std::mutex start_stop_mutex;
     std::atomic<bool> need_stop { false };
-    BackgroundSchedulePool::TaskHolder task;
+
+    BackgroundSchedulePoolPausableTask pausable_task;
 };
 
 }

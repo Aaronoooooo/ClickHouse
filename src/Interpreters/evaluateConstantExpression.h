@@ -1,10 +1,11 @@
 #pragma once
 
-#include <Core/Block.h>
+#include <Core/Block_fwd.h>
 #include <Core/Field.h>
+#include <Columns/IColumn_fwd.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context_fwd.h>
-#include <Parsers/IAST.h>
-#include <Parsers/IParser.h>
+#include <Parsers/IAST_fwd.h>
 
 #include <memory>
 #include <optional>
@@ -15,33 +16,56 @@ namespace DB
 
 class ExpressionActions;
 class IDataType;
+/// Forward-declared on purpose: this header is included very widely, and its declarations only *name*
+/// `ConstantValue` (the alias + the function return types). Pulling in `Core/ConstantValue.h` here
+/// would drag `ColumnConst.h`/`IDataType.h` into every includer. Callers that use the value include it.
+class ConstantValue;
 
 using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
+
+using EvaluateConstantExpressionResult = std::pair<Field, std::shared_ptr<const IDataType>>;
+
+/** The value of a constant expression as an owning `ConstantValue` (size-1 const column + exact type).
+  * Unlike `EvaluateConstantExpressionResult`, this keeps the precise SQL type (`UInt8`, `Float32`,
+  * `DateTime64`, ...) instead of collapsing it through `Field`'s `NearestFieldType` mapping, and it
+  * avoids materializing a `Field` at all. Read the scalar with the typed accessors on `ConstantValue`
+  * (`getUInt`, `getDataAt`, `isNull`, ...) instead of a `Field`.
+  */
+using EvaluateConstantExpressionColumnResult = ConstantValue;
 
 /** Evaluate constant expression and its type.
   * Used in rare cases - for elements of set for IN, for data to INSERT.
   * Throws exception if it's not a constant expression.
   * Quite suboptimal.
   */
-std::pair<Field, std::shared_ptr<const IDataType>> evaluateConstantExpression(const ASTPtr & node, ContextPtr context);
+EvaluateConstantExpressionResult evaluateConstantExpression(const ASTPtr & node, const ContextPtr & context);
 
+std::optional<EvaluateConstantExpressionResult> tryEvaluateConstantExpression(const ASTPtr & node, const ContextPtr & context);
+
+/** Same as `evaluateConstantExpression`, but returns the value as a single-row column + exact type,
+  * without collapsing the type through `Field`. Prefer this on paths that only need to read a scalar
+  * (via `IColumn` typed getters) — it avoids a `Field` materialization and preserves the SQL type.
+  */
+EvaluateConstantExpressionColumnResult evaluateConstantExpressionAsColumn(const ASTPtr & node, const ContextPtr & context);
+
+std::optional<EvaluateConstantExpressionColumnResult> tryEvaluateConstantExpressionAsColumn(const ASTPtr & node, const ContextPtr & context);
 
 /** Evaluate constant expression and returns ASTLiteral with its value.
   */
-ASTPtr evaluateConstantExpressionAsLiteral(const ASTPtr & node, ContextPtr context);
+ASTPtr evaluateConstantExpressionAsLiteral(const ASTPtr & node, const ContextPtr & context);
 
 
 /** Evaluate constant expression and returns ASTLiteral with its value.
   * Also, if AST is identifier, then return string literal with its name.
   * Useful in places where some name may be specified as identifier, or as result of a constant expression.
   */
-ASTPtr evaluateConstantExpressionOrIdentifierAsLiteral(const ASTPtr & node, ContextPtr context);
+ASTPtr evaluateConstantExpressionOrIdentifierAsLiteral(const ASTPtr & node, const ContextPtr & context);
 
 /** The same as evaluateConstantExpressionOrIdentifierAsLiteral(...),
  *  but if result is an empty string, replace it with current database name
  *  or default database name.
  */
-ASTPtr evaluateConstantExpressionForDatabaseName(const ASTPtr & node, ContextPtr context);
+ASTPtr evaluateConstantExpressionForDatabaseName(const ASTPtr & node, const ContextPtr & context);
 
 /** Try to fold condition to countable set of constant values.
   * @param node a condition that we try to fold.
@@ -53,4 +77,12 @@ ASTPtr evaluateConstantExpressionForDatabaseName(const ASTPtr & node, ContextPtr
   */
 std::optional<Blocks> evaluateExpressionOverConstantCondition(const ASTPtr & node, const ExpressionActionsPtr & target_expr, size_t & limit);
 
+using ConstantVariants = std::vector<ColumnsWithTypeAndName>;
+
+/// max_elements is a hint
+std::optional<ConstantVariants> evaluateExpressionOverConstantCondition(
+    const ActionsDAG::Node * predicate,
+    const ActionsDAG::NodeRawConstPtrs & expr,
+    const ContextPtr & context,
+    size_t max_elements);
 }

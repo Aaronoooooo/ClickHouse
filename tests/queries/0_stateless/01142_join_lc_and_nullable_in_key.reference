@@ -3,17 +3,20 @@
 1	l	\N	Nullable(String)
 2		\N	Nullable(String)
 -
-1	l	\N	Nullable(String)
-0		\N	Nullable(String)
-0		\N	Nullable(String)
-1	l	\N	Nullable(String)
+1	l	Nullable(String)	\N	Nullable(String)
+0	\N	Nullable(String)	\N	Nullable(String)
+0	\N	Nullable(String)	\N	Nullable(String)
+1	l	Nullable(String)	\N	Nullable(String)
+-
 -
 1	l	\N	Nullable(String)
-0		\N	Nullable(String)
-0		\N	Nullable(String)
+0	\N	\N	Nullable(String)
+0	\N	\N	Nullable(String)
 1	l	\N	Nullable(String)
 -
-0	
+-
+0	\N
+-
 -
 1	l	\N	Nullable(String)
 2	\N	\N	Nullable(String)

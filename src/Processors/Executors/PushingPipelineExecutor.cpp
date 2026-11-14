@@ -1,7 +1,8 @@
 #include <Processors/Executors/PushingPipelineExecutor.h>
-#include <Processors/Executors/PipelineExecutor.h>
+#include <Processors/Executors/Runtime/createExecutor.h>
 #include <Processors/ISource.h>
 #include <QueryPipeline/QueryPipeline.h>
+#include <QueryPipeline/ReadProgressCallback.h>
 
 
 namespace DB
@@ -10,21 +11,22 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int QUERY_WAS_CANCELLED;
 }
 
 class PushingSource : public ISource
 {
 public:
-    explicit PushingSource(const Block & header, std::atomic_bool & need_data_flag_)
+    explicit PushingSource(SharedHeader header, std::atomic_bool & input_wait_flag_)
         : ISource(header)
-        , need_data_flag(need_data_flag_)
+        , input_wait_flag(input_wait_flag_)
     {}
 
     String getName() const override { return "PushingSource"; }
 
     void setData(Chunk chunk)
     {
-        need_data_flag = false;
+        input_wait_flag = false;
         data = std::move(chunk);
     }
 
@@ -34,7 +36,7 @@ protected:
     {
         auto status = ISource::prepare();
         if (status == Status::Ready)
-            need_data_flag = true;
+            input_wait_flag = true;
 
         return status;
     }
@@ -46,7 +48,7 @@ protected:
 
 private:
     Chunk data;
-    std::atomic_bool & need_data_flag;
+    std::atomic_bool & input_wait_flag;
 };
 
 
@@ -55,16 +57,18 @@ PushingPipelineExecutor::PushingPipelineExecutor(QueryPipeline & pipeline_) : pi
     if (!pipeline.pushing())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Pipeline for PushingPipelineExecutor must be pushing");
 
-    pushing_source = std::make_shared<PushingSource>(pipeline.input->getHeader(), need_data_flag);
+    pushing_source = std::make_shared<PushingSource>(pipeline.input->getSharedHeader(), input_wait_flag);
     connect(pushing_source->getPort(), *pipeline.input);
-    pipeline.processors.emplace_back(pushing_source);
+    pipeline.processors->emplace_back(pushing_source);
 }
 
 PushingPipelineExecutor::~PushingPipelineExecutor()
 {
+    /// It must be finalized explicitly. Otherwise we cancel it assuming it's due to an exception.
+    chassert(finished || std::uncaught_exceptions() || std::current_exception());
     try
     {
-        finish();
+        cancel();
     }
     catch (...)
     {
@@ -77,6 +81,14 @@ const Block & PushingPipelineExecutor::getHeader() const
     return pushing_source->getPort().getHeader();
 }
 
+[[noreturn]] static void throwOnUnexpectedPipelineFinish(const IProcessor & pushing_source)
+{
+    if (pushing_source.isCancelled())
+        throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Query was cancelled");
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "Pipeline for PushingPipelineExecutor was finished before all data was inserted");
+}
 
 void PushingPipelineExecutor::start()
 {
@@ -84,11 +96,12 @@ void PushingPipelineExecutor::start()
         return;
 
     started = true;
-    executor = std::make_shared<PipelineExecutor>(pipeline.processors, pipeline.process_list_element);
+    executor = createExecutor(pipeline.processors, pipeline.process_list_element);
+    executor->setReadProgressCallback(pipeline.getReadProgressCallback());
+    executor->setStepProfiler(pipeline.getStepProfiler());
 
-    if (!executor->executeStep(&need_data_flag))
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "Pipeline for PushingPipelineExecutor was finished before all data was inserted");
+    if (!executor->executeUntil(&input_wait_flag))
+        throwOnUnexpectedPipelineFinish(*pushing_source);
 }
 
 void PushingPipelineExecutor::push(Chunk chunk)
@@ -98,9 +111,8 @@ void PushingPipelineExecutor::push(Chunk chunk)
 
     pushing_source->setData(std::move(chunk));
 
-    if (!executor->executeStep(&need_data_flag))
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "Pipeline for PushingPipelineExecutor was finished before all data was inserted");
+    if (!executor->executeUntil(&input_wait_flag))
+        throwOnUnexpectedPipelineFinish(*pushing_source);
 }
 
 void PushingPipelineExecutor::push(Block block)
@@ -115,7 +127,10 @@ void PushingPipelineExecutor::finish()
     finished = true;
 
     if (executor)
-        executor->executeStep();
+    {
+        [[maybe_unused]] auto res = executor->executeUntil(nullptr);
+        chassert(!res);
+    }
 }
 
 void PushingPipelineExecutor::cancel()
@@ -124,7 +139,7 @@ void PushingPipelineExecutor::cancel()
     if (executor && !finished)
     {
         finished = true;
-        executor->cancel();
+        executor->cancel(IProcessor::CancelReason::CancelledByUser);
     }
 }
 

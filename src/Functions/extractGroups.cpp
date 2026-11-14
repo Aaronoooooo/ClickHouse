@@ -27,7 +27,7 @@ namespace
  * should produce:
  *   ['abc', '111']
  */
-class FunctionExtractGroups : public IFunction
+class FunctionExtractGroups final : public IFunction
 {
 public:
     static constexpr auto name = "extractGroups";
@@ -42,15 +42,9 @@ public:
     bool useDefaultImplementationForConstants() const override { return false; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
 
-    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
+    String getSignatureString() const override
     {
-        FunctionArgumentDescriptors args{
-            {"haystack", &isStringOrFixedString<IDataType>, nullptr, "const String or const FixedString"},
-            {"needle", &isStringOrFixedString<IDataType>, isColumnConst, "const String or const FixedString"},
-        };
-        validateFunctionArgumentTypes(*this, arguments, args);
-
-        return std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>());
+        return "(String | FixedString, const String | FixedString) -> Array(String)";
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
@@ -61,21 +55,14 @@ public:
         const auto needle = typeid_cast<const ColumnConst &>(*column_needle).getValue<String>();
 
         if (needle.empty())
-            throw Exception(getName() + " length of 'needle' argument must be greater than 0.", ErrorCodes::BAD_ARGUMENTS);
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "{} length of 'needle' argument must be greater than 0.", getName());
 
-        auto regexp = Regexps::get<false, false>(needle);
-        const auto & re2 = regexp->getRE2();
-
-        if (!re2)
-            throw Exception("There are no groups in regexp: " + needle, ErrorCodes::BAD_ARGUMENTS);
-
-        const size_t groups_count = re2->NumberOfCapturingGroups();
-
-        if (!groups_count)
-            throw Exception("There are no groups in regexp: " + needle, ErrorCodes::BAD_ARGUMENTS);
+        const OptimizedRegularExpression regexp = Regexps::createRegexp<false, false, false, false>(needle);
+        const size_t groups_count = Regexps::getCapturingGroupsCount(regexp, needle);
+        const auto & re2 = regexp.getRE2();
 
         // Including 0-group, which is the whole regexp.
-        PODArrayWithStackMemory<re2_st::StringPiece, 128> matched_groups(groups_count + 1);
+        Regexps::MatchedGroups matched_groups(groups_count + 1);
 
         ColumnArray::ColumnOffsets::MutablePtr offsets_col = ColumnArray::ColumnOffsets::create();
         ColumnString::MutablePtr data_col = ColumnString::create();
@@ -87,10 +74,11 @@ public:
 
         for (size_t i = 0; i < input_rows_count; ++i)
         {
-            StringRef current_row = column_haystack->getDataAt(i);
+            std::string_view current_row = column_haystack->getDataAt(i);
 
-            if (re2->Match(re2_st::StringPiece(current_row.data, current_row.size),
-                0, current_row.size, re2_st::RE2::UNANCHORED, matched_groups.data(), matched_groups.size()))
+            if (re2->Match({current_row.data(), current_row.size()},
+                0, current_row.size(), re2::RE2::UNANCHORED, matched_groups.data(),
+                static_cast<int>(matched_groups.size())))
             {
                 // 1 is to exclude group #0 which is whole re match.
                 for (size_t group = 1; group <= groups_count; ++group)
@@ -108,9 +96,37 @@ public:
 
 }
 
-void registerFunctionExtractGroups(FunctionFactory & factory)
+REGISTER_FUNCTION(ExtractGroups)
 {
-    factory.registerFunction<FunctionExtractGroups>();
+    FunctionDocumentation::Description description = R"(
+Extracts the capturing groups from the first substring matched by a regular expression. To extract groups from all matches, use [`extractAllGroupsHorizontal`](#extractAllGroupsHorizontal) or [`extractAllGroupsVertical`](/reference/functions/regular-functions/splitting-merging-functions#extractAllGroupsVertical).
+    )";
+    FunctionDocumentation::Syntax syntax = "extractGroups(s, regexp)";
+    FunctionDocumentation::Arguments arguments = {
+        {"s", "Input string to extract from.", {"String", "FixedString"}},
+        {"regexp", "Regular expression. Must contain between 1 and 127 capturing groups. Constant.", {"const String", "const FixedString"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"If the regular expression matches, returns an array containing the captured groups (`1` to `N`, where `N` is the number of capturing groups in `regexp`) of the first match. If there is no match, returns an empty array.", {"Array(String)"}};
+    FunctionDocumentation::Examples examples = {
+        {
+            "Usage example",
+            R"(
+WITH '< Server: nginx
+< Date: Tue, 22 Jan 2019 00:26:14 GMT
+< Content-Type: text/html; charset=UTF-8
+< Connection: keep-alive
+' AS s
+SELECT extractGroups(s, '< ([\\w\\-]+): ([^\\r\\n]+)');
+)",
+            R"(
+['Server','nginx']
+    )"
+        }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 5};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::StringSearch;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction<FunctionExtractGroups>(documentation);
 }
 
 }

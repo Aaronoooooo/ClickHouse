@@ -49,6 +49,8 @@
     #include <cxxabi.h>
 #endif
 
+// NOLINTBEGIN(readability-identifier-naming, modernize-use-using, bugprone-macro-parentheses, google-explicit-constructor)
+
 /*
  * Abstractions for compiler-specific directives
  */
@@ -89,7 +91,6 @@
             pcg128_t(high,low)
     #define PCG_EMULATED_128BIT_MATH 1
 #endif
-
 
 namespace pcg_extras {
 
@@ -454,7 +455,7 @@ auto bounded_rand(RngType& rng, typename RngType::result_type upper_bound)
     typedef typename RngType::result_type rtype;
     rtype threshold = (RngType::max() - RngType::min() + rtype(1) - upper_bound)
                     % upper_bound;
-    for (;;) { //-V1044
+    for (;;) {
         rtype r = rng() - RngType::min();
         if (r >= threshold)
             return r % upper_bound;
@@ -462,10 +463,10 @@ auto bounded_rand(RngType& rng, typename RngType::result_type upper_bound)
 }
 
 template <typename Iter, typename RandType>
-void shuffle(Iter from, Iter to, RandType&& rng)
+void shuffle(Iter from, Iter to, RandType&& rng) // NOLINT(cppcoreguidelines-missing-std-forward)
 {
     typedef typename std::iterator_traits<Iter>::difference_type delta_t;
-    typedef typename std::remove_reference<RandType>::type::result_type result_t;
+    typedef typename std::remove_reference_t<RandType>::result_type result_t;
     auto count = to - from;
     while (count > 1) {
         delta_t chosen = delta_t(bounded_rand(rng, result_t(count)));
@@ -535,7 +536,7 @@ template <typename T>
 std::ostream& operator<<(std::ostream& out, printable_typename<T>) {
     const char *implementation_typename = typeid(T).name();
 #ifdef __GNUC__
-    int status;
+    int status = 0;
     char* pretty_name =
         abi::__cxa_demangle(implementation_typename, nullptr, nullptr, &status);
     if (status == 0)
@@ -551,5 +552,7 @@ std::ostream& operator<<(std::ostream& out, printable_typename<T>) {
 #endif  // __cpp_rtti || __GXX_RTTI
 
 } // namespace pcg_extras
+
+// NOLINTEND(readability-identifier-naming, modernize-use-using, bugprone-macro-parentheses, google-explicit-constructor)
 
 #endif // PCG_EXTRAS_HPP_INCLUDED

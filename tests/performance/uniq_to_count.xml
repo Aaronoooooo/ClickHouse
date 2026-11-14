@@ -1,0 +1,4 @@
+<test>
+    <query>select uniq(number) from (select DISTINCT number from numbers(1000000))</query>
+    <query>select uniq(number) from (select number from numbers(1000000) group by number)</query>
+</test>

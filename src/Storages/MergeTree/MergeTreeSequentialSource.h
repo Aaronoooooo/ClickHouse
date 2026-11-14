@@ -1,5 +1,5 @@
 #pragma once
-#include <Processors/Sources/SourceWithProgress.h>
+#include <Processors/ISource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/IMergeTreeReader.h>
 #include <Storages/MergeTree/MarkRange.h>
@@ -8,59 +8,61 @@
 namespace DB
 {
 
-/// Lightweight (in terms of logic) stream for reading single part from MergeTree
-class MergeTreeSequentialSource : public SourceWithProgress
+class MergedPartOffsets;
+using MergedPartOffsetsPtr = std::shared_ptr<MergedPartOffsets>;
+
+enum MergeTreeSequentialSourceType
 {
-public:
-    MergeTreeSequentialSource(
-        const MergeTreeData & storage_,
-        const StorageMetadataPtr & metadata_snapshot_,
-        MergeTreeData::DataPartPtr data_part_,
-        Names columns_to_read_,
-        bool read_with_direct_io_,
-        bool take_column_types_from_storage,
-        bool quiet = false);
-
-    ~MergeTreeSequentialSource() override;
-
-    String getName() const override { return "MergeTreeSequentialSource"; }
-
-    size_t getCurrentMark() const { return current_mark; }
-
-    size_t getCurrentRow() const { return current_row; }
-
-protected:
-    Chunk generate() override;
-
-private:
-
-    const MergeTreeData & storage;
-    StorageMetadataPtr metadata_snapshot;
-
-    /// Data part will not be removed if the pointer owns it
-    MergeTreeData::DataPartPtr data_part;
-
-    /// Columns we have to read (each Block from read will contain them)
-    Names columns_to_read;
-
-    /// Should read using direct IO
-    bool read_with_direct_io;
-
-    Poco::Logger * log = &Poco::Logger::get("MergeTreeSequentialSource");
-
-    std::shared_ptr<MarkCache> mark_cache;
-    using MergeTreeReaderPtr = std::unique_ptr<IMergeTreeReader>;
-    MergeTreeReaderPtr reader;
-
-    /// current mark at which we stop reading
-    size_t current_mark = 0;
-
-    /// current row at which we stop reading
-    size_t current_row = 0;
-
-private:
-    /// Closes readers and unlock part locks
-    void finish();
+    Mutation,
+    Merge,
 };
+
+/// Create stream for reading single part from MergeTree.
+/// If the part has lightweight delete mask then the deleted rows are filtered out.
+/// `allow_remote_fs_prefetch`: if false, the source does not prefetch at all.
+Pipe createMergeTreeSequentialSource(
+    MergeTreeSequentialSourceType type,
+    const MergeTreeData & storage,
+    const StorageSnapshotPtr & storage_snapshot,
+    RangesInDataPart data_part,
+    AlterConversionsPtr alter_conversions,
+    MergedPartOffsetsPtr merged_part_offsets,
+    Names columns_to_read,
+    std::optional<MarkRanges> mark_ranges,
+    std::shared_ptr<std::atomic<size_t>> filtered_rows_count,
+    bool apply_deleted_mask,
+    bool read_with_direct_io,
+    bool allow_remote_fs_prefetch);
+
+class QueryPlan;
+class QueryPipeline;
+
+void createReadFromPartStep(
+    MergeTreeSequentialSourceType type,
+    QueryPlan & plan,
+    const MergeTreeData & storage,
+    const StorageSnapshotPtr & storage_snapshot,
+    RangesInDataPart data_part,
+    AlterConversionsPtr alter_conversions,
+    MergedPartOffsetsPtr merged_part_offsets,
+    Names columns_to_read,
+    std::shared_ptr<std::atomic<size_t>> filtered_rows_count,
+    bool apply_deleted_mask,
+    std::optional<ActionsDAG> filter,
+    bool read_with_direct_io,
+    bool allow_remote_fs_prefetch,
+    ContextPtr context,
+    LoggerPtr log);
+
+/// Starts reading the first range of every `MergeTreeSequentialSource` of the pipeline in the background.
+void prefetchMergeTreeSequentialSources(const QueryPipeline & pipeline);
+
+/// Whether a merge or mutation reading `columns_to_read` of `parts` fits into `filesystem_prefetches_limit`
+/// and `filesystem_prefetch_max_memory_usage` of `task_context`, as a query does.
+bool canPrefetchInMergeOrMutation(
+    const MergeTreeData & storage,
+    const MergeTreeData::DataPartsVector & parts,
+    const Names & columns_to_read,
+    const ContextPtr & task_context);
 
 }

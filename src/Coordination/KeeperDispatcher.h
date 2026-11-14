@@ -1,67 +1,66 @@
 #pragma once
 
-#include <Common/config.h>
-#include "config_core.h"
+#include "config.h"
 
 #if USE_NURAFT
 
+#include <Interpreters/OpenTelemetrySpanLog.h>
 #include <Common/ThreadPool.h>
 #include <Common/ConcurrentBoundedQueue.h>
 #include <Poco/Util/AbstractConfiguration.h>
-#include <Common/Exception.h>
-#include <base/logger_useful.h>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
+#include <unordered_set>
 #include <Coordination/KeeperServer.h>
-#include <Coordination/CoordinationSettings.h>
+#include <Coordination/Keeper4LWInfo.h>
+#include <Coordination/KeeperConnectionStats.h>
+#include <Coordination/KeeperSnapshotManagerS3.h>
+#include <Common/MultiVersion.h>
+#include <Common/Macros.h>
+#include <Poco/JSON/Object.h>
+#include <Coordination/KeeperRequestDispatcherOld.h>
+#include <Coordination/KeeperRequestDispatcher.h>
 
+#include <future>
 
 namespace DB
 {
 
-using ZooKeeperResponseCallback = std::function<void(const Coordination::ZooKeeperResponsePtr & response)>;
-
-/// Highlevel wrapper for ClickHouse Keeper.
-/// Process user requests via consensus and return responses.
+/// KeeperRequestDispatcherOld dispatches regular request processing, this class manages everything else:
+/// snapshots, new session id assignment, expired session cleanup etc.
 class KeeperDispatcher
 {
-
 private:
-    std::mutex push_request_mutex;
+    friend class KeeperDispatcherTestAccessor;
 
-    CoordinationSettingsPtr coordination_settings;
-    using RequestsQueue = ConcurrentBoundedQueue<KeeperStorage::RequestForSession>;
-    using SessionToResponseCallback = std::unordered_map<int64_t, ZooKeeperResponseCallback>;
-    using UpdateConfigurationQueue = ConcurrentBoundedQueue<ConfigUpdateAction>;
+    struct QueuedClusterUpdate
+    {
+        ClusterUpdateAction action;
+        /// Set by `clusterUpdateThread` once the update is accepted, if the producer waits for that.
+        std::shared_ptr<std::atomic<bool>> accepted;
+    };
+    using ClusterUpdateQueue = ConcurrentBoundedQueue<QueuedClusterUpdate>;
 
-    /// Size depends on coordination settings
-    std::unique_ptr<RequestsQueue> requests_queue;
-    ResponsesQueue responses_queue;
     SnapshotsQueue snapshots_queue{1};
 
     /// More than 1k updates is definitely misconfiguration.
-    UpdateConfigurationQueue update_configuration_queue{1000};
+    ClusterUpdateQueue cluster_update_queue{1000};
 
-    std::atomic<bool> shutdown_called{false};
+    /// When client connects to the server for the first time it doesn't have session_id.
+    /// It request it from server. We give temporary internal id for such requests just to match
+    /// client with its response. This is a map of in-progress SessionID requests.
+    /// After a proper session id is assigned, session lives in KeeperRequestDispatcherOld's session map.
+    mutable std::mutex new_session_id_mutex;
+    std::unordered_map<int64_t, std::promise<int64_t>> new_session_id_requests;
 
-    std::mutex session_to_response_callback_mutex;
-    /// These two maps looks similar, but serves different purposes.
-    /// The first map is subscription map for normal responses like
-    /// (get, set, list, etc.). Dispatcher determines callback for each response
-    /// using session id from this map.
-    SessionToResponseCallback session_to_response_callback;
-
-    /// But when client connects to the server for the first time it doesn't
-    /// have session_id. It request it from server. We give temporary
-    /// internal id for such requests just to much client with its response.
-    SessionToResponseCallback new_session_id_response_callback;
-
-    /// Reading and batching new requests from client handlers
-    ThreadFromGlobalPool request_thread;
-    /// Pushing responses to clients client handlers
-    /// using session_id.
-    ThreadFromGlobalPool responses_thread;
     /// Cleaning old dead sessions
     ThreadFromGlobalPool session_cleaner_thread;
+    /// TTL expiry: leader enqueues TryRemove for expired empty nodes
+    ThreadFromGlobalPool ttl_garbage_collector_thread;
+    /// Container cleanup: leader enqueues TryRemove for childless container nodes
+    ThreadFromGlobalPool container_garbage_collector_thread;
     /// Dumping new snapshots to disk
     ThreadFromGlobalPool snapshot_thread;
     /// Apply or wait for configuration changes
@@ -70,35 +69,93 @@ private:
     /// RAFT wrapper.
     std::unique_ptr<KeeperServer> server;
 
-    Poco::Logger * log;
+    /// Exactly one of these is non-null.
+    /// Hopefully KeeperRequestDispatcher will work well and we'll delete KeeperRequestDispatcherOld soon.
+    std::unique_ptr<KeeperRequestDispatcherOld> dispatcher_old;
+    std::unique_ptr<KeeperRequestDispatcher> dispatcher;
+
+    KeeperConnectionStats keeper_stats;
+
+    KeeperConfigurationPtr server_config;
+
+    LoggerPtr log;
 
     /// Counter for new session_id requests.
-    std::atomic<int64_t> internal_session_id_counter{0};
+    std::atomic<int64_t> internal_session_id_counter;
 
-private:
-    /// Thread put requests to raft
-    void requestThread();
-    /// Thread put responses for subscribed sessions
-    void responseThread();
+    KeeperSnapshotManagerS3 snapshot_s3;
+
+    KeeperContextPtr keeper_context;
+
+    /// Flag to signal TCP handlers that they should close connections.
+    /// Not to be confused with keeper_context->isShutdownCalled(), which happens later.
+    /// This flag means we should avoid taking new requests, while existing requests and RAFT etc
+    /// may keep running normally. Then after client sessions are closed shutdown() is called to
+    /// stop all activity and join threads.
+    std::atomic<bool> shutting_down{false};
+
+    /// Flag to stop Keeper TCP connection handlers before the full dispatcher shutdown.
+    /// It lets non-TCP protocol handlers finish while the Keeper state and RAFT remain live.
+    std::atomic<bool> tcp_connections_draining{false};
+
+    /// Set after all request and response producers have stopped. Queue accounting can be
+    /// finalized after the TCP handlers have released their pending responses.
+    std::atomic<bool> ready_to_finish_shutdown{false};
+    std::atomic<bool> shutdown_finished{false};
+
+    /// Notified when shutting_down (not to be confused with keeper_context->isShutdownCalled())
+    /// becomes true. Wakes up interruptibleSleep().
+    std::mutex early_shutdown_wait_mutex;
+    std::condition_variable early_shutdown_wait_cv;
+
+    /// Protects admission and completion of four-letter commands. `signalShutdown` closes
+    /// admission under this mutex before any Keeper state can be destroyed.
+    std::mutex four_letter_command_mutex;
+    std::condition_variable four_letter_command_cv;
+    size_t running_four_letter_commands{0};
+
+    /// Sleep for `period`, returning early if `shutting_down` becomes true.
+    /// Useful for background work that must exit promptly during shutdown.
+    void interruptibleSleep(std::chrono::milliseconds period);
+
+    /// Wait for commands admitted before shutdown to stop accessing Keeper state.
+    void waitForFourLetterCommands();
+
     /// Thread clean disconnected sessions from memory
     void sessionCleanerTask();
     /// Thread create snapshots in the background
     void snapshotThread();
-    /// Thread apply or wait configuration changes from leader
-    void updateConfigurationThread();
 
-    void setResponse(int64_t session_id, const Coordination::ZooKeeperResponsePtr & response);
+    // TODO (myrrc) this should be removed once "reconfig" is stabilized
+    void clusterUpdateWithReconfigDisabledThread();
+    void clusterUpdateThread();
 
-    /// Add error responses for requests to responses queue.
-    /// Clears requests.
-    void addErrorResponses(const KeeperStorage::RequestsForSessions & requests_for_sessions, Coordination::Error error);
+    using ConfigCheckCallback = std::function<bool(KeeperServer * server)>;
+    void executeClusterUpdateActionAndWaitConfigChange(
+        const ClusterUpdateAction & action,
+        ConfigCheckCallback check_callback,
+        UInt64 max_action_wait_time_ms,
+        UInt64 retry_count,
+        const Stopwatch & total_watch,
+        UInt64 max_total_wait_time_ms);
 
-    /// Forcefully wait for result and sets errors if something when wrong.
-    /// Clears both arguments
-    void forceWaitAndProcessResult(RaftAppendResult & result, KeeperStorage::RequestsForSessions & requests_for_sessions);
+    /// Verify some logical issues in command, like duplicate ids, wrong leadership transfer and etc
+    void checkReconfigCommandPreconditions(Poco::JSON::Object::Ptr reconfig_command);
+    void checkReconfigCommandActions(Poco::JSON::Object::Ptr reconfig_command);
+
+    void ttlGarbageCollectorThread(size_t batch_size);
+    void containerGarbageCollectorThread(size_t batch_size, UInt64 max_never_used_interval_ms);
+
+    void onSessionIDResponse(const Coordination::ZooKeeperResponsePtr & response) noexcept;
+
+    /// The only place that knows which responses do not go to a per-session response callback.
+    bool tryRouteSpecialResponse(const KeeperResponseForSession & response) noexcept;
+
+    /// Completes every waiter that can no longer receive a response. Call once no dispatcher can
+    /// produce one.
+    void failPendingSessionIDRequests() noexcept;
 
 public:
-    /// Just allocate some objects, real initialization is done by `intialize method`
     KeeperDispatcher();
 
     /// Call shutdown
@@ -106,22 +163,72 @@ public:
 
     /// Initialization from config.
     /// standalone_keeper -- we are standalone keeper application (not inside clickhouse server)
-    void initialize(const Poco::Util::AbstractConfiguration & config, bool standalone_keeper, bool start_async);
+    /// 'macros' are used to substitute macros in endpoint of disks
+    void initialize(const Poco::Util::AbstractConfiguration & config, bool standalone_keeper, bool start_async, const MultiVersion<Macros>::Version & macros);
 
     bool checkInit() const
     {
         return server && server->checkInit();
     }
 
-    /// Registered in ConfigReloader callback. Add new configuration changes to
-    /// update_configuration_queue. Keeper Dispatcher apply them asynchronously.
-    void updateConfiguration(const Poco::Util::AbstractConfiguration & config);
+    /// Is server accepting requests, i.e. connected to the cluster
+    /// and achieved quorum
+    bool isServerActive() const;
+
+    void updateConfiguration(const Poco::Util::AbstractConfiguration & config, const MultiVersion<Macros>::Version & macros);
+    void pushClusterUpdates(ClusterUpdateActions && actions, std::shared_ptr<std::atomic<bool>> accepted = nullptr);
+    bool reconfigEnabled() const;
+
+    /// Process reconfiguration 4LW command: rcfg, it's another option to update cluster configuration
+    Poco::JSON::Object::Ptr reconfigureClusterFromReconfigureCommand(Poco::JSON::Object::Ptr reconfig_command);
+
+    /// Signal TCP handlers to close connections before the full shutdown, and wake the
+    /// GC threads from their inter-tick wait so they exit promptly.
+    void signalShutdown();
+
+    /// Returns true if signalShutdown() was called.
+    bool isShuttingDown() const { return shutting_down.load(std::memory_order_relaxed); }
+
+    /// Stop accepting and processing Keeper TCP connections before the full dispatcher shutdown.
+    void beginTCPConnectionDrain();
+
+    /// Returns true after beginTCPConnectionDrain was called.
+    bool isTCPConnectionDrainStarted() const { return tcp_connections_draining.load(std::memory_order_acquire); }
+
+    /// Begin executing a four-letter command unless shutdown has started. Each successful call
+    /// must be matched by finishFourLetterCommand.
+    bool tryBeginFourLetterCommand();
+    void finishFourLetterCommand();
 
     /// Shutdown internal keeper parts (server, state machine, log storage, etc)
-    void shutdown();
+    /// `closed_all_connections` should be false if there may be any remaining KeeperTCPHandler instances.
+    void shutdown(bool closed_all_connections);
+
+    /// Stop all request and response producers and complete pending session-ID requests.
+    /// TCP handlers can then finish without waiting for the Keeper session timeout.
+    void shutdownBeforeConnectionsFinish();
+
+    /// Drain the queues after TCP handlers finish and check their byte accounting when all
+    /// connections closed. Must be called after `shutdownBeforeConnectionsFinish`.
+    void shutdownAfterConnectionsFinish(bool closed_all_connections);
+
+    void forceRecovery();
 
     /// Put request to ClickHouse Keeper
-    bool putRequest(const Coordination::ZooKeeperRequestPtr & request, int64_t session_id);
+    bool putRequest(const Coordination::ZooKeeperRequestPtr & request, int64_t session_id, bool use_xid_64);
+
+    /// Get new session ID
+    int64_t getSessionID(int64_t session_timeout_ms);
+
+    /// Register session and subscribe for responses with callback.
+    /// The callback must be safe for concurrent invocation — see ZooKeeperResponseCallback.
+    void registerSession(int64_t session_id, ZooKeeperResponseCallback callback);
+
+    /// Call if we don't need any responses for this session no more (session was expired)
+    void finishSession(int64_t session_id);
+
+    /// Invoked when a request completes.
+    void updateKeeperStatLatency(uint64_t process_time_ms);
 
     /// Are we leader
     bool isLeader() const
@@ -129,19 +236,137 @@ public:
         return server->isLeader();
     }
 
+    bool isFollower() const
+    {
+        return server->isFollower();
+    }
+
+    const char * getRoleString() const
+    {
+        if (isLeader())
+            return "leader";
+        if (isFollower())
+            return "follower";
+        if (isObserver())
+            return "observer";
+        return "unknown";
+    }
+
     bool hasLeader() const
     {
         return server->isLeaderAlive();
     }
 
-    /// Get new session ID
-    int64_t getSessionID(int64_t session_timeout_ms);
+    bool isObserver() const
+    {
+        return server->isObserver();
+    }
 
-    /// Register session and subscribe for responses with callback
-    void registerSession(int64_t session_id, ZooKeeperResponseCallback callback);
+    bool isExceedingMemorySoftLimit() const
+    {
+        return server->isExceedingMemorySoftLimit();
+    }
 
-    /// Call if we don't need any responses for this session no more (session was expired)
-    void finishSession(int64_t session_id);
+    uint64_t getLogDirSize() const;
+
+    uint64_t getSnapDirSize() const;
+
+    /// Request statistics such as qps, latency etc.
+    KeeperConnectionStats & getKeeperConnectionStats()
+    {
+        return keeper_stats;
+    }
+
+    Keeper4LWInfo getKeeper4LWInfo() const;
+
+    const KeeperStateMachine & getStateMachine() const
+    {
+        return *server->getKeeperStateMachine();
+    }
+
+    const KeeperConfigurationPtr & getKeeperConfiguration() const
+    {
+        return server_config;
+    }
+
+    const KeeperContextPtr & getKeeperContext() const
+    {
+        return keeper_context;
+    }
+
+    void incrementPacketsSent()
+    {
+        keeper_stats.incrementPacketsSent();
+    }
+
+    void incrementPacketsReceived()
+    {
+        keeper_stats.incrementPacketsReceived();
+    }
+
+    void resetServerStats()
+    {
+        keeper_stats.reset();
+        server->resetLeaderMetrics();
+    }
+
+    /// Create snapshot manually, return the last committed log index in the snapshot
+    uint64_t createSnapshot()
+    {
+        return server->createSnapshot();
+    }
+
+    /// Get Raft information
+    KeeperLogInfo getKeeperLogInfo()
+    {
+        return server->getKeeperLogInfo();
+    }
+
+    std::vector<KeeperClusterMemberInfo> getClusterMembersInfo() const
+    {
+        return server->getClusterMembersInfo();
+    }
+
+    std::vector<KeeperChangelogStatus> getChangelogsStatus() const
+    {
+        return server->getChangelogsStatus();
+    }
+
+    /// Request to be leader.
+    bool requestLeader()
+    {
+        return server->requestLeader();
+    }
+
+    /// Yield leadership and become follower.
+    void yieldLeadership()
+    {
+        server->yieldLeadership();
+    }
+
+    /// Ask the leader to start, or stop, waiting for replicas that cannot keep up.
+    bool requestSlowMemberBackpressure(bool enable)
+    {
+        return server->requestSlowMemberBackpressure(enable);
+    }
+
+    /// Whether this node is waiting for replicas that cannot keep up. Only the
+    /// leader holds the setting, so a follower always reports `false`.
+    bool isSlowMemberBackpressure() const
+    {
+        return server->isSlowMemberBackpressure();
+    }
+
+    void recalculateStorageStats()
+    {
+        server->recalculateStorageStats();
+    }
+
+    static void cleanResources();
+
+    std::optional<AuthenticationData> getAuthenticationData() const { return server->getAuthenticationData(); }
+
+    void onResponseDeallocated(const Coordination::ZooKeeperResponse & response);
 };
 
 }

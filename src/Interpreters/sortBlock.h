@@ -1,46 +1,40 @@
 #pragma once
 
-#include <Core/Block.h>
-#include <Core/SortDescription.h>
-
+#include <Columns/IColumn.h>
+#include <base/types.h>
+#include <Common/PODArray_fwd.h>
 
 namespace DB
 {
 
+class Block;
+class SortDescription;
+using IColumnPermutation = PaddedPODArray<size_t>;
+
+/// Estimates permutation and scratch memory for `sortBlock` and `sortBlockAndDeduplicate`.
+/// Input columns and their reordered copies are excluded and must be accounted for separately.
+size_t estimateSortingWorkspace(size_t rows);
+
 /// Sort one block by `description`. If limit != 0, then the partial sort of the first `limit` rows is produced.
-void sortBlock(Block & block, const SortDescription & description, UInt64 limit = 0);
+void sortBlock(Block & block, const SortDescription & description, UInt64 limit = 0, IColumn::PermutationSortStability stability = IColumn::PermutationSortStability::Unstable);
 
+/// Sorts the block by `description` and keeps one row for each sort key. Stable sorting retains the
+/// first input row. Duplicates are removed from the permutation before output columns are materialized.
+/// Without a non-constant sort column, all rows compare equal and only the first input row is retained.
+void sortBlockAndDeduplicate(Block & block, const SortDescription & description, IColumn::PermutationSortStability stability);
 
-/** Used only in StorageMergeTree to sort the data with INSERT.
+/** Same as sortBlock, but do not sort the block, but only calculate the permutation of the values,
+  *  so that you can rearrange the column values yourself.
   * Sorting is stable. This is important for keeping the order of rows in the CollapsingMergeTree engine
   *  - because based on the order of rows it is determined whether to delete or leave groups of rows when collapsing.
-  * Collations are not supported. Partial sorting is not supported.
+  * Used only in StorageMergeTree to sort the data with INSERT.
   */
-void stableSortBlock(Block & block, const SortDescription & description);
-
-/** Same as stableSortBlock, but do not sort the block, but only calculate the permutation of the values,
-  *  so that you can rearrange the column values yourself.
-  */
-void stableGetPermutation(const Block & block, const SortDescription & description, IColumn::Permutation & out_permutation);
-
+void stableGetPermutation(const Block & block, const SortDescription & description, IColumnPermutation & out_permutation);
 
 /** Quickly check whether the block is already sorted. If the block is not sorted - returns false as fast as possible.
-  * Collations are not supported.
   */
 bool isAlreadySorted(const Block & block, const SortDescription & description);
 
-/// Column with description for sort
-struct ColumnWithSortDescription
-{
-    const IColumn * column = nullptr;
-    SortColumnDescription description;
-
-    /// It means, that this column is ColumnConst
-    bool column_const = false;
-};
-
-using ColumnsWithSortDescriptions = std::vector<ColumnWithSortDescription>;
-
-ColumnsWithSortDescriptions getColumnsWithSortDescription(const Block & block, const SortDescription & description);
-
+/// Check if the permutation is identity (we can skip sorting).
+bool isIdentityPermutation(const IColumn::Permutation & permutation, size_t limit);
 }

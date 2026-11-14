@@ -8,7 +8,10 @@ namespace DB
 {
 
 /** Query like this:
-  * DROP|DETACH|TRUNCATE TABLE [IF EXISTS] [db.]name [PERMANENTLY]
+  * DROP TABLE [IF EXISTS|EMPTY] [db.]name [PERMANENTLY]
+  *
+  * Or:
+  * DETACH|TRUNCATE TABLE [IF EXISTS] [db.]name [PERMANENTLY]
   *
   * Or:
   * DROP DATABASE [IF EXISTS] db
@@ -18,6 +21,9 @@ namespace DB
   */
 class ParserDropQuery : public IParserBase
 {
+public:
+    std::map<String, Documentation> getDocumentation() const override;
+
 protected:
     const char * getName() const  override{ return "DROP query"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;

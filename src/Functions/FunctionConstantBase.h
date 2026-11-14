@@ -1,7 +1,9 @@
 #pragma once
+
+#include <Columns/ColumnConst.h>
+#include <DataTypes/IDataType.h>
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
-#include <Interpreters/Context.h>
 
 
 namespace DB
@@ -13,8 +15,9 @@ class FunctionConstantBase : public IFunction
 {
 public:
     template <typename U>
-    explicit FunctionConstantBase(U && constant_value_, bool is_distributed_ = false)
-        : constant_value(std::forward<U>(constant_value_)), is_distributed(is_distributed_)
+    explicit FunctionConstantBase(const U & constant_value_, bool is_distributed_ = false)
+        : constant_value(static_cast<T>(constant_value_))
+        , is_distributed(is_distributed_)
     {
     }
 
@@ -28,22 +31,21 @@ public:
         return 0;
     }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & /*arguments*/) const override
+    String getSignatureString() const override
     {
-        return std::make_shared<ColumnT>();
+        return "() -> " + ColumnT{}.getName();
     }
 
     bool isDeterministic() const override { return false; }
-    bool isDeterministicInScopeOfQuery() const override { return true; }
 
     /// Some functions may return different values on different shards/replicas, so it's not constant for distributed query
     bool isSuitableForConstantFolding() const override { return !is_distributed; }
 
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName &, const DataTypePtr &, size_t input_rows_count) const override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName &, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
-        return ColumnT().createColumnConst(input_rows_count, constant_value);
+        return result_type->createColumnConst(input_rows_count, constant_value);
     }
 
 private:
@@ -52,4 +54,3 @@ private:
 };
 
 }
-

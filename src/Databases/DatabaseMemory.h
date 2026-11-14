@@ -32,10 +32,12 @@ public:
     void dropTable(
         ContextPtr context,
         const String & table_name,
-        bool no_delay) override;
+        bool sync) override;
 
     ASTPtr getCreateTableQueryImpl(const String & name, ContextPtr context, bool throw_on_error) const override;
-    ASTPtr getCreateDatabaseQuery() const override;
+
+    void checkMetadataFilenameAvailability(const String & table_name) const override;
+    bool canReattachTableWithFullDefinition() const override { return false; }
 
     /// DatabaseMemory allows to create tables, which store data on disk.
     /// It's needed to create such tables in default database of clickhouse-local.
@@ -48,12 +50,20 @@ public:
 
     void drop(ContextPtr context) override;
 
-    void alterTable(ContextPtr local_context, const StorageID & table_id, const StorageInMemoryMetadata & metadata) override;
+    void alterTable(ContextPtr local_context, const StorageID & table_id, const StorageInMemoryMetadata & metadata, bool validate_new_create_query) override;
+
+    std::vector<std::pair<ASTPtr, StoragePtr>> getTablesForBackup(const FilterByNameFunction & filter, const ContextPtr & local_context) const override;
+
+protected:
+    ASTPtr getCreateDatabaseQueryImpl() const override TSA_REQUIRES(mutex);
 
 private:
-    String data_path;
+    void removeDataPath(ContextPtr local_context);
+    void checkMetadataFilenameAvailabilityUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
+
+    const String data_path;
     using NameToASTCreate = std::unordered_map<String, ASTPtr>;
-    NameToASTCreate create_queries;
+    NameToASTCreate create_queries TSA_GUARDED_BY(mutex);
 };
 
 }

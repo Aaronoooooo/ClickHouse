@@ -1,4 +1,4 @@
-#include "Storages/MergeTree/FutureMergedMutatedPart.h"
+#include <Storages/MergeTree/FutureMergedMutatedPart.h>
 
 
 namespace DB
@@ -9,27 +9,35 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-void FutureMergedMutatedPart::assign(MergeTreeData::DataPartsVector parts_)
+void FutureMergedMutatedPart::assign(
+    MergeTreeData::DataPartsVector parts_, MergeTreeData::DataPartsVector patch_parts_, ProjectionDescriptionRawPtr projection)
 {
     if (parts_.empty())
         return;
 
     size_t sum_rows = 0;
     size_t sum_bytes_uncompressed = 0;
-    MergeTreeDataPartType future_part_type = MergeTreeDataPartType::UNKNOWN;
+    MergeTreeDataPartType future_part_type;
+    UInt32 max_level = 0;
+
     for (const auto & part : parts_)
     {
         sum_rows += part->rows_count;
         sum_bytes_uncompressed += part->getTotalColumnsSize().data_uncompressed;
         future_part_type = std::min(future_part_type, part->getType());
+        max_level = std::max(max_level, part->info.level);
     }
 
-    auto chosen_type = parts_.front()->storage.choosePartTypeOnDisk(sum_bytes_uncompressed, sum_rows);
-    future_part_type = std::min(future_part_type, chosen_type);
-    assign(std::move(parts_), future_part_type);
+    auto chosen_format = parts_.front()->storage.choosePartFormat(sum_bytes_uncompressed, sum_rows, max_level + 1, projection);
+    future_part_type = std::min(future_part_type, chosen_format.part_type);
+
+    /// The storage type needs no clamping to the sources: merges always rewrite the data, and a
+    /// mutation whose result storage type differs from the source's is routed to a full rewrite
+    /// (see `rewritesAllPartColumns`).
+    assign(std::move(parts_), std::move(patch_parts_), {future_part_type, chosen_format.storage_type});
 }
 
-void FutureMergedMutatedPart::assign(MergeTreeData::DataPartsVector parts_, MergeTreeDataPartType future_part_type)
+void FutureMergedMutatedPart::assign(MergeTreeData::DataPartsVector parts_, MergeTreeData::DataPartsVector patch_parts_, MergeTreeDataPartFormat future_part_format)
 {
     if (parts_.empty())
         return;
@@ -39,28 +47,51 @@ void FutureMergedMutatedPart::assign(MergeTreeData::DataPartsVector parts_, Merg
         const MergeTreeData::DataPartPtr & first_part = parts_.front();
 
         if (part->partition.value != first_part->partition.value)
-            throw Exception(
-                "Attempting to merge parts " + first_part->name + " and " + part->name + " that are in different partitions",
-                ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Attempting to merge parts {} and {} that are in different partitions",
+                first_part->name, part->name);
     }
 
     parts = std::move(parts_);
+    patch_parts = std::move(patch_parts_);
 
     UInt32 max_level = 0;
     Int64 max_mutation = 0;
+
     for (const auto & part : parts)
     {
         max_level = std::max(max_level, part->info.level);
         max_mutation = std::max(max_mutation, part->info.mutation);
     }
 
-    type = future_part_type;
-    part_info.partition_id = parts.front()->info.partition_id;
+    for (const auto & patch : patch_parts)
+    {
+        Int64 max_patch_version = patch->getPatchPartIndex().getMaxDataVersion();
+        max_mutation = std::max(max_mutation, max_patch_version);
+    }
+
+    part_format = future_part_format;
+    part_info.setPartitionId(parts.front()->info.getPartitionId());
     part_info.min_block = parts.front()->info.min_block;
     part_info.max_block = parts.back()->info.max_block;
     part_info.level = max_level + 1;
     part_info.mutation = max_mutation;
 
+    updateName();
+}
+
+void FutureMergedMutatedPart::raiseMutationVersion(Int64 mutation_version)
+{
+    if (mutation_version < part_info.mutation)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Cannot lower the mutation version of the future part {} from {} to {}",
+            name, part_info.mutation, mutation_version);
+
+    part_info.mutation = mutation_version;
+    updateName();
+}
+
+void FutureMergedMutatedPart::updateName()
+{
     if (parts.front()->storage.format_version < MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING)
     {
         DayNum min_date = DayNum(std::numeric_limits<UInt16>::max());
@@ -81,12 +112,15 @@ void FutureMergedMutatedPart::assign(MergeTreeData::DataPartsVector parts_, Merg
         name = part_info.getPartNameV0(min_date, max_date);
     }
     else
-        name = part_info.getPartName();
+    {
+        name = part_info.getPartNameV1();
+    }
 }
 
 void FutureMergedMutatedPart::updatePath(const MergeTreeData & storage, const IReservation * reservation)
 {
-    path = storage.getFullPathOnDisk(reservation->getDisk()) + name + "/";
+    path = fs::path(storage.getFullPathOnDisk(reservation->getDisk())) / name;
+    path += "/";
 }
 
 }

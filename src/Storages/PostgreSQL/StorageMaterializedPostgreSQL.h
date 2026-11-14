@@ -1,26 +1,27 @@
 #pragma once
 
-#include "config_core.h"
+#include "config.h"
 
 #if USE_LIBPQXX
-#include "PostgreSQLReplicationHandler.h"
-#include "MaterializedPostgreSQLSettings.h"
+#include <Storages/PostgreSQL/PostgreSQLReplicationHandler.h>
 
-#include <Parsers/IAST.h>
-#include <Parsers/ASTLiteral.h>
-#include <Parsers/ASTFunction.h>
-#include <Parsers/ASTIdentifier.h>
+#include <Parsers/IAST_fwd.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTColumnDeclaration.h>
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/InterpreterCreateQuery.h>
 #include <Interpreters/ExpressionAnalyzer.h>
-#include <base/shared_ptr_helper.h>
 #include <memory>
 
 
 namespace DB
 {
+struct MaterializedPostgreSQLSettings;
+
+/** TODO list:
+ * - Actually I think we can support ddl even though logical replication does not fully support it.
+ *   But some basic ddl like adding/dropping columns, changing column type, column names -- is manageable.
+ */
 
 /** Case of single MaterializedPostgreSQL table engine.
  *
@@ -59,45 +60,90 @@ namespace DB
  *
 **/
 
-class StorageMaterializedPostgreSQL final : public shared_ptr_helper<StorageMaterializedPostgreSQL>, public IStorage, WithContext
+class StorageMaterializedPostgreSQL final : public IStorage, WithContext
 {
-    friend struct shared_ptr_helper<StorageMaterializedPostgreSQL>;
-
 public:
+    static constexpr auto NESTED_TABLE_SUFFIX = "_nested";
+    static constexpr auto TMP_SUFFIX = "_tmp";
+
     StorageMaterializedPostgreSQL(const StorageID & table_id_, ContextPtr context_,
                                 const String & postgres_database_name, const String & postgres_table_name);
 
     StorageMaterializedPostgreSQL(StoragePtr nested_storage_, ContextPtr context_,
                                 const String & postgres_database_name, const String & postgres_table_name);
 
+    StorageMaterializedPostgreSQL(
+        const StorageID & table_id_,
+        LoadingStrictnessLevel mode,
+        const String & remote_database_name,
+        const String & remote_table_name,
+        const postgres::ConnectionInfo & connection_info,
+        const StorageInMemoryMetadata & storage_metadata,
+        ContextPtr context_,
+        std::unique_ptr<MaterializedPostgreSQLSettings> replication_settings);
+
     String getName() const override { return "MaterializedPostgreSQL"; }
+    bool hasUnreplicatedTableDataOnDisk() const override { return true; }
 
-    void startup() override;
-
-    void shutdown() override;
+    void shutdown(bool is_drop) override;
 
     /// Used only for single MaterializedPostgreSQL storage.
-    void dropInnerTableIfAny(bool no_delay, ContextPtr local_context) override;
+    void dropInnerTableIfAny(bool sync, ContextPtr local_context) override;
 
-    NamesAndTypesList getVirtuals() const override;
+    /// Forward the size guard onto the nested table that `dropInnerTableIfAny` will
+    /// actually drop, so `CREATE OR REPLACE` cannot delete an over-limit nested table
+    /// that plain `DROP TABLE` would refuse.
+    void checkTableSizeBelowDropLimit(ContextPtr query_context) const override;
 
     bool needRewriteQueryWithFinal(const Names & column_names) const override;
 
-    Pipe read(
+    /// The read is delegated to the nested `ReplacingMergeTree` (see `read`), which receives the very same
+    /// `SelectQueryInfo`, so the wrapper must advertise the capabilities and the statistics of the nested
+    /// table instead of the `IStorage` defaults. Otherwise a query over the wrapper - directly or through
+    /// `Merge` - silently loses `PREWHERE`, the optimization to subcolumns and the size estimates.
+    bool supportsPrewhere() const override;
+    bool canMoveConditionsToPrewhere() const override;
+    bool supportedPrewhereColumnsIncludeSubcolumns() const override;
+    bool supportsSubcolumns() const override;
+    bool supportsOptimizationToSubcolumns() const override;
+    bool hasBucketedMapSerialization() const override;
+
+    ColumnSizeByName getColumnSizes() const override;
+    ColumnSizeByName getColumnSizes(const Names & columns, bool calculate_subcolumn_sizes) const override;
+
+    std::optional<UInt64> totalRows(ContextPtr query_context) const override;
+    std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
+
+    void read(
+        QueryPlan & query_plan,
         const Names & column_names,
-        const StorageMetadataPtr & metadata_snapshot,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
         ContextPtr context_,
         QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
-        unsigned num_streams) override;
+        size_t num_streams) override;
+
+    /// Back up / restore the data of the underlying nested ReplacingMergeTree table.
+    void backupData(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
+    void restoreDataFromBackup(RestorerFromBackup & restorer, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
+
+    /// `backupData` delegates to the nested ReplacingMergeTree, which supports per-partition backups, so mirror
+    /// its capability here. Otherwise `BackupEntriesCollector` would reject `BACKUP TABLE ... PARTITIONS` before
+    /// the delegation can run, because `IStorage::supportsBackupPartition` defaults to `false`.
+    bool supportsBackupPartition() const override;
 
     /// This method is called only from MateriaizePostgreSQL database engine, because it needs to maintain
     /// an invariant: a table exists only if its nested table exists. This atomic variable is set to _true_
     /// only once - when nested table is successfully created and is never changed afterwards.
     bool hasNested() { return has_nested.load(); }
 
-    void createNestedIfNeeded(PostgreSQLTableStructurePtr table_structure);
+    void createNestedIfNeeded(PostgreSQLTableStructurePtr table_structure, const ASTTableOverride * table_override);
+
+    ASTPtr getCreateNestedTableQuery(PostgreSQLTableStructurePtr table_structure, const ASTTableOverride * table_override);
+
+    boost::intrusive_ptr<ASTExpressionList> getColumnsExpressionList(
+        const NamesAndTypesList & columns, std::unordered_map<std::string, ASTPtr> defaults = {}) const;
 
     StoragePtr getNested() const;
 
@@ -108,42 +154,30 @@ public:
     /// temporary nested, which will be created shortly after.
     StoragePtr createTemporary() const;
 
-    ContextPtr getNestedTableContext() const { return nested_context; }
+    ContextMutablePtr getNestedTableContext() const { return nested_context; }
 
     StorageID getNestedStorageID() const;
 
-    void setNestedStorageID(const StorageID & id) { nested_table_id.emplace(id); }
+    void set(StoragePtr nested_storage);
 
     static std::shared_ptr<Context> makeNestedTableContext(ContextPtr from_context);
 
-    /// Get nested table (or throw if it does not exist), set in-memory metadata (taken from nested table)
-    /// for current table, set has_nested = true.
-    StoragePtr prepare();
-
     bool supportsFinal() const override { return true; }
 
-    ASTPtr getCreateNestedTableQuery(PostgreSQLTableStructurePtr table_structure);
-
-protected:
-    StorageMaterializedPostgreSQL(
-        const StorageID & table_id_,
-        bool is_attach_,
-        const String & remote_database_name,
-        const String & remote_table_name,
-        const postgres::ConnectionInfo & connection_info,
-        const StorageInMemoryMetadata & storage_metadata,
-        ContextPtr context_,
-        std::unique_ptr<MaterializedPostgreSQLSettings> replication_settings);
+    /// NOTE: `supportsTrivialCountOptimization` is deliberately not forwarded to the nested table. The nested
+    /// `ReplacingMergeTree` still holds the deleted rows (`_sign = 0`) and the superseded versions of the
+    /// updated rows, and `read` filters them out with `FINAL` and a `_sign = 1` filter, so counting the parts
+    /// of the nested table would report more rows than a read returns.
 
 private:
-    static std::shared_ptr<ASTColumnDeclaration> getMaterializedColumnsDeclaration(
-            const String name, const String type, UInt64 default_value);
+    static boost::intrusive_ptr<ASTColumnDeclaration> getMaterializedColumnsDeclaration(
+            String name, String type, UInt64 default_value);
 
-    ASTPtr getColumnDeclaration(const DataTypePtr & data_type) const;
+    static VirtualColumnsDescription createVirtuals();
 
     String getNestedTableName() const;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     /// Not nullptr only for single MaterializedPostgreSQL storage, because for MaterializedPostgreSQL
     /// database engine there is one replication handler for all tables.

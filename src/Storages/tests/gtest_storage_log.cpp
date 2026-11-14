@@ -5,8 +5,7 @@
 #include <Disks/tests/gtest_disk.h>
 #include <Formats/FormatFactory.h>
 #include <IO/ReadHelpers.h>
-#include <IO/WriteBufferFromOStream.h>
-#include <Interpreters/Context.h>
+#include <IO/WriteBufferFromString.h>
 #include <Storages/StorageLog.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Common/typeid_cast.h>
@@ -18,46 +17,43 @@
 #include <Processors/Executors/PushingPipelineExecutor.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/Sinks/SinkToStorage.h>
-#include <QueryPipeline/Chain.h>
 #include <QueryPipeline/QueryPipeline.h>
+#include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
 
-#if !defined(__clang__)
-#    pragma GCC diagnostic push
-#    pragma GCC diagnostic ignored "-Wsuggest-override"
-#endif
 
-
-DB::StoragePtr createStorage(DB::DiskPtr & disk)
+static DB::StoragePtr createStorage(DB::DiskPtr & disk)
 {
     using namespace DB;
 
     NamesAndTypesList names_and_types;
     names_and_types.emplace_back("a", std::make_shared<DataTypeUInt64>());
 
-    StoragePtr table = StorageLog::create(
+    StoragePtr table = std::make_shared<StorageLog>(
         "Log", disk, "table/", StorageID("test", "test"), ColumnsDescription{names_and_types},
-        ConstraintsDescription{}, String{}, false, 1048576);
+        ConstraintsDescription{}, String{}, LoadingStrictnessLevel::CREATE, getContext().context);
 
     table->startup();
 
     return table;
 }
 
-template <typename T>
 class StorageLogTest : public testing::Test
 {
 public:
 
     void SetUp() override
     {
-        disk = createDisk<T>();
+        disk = createDisk();
         table = createStorage(disk);
     }
 
     void TearDown() override
     {
         table->flushAndShutdown();
-        destroyDisk<T>(disk);
+        destroyDisk(disk);
     }
 
     const DB::DiskPtr & getDisk() { return disk; }
@@ -69,14 +65,11 @@ private:
 };
 
 
-using DiskImplementations = testing::Types<DB::DiskMemory, DB::DiskLocal>;
-TYPED_TEST_SUITE(StorageLogTest, DiskImplementations);
-
 // Returns data written to table in Values format.
-std::string writeData(int rows, DB::StoragePtr & table, const DB::ContextPtr context)
+static std::string writeData(int rows, DB::StoragePtr & table, const DB::ContextPtr context)
 {
     using namespace DB;
-    auto metadata_snapshot = table->getInMemoryMetadataPtr();
+    auto metadata_snapshot = table->getInMemoryMetadataPtr(context, false);
 
     std::string data;
 
@@ -103,7 +96,7 @@ std::string writeData(int rows, DB::StoragePtr & table, const DB::ContextPtr con
         block.insert(column);
     }
 
-    QueryPipeline pipeline(table->write({}, metadata_snapshot, context));
+    QueryPipeline pipeline(table->write({}, metadata_snapshot, context, /*async_insert=*/false));
 
     PushingPipelineExecutor executor(pipeline);
     executor.push(block);
@@ -113,19 +106,24 @@ std::string writeData(int rows, DB::StoragePtr & table, const DB::ContextPtr con
 }
 
 // Returns all table data in Values format.
-std::string readData(DB::StoragePtr & table, const DB::ContextPtr context)
+static std::string readData(DB::StoragePtr & table, const DB::ContextPtr context)
 {
     using namespace DB;
-    auto metadata_snapshot = table->getInMemoryMetadataPtr();
+    auto metadata_snapshot = table->getInMemoryMetadataPtr(context, false);
+    auto storage_snapshot = table->getStorageSnapshot(metadata_snapshot, context);
 
     Names column_names;
     column_names.push_back("a");
 
     SelectQueryInfo query_info;
     QueryProcessingStage::Enum stage = table->getQueryProcessingStage(
-        context, QueryProcessingStage::Complete, metadata_snapshot, query_info);
+        context, QueryProcessingStage::Complete, storage_snapshot, query_info);
 
-    QueryPipeline pipeline(table->read(column_names, metadata_snapshot, query_info, context, stage, 8192, 1));
+    QueryPlan plan;
+    table->read(plan, column_names, storage_snapshot, query_info, context, stage, 8192, 1);
+
+    auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*plan.buildQueryPipeline(
+        QueryPlanOptimizationSettings(context), BuildQueryPipelineSettings(context))));
 
     Block sample;
     {
@@ -151,7 +149,7 @@ std::string readData(DB::StoragePtr & table, const DB::ContextPtr context)
     return out_buf.str();
 }
 
-TYPED_TEST(StorageLogTest, testReadWrite)
+TEST_F(StorageLogTest, testReadWrite)
 {
     using namespace DB;
     const auto & context_holder = getContext();

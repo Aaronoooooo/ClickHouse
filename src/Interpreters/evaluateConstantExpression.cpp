@@ -1,91 +1,268 @@
 #include <Interpreters/evaluateConstantExpression.h>
 
 #include <Columns/ColumnConst.h>
-#include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnNullable.h>
+#include <Columns/ColumnSet.h>
+#include <Columns/ColumnTuple.h>
+#include <Common/typeid_cast.h>
+#include <Analyzer/Resolve/QueryAnalyzer.h>
+#include <Analyzer/QueryTreeBuilder.h>
+#include <Analyzer/TableNode.h>
 #include <Core/Block.h>
+#include <Core/ConstantValue.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/FieldToDataType.h>
+#include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <Functions/IFunction.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/castColumn.h>
 #include <Interpreters/convertFieldToType.h>
+#include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/ExpressionActions.h>
-#include <Interpreters/ExpressionAnalyzer.h>
-#include <Interpreters/TreeRewriter.h>
+#include <Interpreters/ReplaceQueryParameterVisitor.h>
+#include <Interpreters/SelectQueryOptions.h>
+#include <Interpreters/Set.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
-#include <Parsers/ExpressionElementParsers.h>
+#include <Parsers/ASTSubquery.h>
+#include <Parsers/ASTSelectQuery.h>
+#include <Planner/CollectSets.h>
+#include <Planner/CollectTableExpressionData.h>
+#include <Planner/PlannerActionsVisitor.h>
+#include <Planner/PlannerContext.h>
+#include <Planner/Utils.h>
+#include <Processors/QueryPlan/Optimizations/actionsDAGUtils.h>
+#include <Processors/Executors/PullingPipelineExecutor.h>
+#include <Storages/MergeTree/KeyCondition.h>
+#include <Storages/ColumnsDescription.h>
+#include <Storages/StorageDummy.h>
 #include <TableFunctions/TableFunctionFactory.h>
-#include <Common/typeid_cast.h>
-#include <Interpreters/FunctionNameNormalizer.h>
-#include <Interpreters/ReplaceQueryParameterVisitor.h>
-#include <Poco/Util/AbstractConfiguration.h>
+
+#include <optional>
 #include <unordered_map>
+
+#include <Poco/Util/AbstractConfiguration.h>
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
-
-std::pair<Field, std::shared_ptr<const IDataType>> evaluateConstantExpression(const ASTPtr & node, ContextPtr context)
+/// NOTE: this helper is a temporary compatibility shim for the legacy `Field`-returning API. It
+/// re-adds a `Field` materialization (which the ongoing removal of `Field` aims to avoid) purely to
+/// preserve behavior: without it a literal round-trips through the size-1 column and `operator[]`
+/// canonicalizes tags (`Bool`->`UInt64`), so e.g. `values('x String', true)` returns `'1'` instead of
+/// `'true'`. It is used at the literal site in the impl below. Delete this together with the
+/// `Field`-returning `evaluateConstantExpression` once its callers move to the column API
+/// (`evaluateConstantExpressionAsColumn`).
+static EvaluateConstantExpressionResult getFieldAndDataTypeFromLiteral(ASTLiteral * literal)
 {
+    auto type = applyVisitor(FieldToDataType(), literal->value);
+    /// In case of Array field nested fields can have different types.
+    /// Example: Array [1, 2.3] will have 2 fields with types UInt64 and Float64
+    /// when result type is Array(Float64).
+    /// So, we need to convert this field to the result type.
+    return {convertFieldToType(literal->value, *type), type};
+}
+
+static EvaluateConstantExpressionColumnResult getColumnAndDataTypeFromLiteral(ASTLiteral * literal)
+{
+    auto [field, type] = getFieldAndDataTypeFromLiteral(literal);
+    return {ConstantValue::wrapToColumnConst(type->createColumnConst(1, field)), type};
+}
+
+/// `literal_out` (the compatibility shim documented on `getFieldAndDataTypeFromLiteral`): a literal
+/// result arises when `node` is an `ASTLiteral`. When `literal_out` is non-null (the `Field`-returning
+/// API is calling), such a literal is handed back through it as a tag-preserving `Field` and NO column
+/// is built (the function returns `std::nullopt`); when it is null (the column API is calling), the
+/// size-1 column is built as usual. This keeps the legacy `Field` API tag-faithful without building a
+/// column only to discard it.
+static std::optional<EvaluateConstantExpressionColumnResult> evaluateConstantExpressionAsColumnImpl(
+    const ASTPtr & node, const ContextPtr & context,
+    std::optional<EvaluateConstantExpressionResult> * literal_out = nullptr)
+{
+    auto from_literal = [&](ASTLiteral * literal) -> std::optional<EvaluateConstantExpressionColumnResult>
+    {
+        if (literal_out)
+        {
+            *literal_out = getFieldAndDataTypeFromLiteral(literal);
+            return std::nullopt;
+        }
+        return getColumnAndDataTypeFromLiteral(literal);
+    };
+
+    if (ASTLiteral * literal = node->as<ASTLiteral>())
+        return from_literal(literal);
+
     NamesAndTypesList source_columns = {{ "_dummy", std::make_shared<DataTypeUInt8>() }};
+
     auto ast = node->clone();
+
+    if (ast->as<ASTSubquery>() != nullptr)
+    {
+        /** For subqueries getColumnName if there are no alias will return __subquery_ + 'hash'.
+          * If there is alias getColumnName for subquery will return alias.
+          * In result block name of subquery after QueryAliasesVisitor pass will be _subquery1.
+          * We specify alias for subquery, because we need to get column from result block.
+          */
+        ast->setAlias("constant_expression");
+    }
+
     ReplaceQueryParameterVisitor param_visitor(context->getQueryParameters());
     param_visitor.visit(ast);
 
-    if (context->getSettingsRef().normalize_function_names)
-        FunctionNameNormalizer().visit(ast.get());
+    String result_name;
 
-    String name = ast->getColumnName();
-    auto syntax_result = TreeRewriter(context).analyze(ast, source_columns);
-    ExpressionActionsPtr expr_for_constant_folding = ExpressionAnalyzer(ast, syntax_result, context).getConstActions();
+    ColumnPtr result_column;
+    DataTypePtr result_type;
+    {
+        /// `result_name` is only used for diagnostic messages below, not to match the output
+        /// column. Avoid calling `getColumnName`, because it throws a logical error for arguments
+        /// that are not column expressions (e.g. `*` or an empty expression list coming from a
+        /// table function argument), while a regular exception is later produced by `buildQueryTree`.
+        result_name = ast->formatForLogging();
 
-    /// There must be at least one column in the block so that it knows the number of rows.
-    Block block_with_constants{{ ColumnConst::create(ColumnUInt8::create(1, 0), 1), std::make_shared<DataTypeUInt8>(), "_dummy" }};
+        auto execution_context = Context::createCopy(context);
+        auto expression = buildQueryTree(ast, execution_context);
 
-    expr_for_constant_folding->execute(block_with_constants);
+        ColumnsDescription fake_column_descriptions(source_columns);
+        auto storage = std::make_shared<StorageDummy>(StorageID{"dummy", "dummy"}, fake_column_descriptions);
+        auto fake_table_expression = std::make_shared<TableNode>(storage, execution_context);
 
-    if (!block_with_constants || block_with_constants.rows() == 0)
-        throw Exception("Logical error: empty block after evaluation of constant expression for IN, VALUES or LIMIT or aggregate function parameter",
-                        ErrorCodes::LOGICAL_ERROR);
+        QueryAnalyzer analyzer(false);
+        analyzer.resolveConstantExpression(expression, fake_table_expression, execution_context);
 
-    if (!block_with_constants.has(name))
+        GlobalPlannerContextPtr global_planner_context = std::make_shared<GlobalPlannerContext>(nullptr, nullptr, nullptr, FiltersForTableExpressionMap{});
+        auto planner_context = std::make_shared<PlannerContext>(execution_context, global_planner_context, SelectQueryOptions{});
+
+        collectSourceColumns(expression, planner_context, false /*keep_alias_columns*/);
+        collectSets(expression, *planner_context);
+
+        ColumnNodePtrWithHashSet empty_correlated_columns_set;
+        auto [actions, correlated_subtrees] = buildActionsDAGFromExpressionNode(
+            expression,
+            /*input_columns=*/{},
+            planner_context,
+            empty_correlated_columns_set);
+        correlated_subtrees.assertEmpty("in constant expression without query context");
+
+        if (actions.getOutputs().size() != 1)
+        {
+            // Expression can return more than one column using untuple()
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Constant expression returns more than 1 column: {}", ast->formatForLogging());
+        }
+
+        const auto & output = actions.getOutputs()[0];
+        if (output->column)
+        {
+            result_column = output->column;
+            result_type = output->result_type;
+        }
+    }
+
+    if (!result_column)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "Element of set in IN, VALUES or LIMIT or aggregate function parameter is not a constant expression (result column not found): {}", name);
+                        "Element of set in IN, VALUES, or LIMIT, or aggregate function parameter, or a table function argument "
+                        "is not a constant expression (result column not found): {}", result_name);
 
-    const ColumnWithTypeAndName & result = block_with_constants.getByName(name);
-    const IColumn & result_column = *result.column;
+    /// All constant (literal) columns in block are added with size 1.
+    /// But if there was no columns in block before executing a function, the result has size 0.
+    /// Change the size to 1.
+    if (result_column->empty() && isColumnConst(*result_column))
+        result_column = result_column->cloneResized(1);
+
+    if (result_column->empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "Empty result column after evaluation "
+                        "of constant expression for IN, VALUES, or LIMIT, or aggregate function parameter, or a table function argument");
 
     /// Expressions like rand() or now() are not constant
-    if (!isColumnConst(result_column))
+    if (!isColumnConst(*result_column))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "Element of set in IN, VALUES or LIMIT or aggregate function parameter is not a constant expression (result column is not const): {}", name);
+                        "Element of set in IN, VALUES, or LIMIT, or aggregate function parameter, or a table function argument "
+                        "is not a constant expression (result column is not const): {}", result_name);
 
-    return std::make_pair(result_column[0], result.type);
+    /// Keep the value as a size-1 const column: this preserves the exact SQL type (no `Field`
+    /// `NearestFieldType` collapse) and lets callers read it without materializing a `Field`.
+    return ConstantValue{ConstantValue::wrapToColumnConst(result_column), result_type};
 }
 
+/// Materialize the column result into the legacy `Field` result. Used by the `Field`-returning
+/// entry points below (for callers not yet migrated to the column API) for NON-literal nodes only;
+/// literal nodes take the tag-preserving fast path (see `getFieldAndDataTypeFromLiteral`). Reading the value back
+/// with `operator[]` canonicalizes nested tags (`Bool`->`UInt64`), matching the historical behavior
+/// of the non-literal path, which also returned `(*result_column)[0]`. Read via the column's
+/// `operator[]` directly (not `ConstantValue::getField`, which uses `IColumn::get`) so this bridge stays
+/// byte-for-byte compatible with that historical path.
+static std::optional<EvaluateConstantExpressionResult> materializeToField(std::optional<EvaluateConstantExpressionColumnResult> column_result)
+{
+    if (!column_result)
+        return {};
+    return std::make_pair((*column_result->getColumn())[0], column_result->getType());
+}
 
-ASTPtr evaluateConstantExpressionAsLiteral(const ASTPtr & node, ContextPtr context)
+std::optional<EvaluateConstantExpressionColumnResult> tryEvaluateConstantExpressionAsColumn(const ASTPtr & node, const ContextPtr & context)
+{
+    return evaluateConstantExpressionAsColumnImpl(node, context);
+}
+
+EvaluateConstantExpressionColumnResult evaluateConstantExpressionAsColumn(const ASTPtr & node, const ContextPtr & context)
+{
+    auto res = evaluateConstantExpressionAsColumnImpl(node, context);
+    if (!res)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "evaluateConstantExpression expected to return a result or throw an exception");
+    return *res;
+}
+
+std::optional<EvaluateConstantExpressionResult> tryEvaluateConstantExpression(const ASTPtr & node, const ContextPtr & context)
+{
+    /// Bridge B1: a (possibly rewrite-folded) literal comes back through `literal_result` as a
+    /// tag-preserving `Field`; otherwise materialize the column result.
+    std::optional<EvaluateConstantExpressionResult> literal_result;
+    auto column_result = evaluateConstantExpressionAsColumnImpl(node, context, &literal_result);
+    if (literal_result)
+        return literal_result;
+    return materializeToField(std::move(column_result));
+}
+
+EvaluateConstantExpressionResult evaluateConstantExpression(const ASTPtr & node, const ContextPtr & context)
+{
+    /// Bridge B1: a (possibly rewrite-folded) literal comes back through `literal_result` as a
+    /// tag-preserving `Field`; otherwise materialize the column result.
+    std::optional<EvaluateConstantExpressionResult> literal_result;
+    auto column_result = evaluateConstantExpressionAsColumnImpl(node, context, &literal_result);
+    if (literal_result)
+        return std::move(*literal_result);
+    auto res = materializeToField(std::move(column_result));
+    if (!res)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "evaluateConstantExpression expected to return a result or throw an exception");
+    return *res;
+}
+
+ASTPtr evaluateConstantExpressionAsLiteral(const ASTPtr & node, const ContextPtr & context)
 {
     /// If it's already a literal.
     if (node->as<ASTLiteral>())
         return node;
-    return std::make_shared<ASTLiteral>(evaluateConstantExpression(node, context).first);
+    return make_intrusive<ASTLiteral>(evaluateConstantExpression(node, context).first);
 }
 
-ASTPtr evaluateConstantExpressionOrIdentifierAsLiteral(const ASTPtr & node, ContextPtr context)
+ASTPtr evaluateConstantExpressionOrIdentifierAsLiteral(const ASTPtr & node, const ContextPtr & context)
 {
     if (const auto * id = node->as<ASTIdentifier>())
-        return std::make_shared<ASTLiteral>(id->name());
+        return make_intrusive<ASTLiteral>(id->name());
 
     return evaluateConstantExpressionAsLiteral(node, context);
 }
 
-ASTPtr evaluateConstantExpressionForDatabaseName(const ASTPtr & node, ContextPtr context)
+ASTPtr evaluateConstantExpressionForDatabaseName(const ASTPtr & node, const ContextPtr & context)
 {
     ASTPtr res = evaluateConstantExpressionOrIdentifierAsLiteral(node, context);
     auto & literal = res->as<ASTLiteral &>();
@@ -189,7 +366,7 @@ namespace
             --limit;
             return analyzeEquals(identifier, literal, expr);
         }
-        else if (fn->name == "in")
+        if (fn->name == "in")
         {
             const auto * left = fn->arguments->children.front().get();
             const auto * right = fn->arguments->children.back().get();
@@ -233,7 +410,7 @@ namespace
             {
                 if (tuple_literal->value.getType() == Field::Types::Tuple)
                 {
-                    const auto & tuple = tuple_literal->value.get<const Tuple &>();
+                    const auto & tuple = tuple_literal->value.safeGet<Tuple>();
                     for (const auto & child : tuple)
                     {
                         const auto dnf = analyzeEquals(identifier, child, expr);
@@ -259,7 +436,7 @@ namespace
 
             return result;
         }
-        else if (fn->name == "or")
+        if (fn->name == "or")
         {
             const auto * args = fn->children.front()->as<ASTExpressionList>();
 
@@ -285,7 +462,7 @@ namespace
 
             return result;
         }
-        else if (fn->name == "and")
+        if (fn->name == "and")
         {
             const auto * args = fn->children.front()->as<ASTExpressionList>();
 
@@ -314,6 +491,395 @@ namespace
 
         return {};
     }
+
+    /// This is a map which stores constants for a single conjunction.
+    /// It can contain execution results from different stanges.
+    /// Example: for expression `(a + b) * c` and predicate `a = 1 and b = 2 and a + b = 3` the map will be
+    /// a -> 1, b -> 2, a + b -> 3
+    /// It is allowed to have a map with contradictive conditions, like for `a = 1 and b = 2 and a + b = 5`,
+    /// but a map for predicate like `a = 1 and a = 2` cannot be built.
+    using ConjunctionMap = ActionsDAG::IntermediateExecutionResult;
+    using DisjunctionList = std::list<ConjunctionMap>;
+
+    std::optional<ConjunctionMap> andConjunctions(const ConjunctionMap & lhs, const ConjunctionMap & rhs)
+    {
+        ConjunctionMap res;
+        for (const auto & [node, column] : rhs)
+        {
+            auto it = lhs.find(node);
+            /// If constants are different, the conjunction is invalid.
+            if (it != lhs.end() && column.column->compareAt(0, 0, *it->second.column, 1))
+                return {};
+
+            if (it == lhs.end())
+                res.emplace(node, column);
+        }
+
+        res.insert(lhs.begin(), lhs.end());
+        return res;
+    }
+
+    DisjunctionList andDisjunctions(const DisjunctionList & lhs, const DisjunctionList & rhs)
+    {
+        DisjunctionList res;
+        for (const auto & lhs_map : lhs)
+            for (const auto & rhs_map : rhs)
+                if (auto conj = andConjunctions(lhs_map, rhs_map))
+                    res.emplace_back(std::move(*conj));
+
+        return res;
+    }
+
+    DisjunctionList orDisjunctions(DisjunctionList && lhs, DisjunctionList && rhs)
+    {
+        lhs.splice(lhs.end(), std::move(rhs));
+        return lhs;
+    }
+
+    const ActionsDAG::Node * findMatch(const ActionsDAG::Node * key, const MatchedTrees::Matches & matches)
+    {
+        auto it = matches.find(key);
+        if (it == matches.end())
+            return {};
+
+        const auto & match = it->second;
+        if (!match.node || match.monotonicity)
+            return nullptr;
+
+        return match.node;
+    }
+
+    ColumnPtr tryCastColumn(ColumnPtr col, const DataTypePtr & from_type, const DataTypePtr & to_type)
+    {
+        auto to_type_no_lc = recursiveRemoveLowCardinality(to_type);
+        // std::cerr << ".. casting " << from_type->getName() << " -> " << to_type_no_lc->getName() << std::endl;
+        if (!to_type_no_lc->canBeInsideNullable())
+            return {};
+
+        auto res = castColumnAccurateOrNull({col, from_type, std::string()}, makeNullable(to_type_no_lc));
+        if (res->onlyNull())
+            return nullptr;
+
+        if (!typeid_cast<const ColumnNullable *>(res.get()))
+            return nullptr;
+
+        return res;
+    }
+
+    std::optional<ConjunctionMap::value_type> analyzeConstant(
+        const ActionsDAG::Node * key,
+        const ActionsDAG::Node * value,
+        const MatchedTrees::Matches & matches)
+    {
+        if (value->type != ActionsDAG::ActionType::COLUMN)
+            return {};
+
+        if (const auto * col = typeid_cast<const ColumnConst *>(value->column.get()))
+        {
+            if (const auto * node = findMatch(key, matches))
+            {
+                /// ActionsDAG::addColumn normalizes ColumnConst to size 0; expand to size 1
+                /// because the conjunction map is consumed by evaluatePartialResult with
+                /// input_rows_count == 1, and downstream consumers (e.g. createBlockSelector)
+                /// rely on the column's row count.
+                ColumnPtr column = ColumnConst::create(col->getDataColumnPtr(), 1);
+                if (!value->result_type->equals(*node->result_type))
+                {
+                    auto inner = tryCastColumn(col->getDataColumnPtr(), value->result_type, node->result_type);
+                    if (!inner || inner->isNullAt(0))
+                        return {};
+
+                    auto innder_column = node->result_type->createColumn();
+                    innder_column->insert((*inner)[0]);
+                    column = ColumnConst::create(std::move(innder_column), 1);
+                }
+
+                return ConjunctionMap::value_type{node, {column, node->result_type, node->result_name}};
+            }
+        }
+
+        return {};
+    }
+
+    std::optional<DisjunctionList> analyzeSet(
+        const ActionsDAG::Node * key,
+        const ActionsDAG::Node * value,
+        const MatchedTrees::Matches & matches,
+        const ContextPtr & context,
+        size_t max_elements)
+    {
+        if (value->type != ActionsDAG::ActionType::COLUMN)
+            return {};
+
+        const auto & col = value->column->getDataColumnPtr();
+        const auto * col_set = typeid_cast<const ColumnSet *>(col.get());
+        if (!col_set || !col_set->getData())
+            return {};
+
+        SetPtr set = nullptr;
+        if (auto * set_from_tuple = typeid_cast<FutureSetFromTuple *>(col_set->getData().get()))
+            set = set_from_tuple->buildOrderedSetInplace(context);
+        else
+            set = col_set->getData().get()->get();
+
+        if (!set || !set->hasExplicitSetElements())
+            return {};
+
+        auto elements = set->getSetElements();
+        auto types = set->getElementsTypes();
+        if (elements.empty())
+            return {};
+
+        /// The values a component of the key takes, row by row, aligned with the set's elements.
+        struct Component
+        {
+            const ActionsDAG::Node * node;
+            ColumnPtr column;
+            /// Owns `null_map` when the elements were cast to a `Nullable` type.
+            ColumnPtr cast_column = nullptr;
+            const NullMap * null_map = nullptr;
+        };
+        std::vector<Component> components;
+
+        if (const auto * node = findMatch(key, matches))
+        {
+            /// The whole key is one of the expressions: a single column, or the tuple itself.
+            ColumnPtr column;
+            DataTypePtr type;
+            if (elements.size() == 1)
+            {
+                column = elements[0];
+                type = types[0];
+            }
+            else
+            {
+                column = ColumnTuple::create(std::move(elements));
+                type = std::make_shared<DataTypeTuple>(std::move(types));
+            }
+            components.push_back({node, std::move(column), nullptr, nullptr});
+            types = {std::move(type)};
+        }
+        else if (key->type == ActionsDAG::ActionType::FUNCTION
+            && key->function_base->getName() == "tuple"
+            && key->children.size() == elements.size())
+        {
+            /// `(a, b) IN ((1, 'x'), (2, 'y'))` pins each expression among `a`, `b` to the values of
+            /// the element column at the same position. A component that is not one of the
+            /// expressions is left out: the values of the others stay a superset of what the
+            /// condition allows, which is all the caller needs.
+            DataTypes component_types;
+            for (size_t i = 0; i < key->children.size(); ++i)
+            {
+                if (const auto * component_node = findMatch(key->children[i], matches))
+                {
+                    components.push_back({component_node, elements[i], nullptr, nullptr});
+                    component_types.push_back(types[i]);
+                }
+            }
+            if (components.empty())
+                return {};
+            types = std::move(component_types);
+        }
+        else
+        {
+            return {};
+        }
+
+        size_t num_rows = components[0].column->size();
+        if (num_rows > max_elements)
+            return {};
+
+        for (size_t i = 0; i < components.size(); ++i)
+        {
+            auto & component = components[i];
+            if (types[i]->equals(*component.node->result_type))
+                continue;
+
+            component.cast_column = tryCastColumn(component.column, types[i], component.node->result_type);
+            if (!component.cast_column)
+                return {};
+            const auto & col_nullable = assert_cast<const ColumnNullable &>(*component.cast_column);
+            component.null_map = &col_nullable.getNullMapData();
+            component.column = col_nullable.getNestedColumnPtr();
+        }
+
+        DisjunctionList res;
+        if (set->hasNull())
+        {
+            /// A NULL in the set matches nothing, but keep it as a variant for a Nullable key so a
+            /// caller that evaluates the variants sees the same NULL the condition mentions.
+            ConjunctionMap null_variant;
+            for (const auto & component : components)
+            {
+                if (component.node->result_type->isNullable())
+                {
+                    auto col_null = component.node->result_type->createColumnConst(1, Field());
+                    null_variant.emplace(component.node, ColumnWithTypeAndName{std::move(col_null), component.node->result_type, component.node->result_name});
+                }
+            }
+            if (!null_variant.empty())
+                res.push_back(std::move(null_variant));
+        }
+
+        for (size_t row = 0; row < num_rows; ++row)
+        {
+            ConjunctionMap variant;
+            bool has_null = false;
+            for (const auto & component : components)
+            {
+                if (component.null_map && (*component.null_map)[row])
+                {
+                    has_null = true;
+                    break;
+                }
+
+                auto innder_column = component.node->result_type->createColumn();
+                innder_column->insert((*component.column)[row]);
+                auto column_const = ColumnConst::create(std::move(innder_column), 1);
+
+                variant.emplace(component.node, ColumnWithTypeAndName{std::move(column_const), component.node->result_type, component.node->result_name});
+            }
+            if (has_null)
+                continue;
+
+            res.push_back(std::move(variant));
+        }
+
+        return res;
+    }
+
+    std::optional<DisjunctionList> analyze(const ActionsDAG::Node * node, const MatchedTrees::Matches & matches, const ContextPtr & context, size_t max_elements)
+    {
+        if (node->type == ActionsDAG::ActionType::FUNCTION)
+        {
+            if (node->function_base->getName() == "equals")
+            {
+                const auto * lhs_node = node->children.at(0);
+                const auto * rhs_node = node->children.at(1);
+                if (auto val = analyzeConstant(lhs_node, rhs_node, matches))
+                    return DisjunctionList{ConjunctionMap{std::move(*val)}};
+
+                if (auto val = analyzeConstant(rhs_node, lhs_node, matches))
+                    return DisjunctionList{ConjunctionMap{std::move(*val)}};
+            }
+            else if (node->function_base->getName() == "in")
+            {
+                const auto * lhs_node = node->children.at(0);
+                const auto * rhs_node = node->children.at(1);
+
+                return analyzeSet(lhs_node, rhs_node, matches, context, max_elements);
+            }
+            else if (node->function_base->getName() == "or")
+            {
+                DisjunctionList res;
+                for (const auto * child : node->children)
+                {
+                    auto val = analyze(child, matches, context, max_elements);
+                    if (!val)
+                        return {};
+
+                    if (val->size() + res.size() > max_elements)
+                        return {};
+
+                    res = orDisjunctions(std::move(res), std::move(*val));
+                }
+
+                return res;
+            }
+            else if (node->function_base->getName() == "and")
+            {
+                std::vector<DisjunctionList> lists;
+                for (const auto * child : node->children)
+                {
+                    auto val = analyze(child, matches, context, max_elements);
+                    if (!val)
+                        continue;
+
+                    lists.push_back(std::move(*val));
+                }
+
+                if (lists.empty())
+                    return {};
+
+                /// clang-tidy says the comparator might be called on moved-from object of type 'std::list'
+                /// NOLINTBEGIN(clang-analyzer-cplusplus.Move)
+                std::sort(lists.begin(), lists.end(),
+                    [](const auto & lhs, const auto & rhs) { return lhs.size() < rhs.size(); });
+                /// NOLINTEND(clang-analyzer-cplusplus.Move)
+
+                DisjunctionList res;
+                bool first = true;
+                for (auto & list : lists)
+                {
+                    if (first)
+                    {
+                        first = false;
+                        res = std::move(list);
+                        continue;
+                    }
+
+                    if (res.size() * list.size() > max_elements)
+                        break;
+
+                    res = andDisjunctions(res, list);
+                }
+
+                return res;
+            }
+        }
+        else if (node->type == ActionsDAG::ActionType::COLUMN)
+        {
+            if (node->result_type->canBeUsedInBooleanContext())
+            {
+                if (!node->column->getBool(0))
+                    return DisjunctionList{};
+            }
+        }
+
+        return {};
+    }
+
+    std::optional<ColumnsWithTypeAndName> evaluateConjunction(
+        const ActionsDAG::NodeRawConstPtrs & target_expr,
+        ConjunctionMap && conjunction)
+    {
+        auto columns = ActionsDAG::evaluatePartialResult(conjunction, target_expr, /* input_rows_count= */ 1);
+        for (const auto & column : columns)
+            if (!column.column)
+                return {};
+
+        return columns;
+    }
+}
+
+std::optional<ConstantVariants> evaluateExpressionOverConstantCondition(
+    const ActionsDAG::Node * predicate,
+    const ActionsDAG::NodeRawConstPtrs & expr,
+    const ContextPtr & context,
+    size_t max_elements)
+{
+    if (!predicate)
+        return {};
+
+    ActionsDAGWithInversionPushDown filter_dag(predicate, context, /* boolean_context */ true);
+    auto matches = matchTrees(expr, *filter_dag.dag, false);
+
+    auto predicates = analyze(filter_dag.predicate, matches, context, max_elements);
+
+    if (!predicates)
+        return {};
+
+    ConstantVariants res;
+    for (auto & conjunction : *predicates)
+    {
+        auto vals = evaluateConjunction(expr, std::move(conjunction));
+        if (!vals)
+            return {};
+
+        res.push_back(std::move(*vals));
+    }
+
+    return res;
 }
 
 std::optional<Blocks> evaluateExpressionOverConstantCondition(const ASTPtr & node, const ExpressionActionsPtr & target_expr, size_t & limit)
@@ -322,7 +888,6 @@ std::optional<Blocks> evaluateExpressionOverConstantCondition(const ASTPtr & nod
 
     if (const auto * fn = node->as<ASTFunction>())
     {
-        std::unordered_map<std::string, bool> always_false_map;
         const auto dnf = analyzeFunction(fn, target_expr, limit);
 
         if (dnf.empty() || !limit)
@@ -354,6 +919,7 @@ std::optional<Blocks> evaluateExpressionOverConstantCondition(const ASTPtr & nod
         for (const auto & conjunct : dnf)
         {
             Block block;
+            bool always_false = false;
 
             for (const auto & elem : conjunct)
             {
@@ -372,22 +938,15 @@ std::optional<Blocks> evaluateExpressionOverConstantCondition(const ASTPtr & nod
                         Field prev_value = assert_cast<const ColumnConst &>(*prev.column).getField();
                         Field curr_value = assert_cast<const ColumnConst &>(*elem.column).getField();
 
-                        if (!always_false_map.count(elem.name))
-                        {
-                            always_false_map[elem.name] = prev_value != curr_value;
-                        }
-                        else
-                        {
-                            auto & always_false = always_false_map[elem.name];
-                            /// If at least one of conjunct is not always false, we should preserve this.
-                            if (always_false)
-                            {
-                                always_false = prev_value != curr_value;
-                            }
-                        }
+                        always_false = prev_value != curr_value;
+                        if (always_false)
+                            break;
                     }
                 }
             }
+
+            if (always_false)
+                continue;
 
             // Block should contain all required columns from `target_expr`
             if (!has_required_columns(block))
@@ -412,19 +971,13 @@ std::optional<Blocks> evaluateExpressionOverConstantCondition(const ASTPtr & nod
                 return {};
             }
         }
-
-        bool any_always_false = std::any_of(always_false_map.begin(), always_false_map.end(), [](const auto & v) { return v.second; });
-        if (any_always_false)
-            return Blocks{};
-
     }
     else if (const auto * literal = node->as<ASTLiteral>())
     {
         // Check if it's always true or false.
-        if (literal->value.getType() == Field::Types::UInt64 && literal->value.get<UInt64>() == 0)
+        if (literal->value.getType() == Field::Types::UInt64 && literal->value.safeGet<UInt64>() == 0)
             return {result};
-        else
-            return {};
+        return {};
     }
 
     return {result};

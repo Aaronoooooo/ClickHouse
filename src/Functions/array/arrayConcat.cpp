@@ -1,14 +1,10 @@
-#include <Functions/IFunction.h>
+#include <Functions/array/arrayConcat.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/GatherUtils/GatherUtils.h>
 #include <DataTypes/DataTypeArray.h>
-#include <DataTypes/getLeastSupertype.h>
 #include <Interpreters/castColumn.h>
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
-#include <Common/typeid_cast.h>
-#include <base/range.h>
-
 
 namespace DB
 {
@@ -16,91 +12,68 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
 }
 
-
-/// arrayConcat(arr1, ...) - concatenate arrays.
-class FunctionArrayConcat : public IFunction
+ColumnPtr FunctionArrayConcat::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const
 {
-public:
-    static constexpr auto name = "arrayConcat";
-    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionArrayConcat>(); }
+    if (result_type->onlyNull())
+        return result_type->createColumnConstWithDefaultValue(input_rows_count);
 
-    String getName() const override { return name; }
+    if (arguments.size() == 1)
+        return arguments[0].column;
 
-    bool isVariadic() const override { return true; }
-    size_t getNumberOfArguments() const override { return 0; }
-    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+    size_t num_args = arguments.size();
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    Columns preprocessed_columns(num_args);
+
+    for (size_t i = 0; i < num_args; ++i)
     {
-        if (arguments.empty())
-            throw Exception{"Function " + getName() + " requires at least one argument.", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH};
+        const ColumnWithTypeAndName & arg = arguments[i];
+        ColumnPtr preprocessed_column = arg.column;
 
-        for (auto i : collections::range(0, arguments.size()))
-        {
-            const auto * array_type = typeid_cast<const DataTypeArray *>(arguments[i].get());
-            if (!array_type)
-                throw Exception("Argument " + std::to_string(i) + " for function " + getName() + " must be an array but it has type "
-                                + arguments[i]->getName() + ".", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-        }
+        if (!arg.type->equals(*result_type))
+            preprocessed_column = castColumn(arg, result_type);
 
-        return getLeastSupertype(arguments);
+        preprocessed_columns[i] = std::move(preprocessed_column);
     }
 
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
+    VectorWithMemoryTracking<std::unique_ptr<GatherUtils::IArraySource>> sources;
+
+    for (auto & argument_column : preprocessed_columns)
     {
-        if (result_type->onlyNull())
-            return result_type->createColumnConstWithDefaultValue(input_rows_count);
+        bool is_const = false;
 
-        size_t rows = input_rows_count;
-        size_t num_args = arguments.size();
-
-        Columns preprocessed_columns(num_args);
-
-        for (size_t i = 0; i < num_args; ++i)
+        if (const auto * argument_column_const = typeid_cast<const ColumnConst *>(argument_column.get()))
         {
-            const ColumnWithTypeAndName & arg = arguments[i];
-            ColumnPtr preprocessed_column = arg.column;
-
-            if (!arg.type->equals(*result_type))
-                preprocessed_column = castColumn(arg, result_type);
-
-            preprocessed_columns[i] = std::move(preprocessed_column);
+            is_const = true;
+            argument_column = argument_column_const->getDataColumnPtr();
         }
 
-        std::vector<std::unique_ptr<GatherUtils::IArraySource>> sources;
-
-        for (auto & argument_column : preprocessed_columns)
-        {
-            bool is_const = false;
-
-            if (const auto * argument_column_const = typeid_cast<const ColumnConst *>(argument_column.get()))
-            {
-                is_const = true;
-                argument_column = argument_column_const->getDataColumnPtr();
-            }
-
-            if (const auto * argument_column_array = typeid_cast<const ColumnArray *>(argument_column.get()))
-                sources.emplace_back(GatherUtils::createArraySource(*argument_column_array, is_const, rows));
-            else
-                throw Exception{"Arguments for function " + getName() + " must be arrays.", ErrorCodes::LOGICAL_ERROR};
-        }
-
-        auto sink = GatherUtils::concat(sources);
-
-        return sink;
+        if (const auto * argument_column_array = typeid_cast<const ColumnArray *>(argument_column.get()))
+            sources.emplace_back(GatherUtils::createArraySource(*argument_column_array, is_const, input_rows_count));
+        else
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Arguments for function {} must be arrays.", getName());
     }
 
-    bool useDefaultImplementationForConstants() const override { return true; }
-};
+    auto sink = GatherUtils::concat(sources);
 
+    return sink;
+}
 
-void registerFunctionArrayConcat(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayConcat)
 {
-    factory.registerFunction<FunctionArrayConcat>();
+    FunctionDocumentation::Description description = "Combines arrays passed as arguments.";
+    FunctionDocumentation::Syntax syntax = "arrayConcat(arr1 [, arr2, ... , arrN])";
+    FunctionDocumentation::Arguments arguments = {
+        {"arr1 [, arr2, ... , arrN]", "N number of arrays to concatenate.", {"Array(T)"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns a single combined array from the provided array arguments.", {"Array(T)"}};
+    FunctionDocumentation::Examples example = {{"Usage example", "SELECT arrayConcat([1, 2], [3, 4], [5, 6]) AS res", "[1,2,3,4,5,6]"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Array;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, example, introduced_in, category};
+
+    factory.registerFunction<FunctionArrayConcat>(documentation);
 }
 
 }

@@ -1,14 +1,13 @@
-<?xml version="1.0"?>
 <clickhouse>
    <dictionary>
       <name>dict0</name>
       <source>
          <postgresql>
-            <db>clickhouse</db>
+            <db>postgres_database</db>
             <host>postgres1</host>
             <port>5432</port>
             <user>postgres</user>
-            <password>mysecretpassword</password>
+            <password>ClickHouse_PostgreSQL_P@ssw0rd</password>
             <table>test0</table>
             <invalidate_query>SELECT value FROM test0 WHERE id = 0</invalidate_query>
          </postgresql>
@@ -38,9 +37,9 @@
       <name>dict1</name>
       <source>
          <postgresql>
-            <db>clickhouse</db>
+            <db>postgres_database</db>
             <user>postgres</user>
-            <password>mysecretpassword</password>
+            <password>ClickHouse_PostgreSQL_P@ssw0rd</password>
             <table>test1</table>
             <replica>
                  <host>postgres1</host>

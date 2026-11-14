@@ -6,10 +6,13 @@
 namespace DB
 {
 
+class ColumnString;
+
 class DataTypeString final : public IDataType
 {
 public:
     using FieldType = String;
+    using ColumnType = ColumnString;
     static constexpr bool is_parametric = false;
     static constexpr auto type_id = TypeIndex::String;
 
@@ -35,7 +38,9 @@ public:
     bool canBeInsideNullable() const override { return true; }
     bool canBeInsideLowCardinality() const override { return true; }
 
-    SerializationPtr doGetDefaultSerialization() const override;
+    void updateHashImpl(SipHash &) const override {}
+
+    SerializationPtr doGetSerialization(const SerializationInfoSettings & settings) const override;
 };
 
 }

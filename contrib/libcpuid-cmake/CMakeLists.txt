@@ -6,12 +6,11 @@ elseif(ENABLE_CPUID)
 endif()
 
 if (NOT ENABLE_CPUID)
-    add_library (cpuid INTERFACE)
-
-    target_compile_definitions (cpuid INTERFACE USE_CPUID=0)
-
+    message(STATUS "Not using cpuid")
     return()
 endif()
+
+add_definitions (-D_GNU_SOURCE)
 
 set (LIBRARY_DIR "${ClickHouse_SOURCE_DIR}/contrib/libcpuid")
 
@@ -20,19 +19,18 @@ set (SRCS
     "${LIBRARY_DIR}/libcpuid/cpuid_main.c"
     "${LIBRARY_DIR}/libcpuid/libcpuid_util.c"
     "${LIBRARY_DIR}/libcpuid/msrdriver.c"
+    "${LIBRARY_DIR}/libcpuid/rdcpuid.c"
     "${LIBRARY_DIR}/libcpuid/rdmsr.c"
     "${LIBRARY_DIR}/libcpuid/rdtsc.c"
     "${LIBRARY_DIR}/libcpuid/recog_amd.c"
+    "${LIBRARY_DIR}/libcpuid/recog_arm.c"
     "${LIBRARY_DIR}/libcpuid/recog_intel.c"
+    "${LIBRARY_DIR}/libcpuid/recog_centaur.c"
 )
 
-add_library (cpuid ${SRCS})
+add_library (_cpuid ${SRCS})
 
-target_include_directories (cpuid SYSTEM PUBLIC "${LIBRARY_DIR}")
-target_compile_definitions (cpuid PUBLIC USE_CPUID=1)
-target_compile_definitions (cpuid PRIVATE VERSION="v0.4.1")
-if (COMPILER_CLANG)
-    target_compile_options (cpuid PRIVATE -Wno-reserved-id-macro)
-endif ()
+target_include_directories (_cpuid SYSTEM PUBLIC "${LIBRARY_DIR}")
+target_compile_definitions (_cpuid PRIVATE VERSION="v0.8.2")
 
-message (STATUS "Using cpuid")
+add_library(ch_contrib::cpuid ALIAS _cpuid)

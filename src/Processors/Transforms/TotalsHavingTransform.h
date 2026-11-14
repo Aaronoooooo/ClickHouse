@@ -1,30 +1,31 @@
 #pragma once
 
+#include <Common/PODArray_fwd.h>
 #include <Processors/ISimpleTransform.h>
-#include <Common/Arena.h>
+#include <Processors/Transforms/finalizeChunk.h>
+#include <Interpreters/SetSpillable.h>
 
 namespace DB
 {
 
-class Arena;
-using ArenaPtr = std::shared_ptr<Arena>;
-
 class ExpressionActions;
 using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
+using IColumnFilter = PaddedPODArray<UInt8>;
 
 class ActionsDAG;
 
-enum class TotalsMode;
+enum class TotalsMode : uint8_t;
 
 /** Takes blocks after grouping, with non-finalized aggregate functions.
   * Calculates total values according to totals_mode.
   * If necessary, evaluates the expression from HAVING and filters rows. Returns the finalized and filtered blocks.
   */
-class TotalsHavingTransform : public ISimpleTransform
+class TotalsHavingTransform final : public ISimpleTransform
 {
 public:
     TotalsHavingTransform(
         const Block & header,
+        const ColumnsMask & aggregates_mask_,
         bool overflow_row_,
         const ExpressionActionsPtr & expression_,
         const std::string & filter_column_,
@@ -34,27 +35,34 @@ public:
         bool final_);
 
     String getName() const override { return "TotalsHavingTransform"; }
+    std::span<ISpillable * const> getSpillables() override { return set_spillables.get(); }
 
     OutputPort & getTotalsPort() { return outputs.back(); }
 
     Status prepare() override;
     void work() override;
+    void onCancel() noexcept override;
 
-    static Block transformHeader(Block block, const ActionsDAG * expression, const std::string & filter_column_name, bool remove_filter, bool final);
+    bool hasFilter() const { return !filter_column_name.empty(); }
+
+    static Block transformHeader(Block block, const ActionsDAG * expression, const std::string & filter_column_name, bool remove_filter, bool final, const ColumnsMask & aggregates_mask);
 
 protected:
     void transform(Chunk & chunk) override;
 
     bool finished_transform = false;
+    bool total_prepared = false;
     Chunk totals;
 
 private:
-    void addToTotals(const Chunk & chunk, const IColumn::Filter * filter);
+    void addToTotals(const Chunk & chunk, const IColumnFilter * filter);
     void prepareTotals();
 
     /// Params
+    const ColumnsMask aggregates_mask;
     bool overflow_row;
     ExpressionActionsPtr expression;
+    SetSpillables set_spillables;
     String filter_column_name;
     bool remove_filter;
     TotalsMode totals_mode;
@@ -75,7 +83,5 @@ private:
     /// Here, total values are accumulated. After the work is finished, they will be placed in totals.
     MutableColumns current_totals;
 };
-
-void finalizeChunk(Chunk & chunk);
 
 }

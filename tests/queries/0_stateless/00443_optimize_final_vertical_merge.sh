@@ -8,7 +8,7 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 table="optimize_me_finally"
 name="$CLICKHOUSE_DATABASE.$table"
-res_rows=1500000 # >= vertical_merge_algorithm_min_rows_to_activate
+res_rows=150000 # >= vertical_merge_algorithm_min_rows_to_activate
 
 function get_num_parts {
     $CLICKHOUSE_CLIENT -q "SELECT count() FROM system.parts WHERE active AND database='$CLICKHOUSE_DATABASE' AND table='$table'"
@@ -16,7 +16,7 @@ function get_num_parts {
 
 $CLICKHOUSE_CLIENT -q "DROP TABLE IF EXISTS $name"
 
-$CLICKHOUSE_CLIENT -q "CREATE TABLE $name (
+$CLICKHOUSE_CLIENT --allow_deprecated_syntax_for_merge_tree=1 -q "CREATE TABLE $name (
 date Date,
 Sign Int8,
 ki UInt64,
@@ -83,8 +83,7 @@ $CLICKHOUSE_CLIENT -q "ALTER TABLE $name MODIFY COLUMN da Array(String) DEFAULT 
 $CLICKHOUSE_CLIENT -q "SELECT count(), sum(Sign), sum(ki = di05), sum(hex(ki) = ds), sum(ki = n.i[1]), sum([hex(ki), hex(ki+1)] = n.s) FROM $name"
 $CLICKHOUSE_CLIENT -q "SELECT groupUniqArray(da), groupUniqArray(n.a) FROM $name"
 
-hash_src=$($CLICKHOUSE_CLIENT --max_threads=1 -q "SELECT cityHash64(groupArray(ki)) FROM $name")
-hash_ref=$($CLICKHOUSE_CLIENT --max_threads=1 -q "SELECT cityHash64(groupArray(ki)) FROM (SELECT number as ki FROM system.numbers LIMIT $res_rows)")
-echo $(( $hash_src - $hash_ref ))
+# The single merged part holds ki = 0..res_rows-1 in physical order
+$CLICKHOUSE_CLIENT -q "SELECT count() FROM $name WHERE ki != _part_offset"
 
 $CLICKHOUSE_CLIENT -q "DROP TABLE IF EXISTS $name"

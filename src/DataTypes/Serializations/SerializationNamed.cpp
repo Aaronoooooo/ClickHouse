@@ -1,26 +1,65 @@
+#include <Common/SipHash.h>
 #include <DataTypes/Serializations/SerializationNamed.h>
+#include <Common/Exception.h>
 
 namespace DB
 {
 
-void SerializationNamed::enumerateStreams(
-    SubstreamPath & path,
-    const StreamCallback & callback,
-    DataTypePtr type,
-    ColumnPtr column) const
+namespace ErrorCodes
 {
-    addToPath(path);
-    path.back().data = {type, column, getPtr(), std::make_shared<SubcolumnCreator>(name, escape_delimiter)};
-    nested_serialization->enumerateStreams(path, callback, type, column);
-    path.pop_back();
+    extern const int LOGICAL_ERROR;
+}
+
+SerializationNamed::SerializationNamed(
+    const SerializationPtr & nested_,
+    const String & name_,
+    SubstreamType substream_type_)
+    : SerializationWrapper(nested_)
+    , name(name_)
+    , substream_type(substream_type_)
+{
+    if (!ISerialization::Substream::named_types.contains(substream_type))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "SerializationNamed doesn't support substream type {}", substream_type);
+}
+
+UInt128 SerializationNamed::getHash(const SerializationPtr & nested_, const String & name_, SubstreamType substream_type_)
+{
+    SipHash hash;
+    hash.update("Named");
+    hash.update(nested_->getHash());
+    hash.update(name_.size());
+    hash.update(name_);
+    hash.update(static_cast<int>(substream_type_));
+    return hash.get128();
+}
+
+SerializationPtr SerializationNamed::create(const SerializationPtr & nested_, const String & name_, SubstreamType substream_type_)
+{
+    if (!nested_->supportsPooling())
+        return std::shared_ptr<ISerialization>(new SerializationNamed(nested_, name_, substream_type_));
+    return ISerialization::pooled(getHash(nested_, name_, substream_type_), [&] { return new SerializationNamed(nested_, name_, substream_type_); });
+}
+
+void SerializationNamed::enumerateStreams(
+    EnumerateStreamsSettings & settings,
+    const StreamCallback & callback,
+    const SubstreamData & data) const
+{
+    addToPath(settings.path);
+    settings.path.back().data = data;
+    settings.path.back().creator = std::make_shared<SubcolumnCreator>(name, substream_type);
+
+    nested_serialization->enumerateStreams(settings, callback, data);
+    settings.path.pop_back();
 }
 
 void SerializationNamed::serializeBinaryBulkStatePrefix(
+    const IColumn & column,
     SerializeBinaryBulkSettings & settings,
     SerializeBinaryBulkStatePtr & state) const
 {
     addToPath(settings.path);
-    nested_serialization->serializeBinaryBulkStatePrefix(settings, state);
+    nested_serialization->serializeBinaryBulkStatePrefix(column, settings, state);
     settings.path.pop_back();
 }
 
@@ -35,10 +74,11 @@ void SerializationNamed::serializeBinaryBulkStateSuffix(
 
 void SerializationNamed::deserializeBinaryBulkStatePrefix(
     DeserializeBinaryBulkSettings & settings,
-    DeserializeBinaryBulkStatePtr & state) const
+    DeserializeBinaryBulkStatePtr & state,
+    SubstreamsDeserializeStatesCache * cache) const
 {
     addToPath(settings.path);
-    nested_serialization->deserializeBinaryBulkStatePrefix(settings, state);
+    nested_serialization->deserializeBinaryBulkStatePrefix(settings, state, cache);
     settings.path.pop_back();
 }
 
@@ -55,7 +95,7 @@ void SerializationNamed::serializeBinaryBulkWithMultipleStreams(
 }
 
 void SerializationNamed::deserializeBinaryBulkWithMultipleStreams(
-    ColumnPtr & column,
+    IColumn & column,
     size_t limit,
     DeserializeBinaryBulkSettings & settings,
     DeserializeBinaryBulkStatePtr & state,
@@ -68,9 +108,20 @@ void SerializationNamed::deserializeBinaryBulkWithMultipleStreams(
 
 void SerializationNamed::addToPath(SubstreamPath & path) const
 {
-    path.push_back(Substream::TupleElement);
-    path.back().tuple_element_name = name;
-    path.back().escape_tuple_delimiter = escape_delimiter;
+    path.push_back(substream_type);
+    path.back().name_of_substream = name;
+}
+
+size_t SerializationNamed::allocatedBytes() const
+{
+    return sizeof(*this) + name.capacity();
+}
+
+SerializationPtr removeNamedSerialization(const SerializationPtr & serialization)
+{
+    if (const auto * named = typeid_cast<const SerializationNamed *>(serialization.get()))
+        return named->getNested();
+    return serialization;
 }
 
 }

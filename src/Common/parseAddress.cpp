@@ -15,7 +15,7 @@ namespace ErrorCodes
 std::pair<std::string, UInt16> parseAddress(const std::string & str, UInt16 default_port)
 {
     if (str.empty())
-        throw Exception("Empty address passed to function parseAddress", ErrorCodes::BAD_ARGUMENTS);
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Empty address passed to function parseAddress");
 
     const char * begin = str.data();
     const char * end = begin + str.size();
@@ -25,8 +25,8 @@ std::pair<std::string, UInt16> parseAddress(const std::string & str, UInt16 defa
     {
         const char * closing_square_bracket = find_first_symbols<']'>(begin + 1, end);
         if (closing_square_bracket >= end)
-            throw Exception("Illegal address passed to function parseAddress: "
-                "the address begins with opening square bracket, but no closing square bracket found", ErrorCodes::BAD_ARGUMENTS);
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Illegal address passed to function parseAddress: "
+                            "the address begins with opening square bracket, but no closing square bracket found");
 
         port = closing_square_bracket + 1;
     }
@@ -41,7 +41,7 @@ std::pair<std::string, UInt16> parseAddress(const std::string & str, UInt16 defa
 
         ++port;
 
-        UInt16 port_number;
+        UInt16 port_number = 0;
         ReadBufferFromMemory port_buf(port, end - port);
         if (!tryReadText(port_number, port_buf) || !port_buf.eof())
         {
@@ -50,13 +50,13 @@ std::pair<std::string, UInt16> parseAddress(const std::string & str, UInt16 defa
         }
         return { std::string(begin, port - 1), port_number };
     }
-    else if (default_port)
+    if (default_port)
     {
-        return { str, default_port };
+        return {str, default_port};
     }
-    else
-        throw Exception("The address passed to function parseAddress doesn't contain port number "
-            "and no 'default_port' was passed", ErrorCodes::BAD_ARGUMENTS);
+    throw Exception(
+        ErrorCodes::BAD_ARGUMENTS,
+        "The address passed to function parseAddress doesn't contain port number and no 'default_port' was passed");
 }
 
 }

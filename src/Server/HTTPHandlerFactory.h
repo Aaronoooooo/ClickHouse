@@ -1,40 +1,17 @@
 #pragma once
 
-#include <Interpreters/AsynchronousMetrics.h>
-#include <Server/HTTP/HTMLForm.h>
 #include <Server/HTTP/HTTPRequestHandlerFactory.h>
 #include <Server/HTTPHandlerRequestFilter.h>
-#include <Common/StringUtils/StringUtils.h>
-#include <base/logger_useful.h>
+#include <Server/HTTPRequestHandlerFactoryMain.h>
+#include <Common/StringUtils.h>
+#include <Poco/Util/AbstractConfiguration.h>
 
-#include <Poco/Util/LayeredConfiguration.h>
 
 namespace DB
 {
 
-namespace ErrorCodes
-{
-    extern const int UNKNOWN_ELEMENT_IN_CONFIG;
-}
-
 class IServer;
-
-/// Handle request using child handlers
-class HTTPRequestHandlerFactoryMain : public HTTPRequestHandlerFactory
-{
-public:
-    explicit HTTPRequestHandlerFactoryMain(const std::string & name_);
-
-    void addHandler(HTTPRequestHandlerFactoryPtr child_factory) { child_factories.emplace_back(child_factory); }
-
-    std::unique_ptr<HTTPRequestHandler> createRequestHandler(const HTTPServerRequest & request) override;
-
-private:
-    Poco::Logger * log;
-    std::string name;
-
-    std::vector<HTTPRequestHandlerFactoryPtr> child_factories;
-};
+class AsynchronousMetrics;
 
 template <typename TEndpoint>
 class HandlingRuleHTTPHandlerFactory : public HTTPRequestHandlerFactory
@@ -42,16 +19,14 @@ class HandlingRuleHTTPHandlerFactory : public HTTPRequestHandlerFactory
 public:
     using Filter = std::function<bool(const HTTPServerRequest &)>;
 
-    template <typename... TArgs>
-    explicit HandlingRuleHTTPHandlerFactory(TArgs &&... args)
+    using Creator = std::function<std::unique_ptr<TEndpoint>()>;
+    explicit HandlingRuleHTTPHandlerFactory(Creator && creator_)
+        : creator(std::move(creator_))
+    {}
+
+    explicit HandlingRuleHTTPHandlerFactory(IServer & server)
     {
-        creator = [args = std::tuple<TArgs...>(std::forward<TArgs>(args) ...)]()
-        {
-            return std::apply([&](auto && ... endpoint_args)
-            {
-                return std::make_unique<TEndpoint>(std::forward<decltype(endpoint_args)>(endpoint_args)...);
-            }, std::move(args));
-        };
+        creator = [&server]() -> std::unique_ptr<TEndpoint> { return std::make_unique<TEndpoint>(server); };
     }
 
     void addFilter(Filter cur_filter)
@@ -63,24 +38,15 @@ public:
         };
     }
 
-    void addFiltersFromConfig(Poco::Util::AbstractConfiguration & config, const std::string & prefix)
+    void addFilters(std::vector<Filter> filters)
     {
-        Poco::Util::AbstractConfiguration::Keys filters_type;
-        config.keys(prefix, filters_type);
+        for (auto & cur_filter : filters)
+            addFilter(std::move(cur_filter));
+    }
 
-        for (const auto & filter_type : filters_type)
-        {
-            if (filter_type == "handler")
-                continue;
-            else if (filter_type == "url")
-                addFilter(urlFilter(config, prefix + ".url"));
-            else if (filter_type == "headers")
-                addFilter(headersFilter(config, prefix + ".headers"));
-            else if (filter_type == "methods")
-                addFilter(methodsFilter(config, prefix + ".methods"));
-            else
-                throw Exception("Unknown element in config: " + prefix + "." + filter_type, ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
-        }
+    void addFiltersFromConfig(const Poco::Util::AbstractConfiguration & config, const std::string & prefix)
+    {
+        addFilters(extractHTTPRequestFiltersFromConfig(config, prefix));
     }
 
     void attachStrictPath(const String & strict_path)
@@ -103,12 +69,23 @@ public:
         });
     }
 
+    /// Handle GET, HEAD or POST endpoint on specified path
+    void allowGetHeadAndPostRequest()
+    {
+        addFilter([](const auto & request)
+        {
+            return request.getMethod() == Poco::Net::HTTPRequest::HTTP_GET
+                || request.getMethod() == Poco::Net::HTTPRequest::HTTP_HEAD
+                || request.getMethod() == Poco::Net::HTTPRequest::HTTP_POST;
+        });
+    }
+
     /// Handle Post request or (Get or Head) with params or OPTIONS requests
     void allowPostAndGetParamsAndOptionsRequest()
     {
         addFilter([](const auto & request)
         {
-            return (request.getURI().find('?') != std::string::npos
+            return (request.getURI().contains('?')
                 && (request.getMethod() == Poco::Net::HTTPRequest::HTTP_GET
                 || request.getMethod() == Poco::Net::HTTPRequest::HTTP_HEAD))
                 || request.getMethod() == Poco::Net::HTTPRequest::HTTP_OPTIONS
@@ -116,9 +93,22 @@ public:
         });
     }
 
+    void allowRESTMethods()
+    {
+        addFilter([](const auto & request)
+        {
+            return request.getMethod() == Poco::Net::HTTPRequest::HTTP_GET
+                || request.getMethod() == Poco::Net::HTTPRequest::HTTP_HEAD
+                || request.getMethod() == Poco::Net::HTTPRequest::HTTP_POST
+                || request.getMethod() == Poco::Net::HTTPRequest::HTTP_PUT
+                || request.getMethod() == Poco::Net::HTTPRequest::HTTP_DELETE;
+        });
+    }
+
     std::unique_ptr<HTTPRequestHandler> createRequestHandler(const HTTPServerRequest & request) override
     {
-        return filter(request) ? creator() : nullptr;
+        /// A rule with no filters (a config rule with only `handler` and no match conditions) matches every request.
+        return (!filter || filter(request)) ? creator() : nullptr;
     }
 
 private:
@@ -126,16 +116,41 @@ private:
     std::function<std::unique_ptr<HTTPRequestHandler> ()> creator;
 };
 
-HTTPRequestHandlerFactoryPtr createStaticHandlerFactory(IServer & server, const std::string & config_prefix);
+HTTPRequestHandlerFactoryPtr createStaticHandlerFactory(IServer & server,
+    const Poco::Util::AbstractConfiguration & config,
+    const std::string & config_prefix,
+    std::unordered_map<String, String> & common_headers);
 
-HTTPRequestHandlerFactoryPtr createDynamicHandlerFactory(IServer & server, const std::string & config_prefix);
+HTTPRequestHandlerFactoryPtr createDynamicHandlerFactory(IServer & server,
+    const Poco::Util::AbstractConfiguration & config,
+    const std::string & config_prefix,
+    std::unordered_map<String, String> & common_headers,
+    const std::optional<String> & default_session_user = {});
 
-HTTPRequestHandlerFactoryPtr createPredefinedHandlerFactory(IServer & server, const std::string & config_prefix);
+HTTPRequestHandlerFactoryPtr createPredefinedHandlerFactory(IServer & server,
+    const Poco::Util::AbstractConfiguration & config,
+    const std::string & config_prefix,
+    std::unordered_map<String, String> & common_headers,
+    const std::optional<String> & default_session_user = {});
 
-HTTPRequestHandlerFactoryPtr createReplicasStatusHandlerFactory(IServer & server, const std::string & config_prefix);
+HTTPRequestHandlerFactoryPtr createReplicasStatusHandlerFactory(IServer & server,
+    const Poco::Util::AbstractConfiguration & config,
+    const std::string & config_prefix,
+    std::unordered_map<String, String> & common_headers);
 
-HTTPRequestHandlerFactoryPtr
-createPrometheusHandlerFactory(IServer & server, AsynchronousMetrics & async_metrics, const std::string & config_prefix);
+/// @param server - used in handlers to check IServer::isCancelled()
+/// @param config - not the same as server.config(), since it can be newer
+/// @param async_metrics - used for prometheus (in case of prometheus.asynchronous_metrics=true)
+/// @param http_handlers_key - config key for custom http_handlers (default: "http_handlers")
+/// @param protocol_name - composable protocol name this factory serves; used to scope SQL-defined
+///                        handlers that specify a PROTOCOL. Empty for legacy http_port/https_port.
+/// @param default_session_user - overrides the `default_session_user` server setting for this listener
+HTTPRequestHandlerFactoryPtr createHandlerFactory(IServer & server,
+    const Poco::Util::AbstractConfiguration & config,
+    AsynchronousMetrics & async_metrics,
+    const std::string & name,
+    const std::string & http_handlers_key = {},
+    const std::string & protocol_name = {},
+    const std::optional<String> & default_session_user = {});
 
-HTTPRequestHandlerFactoryPtr createHandlerFactory(IServer & server, AsynchronousMetrics & async_metrics, const std::string & name);
 }

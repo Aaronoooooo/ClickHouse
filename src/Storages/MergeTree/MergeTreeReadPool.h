@@ -1,28 +1,56 @@
 #pragma once
-
-#include <Core/NamesAndTypes.h>
-#include <Storages/MergeTree/RangesInDataPart.h>
-#include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
+#include <Storages/MergeTree/MergeTreeReadPoolBase.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/RangesInDataPart.h>
+#include <Storages/MergeTree/RequestResponse.h>
 #include <Storages/SelectQueryInfo.h>
+#include <Storages/MergeTree/AlterConversions.h>
 #include <mutex>
 
 
 namespace DB
 {
 
-using MergeTreeReadTaskPtr = std::unique_ptr<MergeTreeReadTask>;
-
-/**   Provides read tasks for MergeTreeThreadSelectBlockInputStream`s in fine-grained batches, allowing for more
- *    uniform distribution of work amongst multiple threads. All parts and their ranges are divided into `threads`
- *    workloads with at most `sum_marks / threads` marks. Then, threads are performing reads from these workloads
- *    in "sequential" manner, requesting work in small batches. As soon as some thread has exhausted
- *    it's workload, it either is signaled that no more work is available (`do_not_steal_tasks == false`) or
- *    continues taking small batches from other threads' workloads (`do_not_steal_tasks == true`).
+/** Provides read tasks for MergeTreeThreadSelectAlgorithm in fine-grained batches, allowing for more
+ *  uniform distribution of work amongst multiple threads. All parts and their ranges are divided into `threads`
+ *  workloads with at most `sum_marks / threads` marks. Then, threads are performing reads from these workloads
+ *  in "sequential" manner, requesting work in small batches. As soon as some thread has exhausted
+ *  it's workload, it either is signaled that no more work is available (`do_not_steal_tasks == false`) or
+ *  continues taking small batches from other threads' workloads (`do_not_steal_tasks == true`).
  */
-class MergeTreeReadPool : private boost::noncopyable
+class MergeTreeReadPool : public MergeTreeReadPoolBase
 {
 public:
+    struct BackoffSettings;
+
+    MergeTreeReadPool(
+        RangesInDataParts && parts_,
+        MutationsSnapshotPtr mutations_snapshot_,
+        VirtualFields shared_virtual_fields_,
+        const IndexReadTasks & index_read_tasks_,
+        const StorageSnapshotPtr & storage_snapshot_,
+        const FilterDAGInfoPtr & row_level_filter_,
+        const PrewhereInfoPtr & prewhere_info_,
+        const ExpressionActionsSettings & actions_settings_,
+        const MergeTreeReaderSettings & reader_settings_,
+        const Names & column_names_,
+        const PoolSettings & settings_,
+        const MergeTreeReadTask::BlockSizeParams & params_,
+        const ContextPtr & context_,
+        RuntimeDataflowStatisticsCacheUpdaterPtr updater_);
+
+    ~MergeTreeReadPool() override = default;
+
+    String getName() const override { return "ReadPool"; }
+    bool preservesOrderOfRanges() const override { return false; }
+    MergeTreeReadTaskPtr getTask(size_t task_idx, MergeTreeReadTask * previous_task) override;
+
+    /** Each worker could call this method and pass information about read performance.
+      * If read performance is too low, pool could decide to lower number of threads: do not assign more tasks to several threads.
+      * This allows to overcome excessive load to disk subsystem, when reads are not from page cache.
+      */
+    void profileFeedback(ReadBufferFromFileBase::ProfileInfo info) override;
+
     /** Pull could dynamically lower (backoff) number of threads, if read operation are too slow.
       * Settings for that backoff.
       */
@@ -40,85 +68,40 @@ public:
         size_t min_concurrency = 1;
 
         /// Constants above is just an example.
-        BackoffSettings(const Settings & settings)
-            : min_read_latency_ms(settings.read_backoff_min_latency_ms.totalMilliseconds()),
-            max_throughput(settings.read_backoff_max_throughput),
-            min_interval_between_events_ms(settings.read_backoff_min_interval_between_events_ms.totalMilliseconds()),
-            min_events(settings.read_backoff_min_events),
-            min_concurrency(settings.read_backoff_min_concurrency)
-        {
-        }
+        explicit BackoffSettings(const Settings & settings);
 
         BackoffSettings() : min_read_latency_ms(0) {}
     };
 
-    BackoffSettings backoff_settings;
-
 private:
-    /** State to track numbers of slow reads.
-      */
+    void fillPerThreadInfo(size_t threads, size_t sum_marks);
+
+    /// Per part, the number of granules in a stripe of the columns cache, or 0 when the part is
+    /// not read through the cache. The ranges are cut at the ends of stripes, see `ColumnsCacheStripes`.
+    std::vector<size_t> columns_cache_stripe_marks;
+
+    mutable std::mutex mutex;
+
+    /// State to track numbers of slow reads.
     struct BackoffState
     {
         size_t current_threads;
         Stopwatch time_since_prev_event {CLOCK_MONOTONIC_COARSE};
         size_t num_events = 0;
 
-        BackoffState(size_t threads) : current_threads(threads) {}
+        explicit BackoffState(size_t threads) : current_threads(threads) {}
     };
 
-    BackoffState backoff_state;
+    RuntimeDataflowStatisticsCacheUpdaterPtr updater;
 
-public:
-    MergeTreeReadPool(
-        const size_t threads_, const size_t sum_marks_, const size_t min_marks_for_concurrent_read_,
-        RangesInDataParts && parts_, const MergeTreeData & data_, const StorageMetadataPtr & metadata_snapshot_,
-        const PrewhereInfoPtr & prewhere_info_,
-        const Names & column_names_,
-        const BackoffSettings & backoff_settings_, size_t preferred_block_size_bytes_,
-        const bool do_not_steal_tasks_ = false);
-
-    MergeTreeReadTaskPtr getTask(const size_t min_marks_to_read, const size_t thread, const Names & ordered_names);
-
-    /** Each worker could call this method and pass information about read performance.
-      * If read performance is too low, pool could decide to lower number of threads: do not assign more tasks to several threads.
-      * This allows to overcome excessive load to disk subsystem, when reads are not from page cache.
-      */
-    void profileFeedback(const ReadBufferFromFileBase::ProfileInfo info);
-
-    Block getHeader() const;
-
-private:
-    std::vector<size_t> fillPerPartInfo(const RangesInDataParts & parts);
-
-    void fillPerThreadInfo(
-        const size_t threads, const size_t sum_marks, std::vector<size_t> per_part_sum_marks,
-        const RangesInDataParts & parts, const size_t min_marks_for_concurrent_read);
-
-    const MergeTreeData & data;
-    StorageMetadataPtr metadata_snapshot;
-    const Names column_names;
-    bool do_not_steal_tasks;
-    bool predict_block_size_bytes;
-    std::vector<NameSet> per_part_column_name_set;
-    std::vector<NamesAndTypesList> per_part_columns;
-    std::vector<NamesAndTypesList> per_part_pre_columns;
-    std::vector<char> per_part_should_reorder;
-    std::vector<MergeTreeBlockSizePredictorPtr> per_part_size_predictor;
-    PrewhereInfoPtr prewhere_info;
-
-    struct Part
-    {
-        MergeTreeData::DataPartPtr data_part;
-        size_t part_index_in_query;
-    };
-
-    std::vector<Part> parts_with_idx;
+    const BackoffSettings backoff_settings;
+    BackoffState backoff_state TSA_GUARDED_BY(mutex);
 
     struct ThreadTask
     {
         struct PartIndexAndRange
         {
-            size_t part_idx;
+            size_t part_idx{};
             MarkRanges ranges;
         };
 
@@ -126,19 +109,22 @@ private:
         std::vector<size_t> sum_marks_in_parts;
     };
 
-    std::vector<ThreadTask> threads_tasks;
+    std::vector<ThreadTask> threads_tasks TSA_GUARDED_BY(mutex);
+    std::set<size_t> remaining_thread_tasks TSA_GUARDED_BY(mutex);
 
-    std::set<size_t> remaining_thread_tasks;
+    /// Cuts the next portion of marks to read from the per-thread queues (possibly stealing from
+    /// another thread's queue when the own one is exhausted). Returns false if there is no more work.
+    /// Outputs the queue and the intended task size so that the caller can continue cutting from
+    /// the same part with cutMoreRangesToRead when the ranges refiner drops a part of the cut.
+    bool cutRangesToRead(size_t task_idx, size_t & part_idx, size_t & thread_idx, size_t & need_marks, MarkRanges & ranges_to_get_from_part);
 
-    RangesInDataParts parts_ranges;
+    /// Cuts up to need_marks more marks of the same part, or returns false if the part
+    /// is not on top of the given thread's queue anymore.
+    bool cutMoreRangesToRead(size_t thread_idx, size_t part_idx, size_t need_marks, MarkRanges & ranges_to_get_from_part);
 
-    mutable std::mutex mutex;
+    void cutFromThreadTask(ThreadTask & thread_tasks, size_t thread_idx, size_t need_marks, MarkRanges & ranges_to_get_from_part) TSA_REQUIRES(mutex);
 
-    Poco::Logger * log = &Poco::Logger::get("MergeTreeReadPool");
-
-    std::vector<bool> is_part_on_remote_disk;
+    LoggerPtr log = getLogger("MergeTreeReadPool");
 };
-
-using MergeTreeReadPoolPtr = std::shared_ptr<MergeTreeReadPool>;
 
 }

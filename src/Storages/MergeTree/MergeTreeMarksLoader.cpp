@@ -1,115 +1,415 @@
-#include <Storages/MergeTree/MergeTreeMarksLoader.h>
-#include <Storages/MergeTree/MergeTreeData.h>
+#include <Compression/CompressedReadBufferFromFile.h>
 #include <IO/ReadBufferFromFile.h>
+#include <IO/ReadHelpers.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/parseIdentifiersOrStringLiteralsWithSettings.h>
+#include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeMarksLoader.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Common/CurrentMetrics.h>
+#include <Common/FailPoint.h>
+#include <Common/MemoryTrackerBlockerInThread.h>
+#include <Common/OpenTelemetryTraceContext.h>
+#include <Common/ThreadPool.h>
+#include <Common/threadPoolCallbackRunner.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
+#include <Common/setThreadName.h>
+#include <base/sleep.h>
 
+#include <chrono>
+#include <thread>
 #include <utility>
+
+namespace ProfileEvents
+{
+    extern const Event WaitMarksLoadMicroseconds;
+    extern const Event BackgroundLoadingMarksTasks;
+    extern const Event LoadingMarksTasksCanceled;
+    extern const Event MarksTasksFromCache;
+    extern const Event LoadedMarksFiles;
+    extern const Event LoadedMarksCount;
+    extern const Event LoadedMarksMemoryBytes;
+}
 
 namespace DB
 {
+
+namespace MergeTreeSetting
+{
+    extern const MergeTreeSettingsString columns_to_prewarm_mark_cache;
+}
 
 namespace ErrorCodes
 {
     extern const int CANNOT_READ_ALL_DATA;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int ASYNC_LOAD_CANCELED;
+}
+
+namespace FailPoints
+{
+    extern const char marks_loader_hold_task_until_canceled[];
+    extern const char merge_tree_marks_load_sync_sleep[];
+}
+
+MergeTreeMarksGetter::MergeTreeMarksGetter(MarkCache::MappedPtr marks_, size_t num_columns_in_mark_)
+    : marks(std::move(marks_)), num_columns_in_mark(num_columns_in_mark_)
+{
+    if (!marks)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Null marks passed to MergeTreeMarksGetter");
+
+    if (num_columns_in_mark == 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Number of columns in mark is zero");
+
+    if (marks->getNumberOfMarks() % num_columns_in_mark != 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Number of marks {} is not divisible by number of columns in mark {}",
+            marks->getNumberOfMarks(), num_columns_in_mark);
+}
+
+MarkInCompressedFile MergeTreeMarksGetter::getMark(size_t row_index, size_t column_index) const
+{
+    if (column_index >= num_columns_in_mark)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Column index {} is out of range [0, {})", column_index, num_columns_in_mark);
+
+    return marks->get(row_index * num_columns_in_mark + column_index);
 }
 
 MergeTreeMarksLoader::MergeTreeMarksLoader(
-    DiskPtr disk_,
+    MergeTreeDataPartInfoForReaderPtr data_part_reader_,
     MarkCache * mark_cache_,
     const String & mrk_path_,
     size_t marks_count_,
     const MergeTreeIndexGranularityInfo & index_granularity_info_,
     bool save_marks_in_cache_,
-    size_t columns_in_mark_)
-    : disk(std::move(disk_))
+    const ReadSettings & read_settings_,
+    ThreadPool * load_marks_threadpool_,
+    size_t num_columns_in_mark_,
+    bool use_streaming_compression_)
+    : data_part_reader(data_part_reader_)
     , mark_cache(mark_cache_)
     , mrk_path(mrk_path_)
     , marks_count(marks_count_)
     , index_granularity_info(index_granularity_info_)
     , save_marks_in_cache(save_marks_in_cache_)
-    , columns_in_mark(columns_in_mark_) {}
-
-const MarkInCompressedFile & MergeTreeMarksLoader::getMark(size_t row_index, size_t column_index)
+    , read_settings(read_settings_)
+    , num_columns_in_mark(num_columns_in_mark_)
+    , use_streaming_compression(use_streaming_compression_)
+    , load_marks_threadpool(load_marks_threadpool_)
 {
-    if (!marks)
-        loadMarks();
-
-#ifndef NDEBUG
-    if (column_index >= columns_in_mark)
-        throw Exception("Column index: " + toString(column_index)
-            + " is out of range [0, " + toString(columns_in_mark) + ")", ErrorCodes::LOGICAL_ERROR);
-#endif
-
-    return (*marks)[row_index * columns_in_mark + column_index];
 }
+
+void MergeTreeMarksLoader::startAsyncLoad()
+{
+    if (load_marks_threadpool)
+        future = loadMarksAsync();
+}
+
+MergeTreeMarksLoader::~MergeTreeMarksLoader()
+{
+    if (future.valid())
+    {
+        is_canceled = true;
+        future.wait();
+    }
+}
+
+MergeTreeMarksGetterPtr MergeTreeMarksLoader::loadMarks()
+{
+    OpenTelemetry::SpanHolder span("MergeTreeMarksLoader::loadMarks");
+
+    auto component_guard = Coordination::setCurrentComponent("MergeTreeMarksLoader::loadMarks");
+
+    std::lock_guard lock(load_mutex);
+
+    if (marks)
+        return std::make_unique<MergeTreeMarksGetter>(marks, num_columns_in_mark);
+
+    Stopwatch watch(CLOCK_MONOTONIC);
+
+    if (future.valid())
+    {
+        marks = future.get();
+        future = {};
+    }
+    else
+    {
+        marks = loadMarksSync();
+    }
+
+    watch.stop();
+    ProfileEvents::increment(ProfileEvents::WaitMarksLoadMicroseconds, watch.elapsedMicroseconds());
+    return std::make_unique<MergeTreeMarksGetter>(marks, num_columns_in_mark);
+}
+
 
 MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
 {
+    LOG_TEST(getLogger("MergeTreeMarksLoader"), "Loading marks from path {}", mrk_path);
+
     /// Memory for marks must not be accounted as memory usage for query, because they are stored in shared cache.
-    MemoryTracker::BlockerInThread temporarily_disable_memory_tracker;
+    MemoryTrackerBlockerInThread temporarily_disable_memory_tracker;
 
-    size_t file_size = disk->getFileSize(mrk_path);
-    size_t mark_size = index_granularity_info.getMarkSizeInBytes(columns_in_mark);
-    size_t expected_file_size = mark_size * marks_count;
+    auto data_part_storage = data_part_reader->getDataPartStorage();
 
-    if (expected_file_size != file_size)
+    /// A part with zero granules has nothing to load: return early without opening the file.
+    if (marks_count == 0)
+    {
+        auto res = MarksInCompressedFile::create(PODArray<MarkInCompressedFile>{});
+        ProfileEvents::increment(ProfileEvents::LoadedMarksFiles);
+        return res;
+    }
+
+    size_t file_size = data_part_storage->getFileSize(mrk_path);
+    size_t mark_size = index_granularity_info.getMarkSizeInBytes(num_columns_in_mark);
+    size_t expected_uncompressed_size = mark_size * marks_count;
+    size_t total_marks = marks_count * num_columns_in_mark;
+
+    auto full_mark_path = std::string(fs::path(data_part_storage->getFullPath()) / mrk_path);
+
+    if (file_size == 0)
+    {
         throw Exception(
-            "Bad size of marks file '" + fullPath(disk, mrk_path) + "': " + std::to_string(file_size) + ", must be: " + std::to_string(expected_file_size),
-            ErrorCodes::CORRUPTED_DATA);
-
-    auto res = std::make_shared<MarksInCompressedFile>(marks_count * columns_in_mark);
-
-    if (!index_granularity_info.is_adaptive)
-    {
-        /// Read directly to marks.
-        auto buffer = disk->readFile(mrk_path, ReadSettings().adjustBufferSize(file_size), file_size);
-        buffer->readStrict(reinterpret_cast<char *>(res->data()), file_size);
-
-        if (!buffer->eof())
-            throw Exception("Cannot read all marks from file " + mrk_path + ", eof: " + std::to_string(buffer->eof())
-            + ", buffer size: " + std::to_string(buffer->buffer().size()) + ", file size: " + std::to_string(file_size), ErrorCodes::CANNOT_READ_ALL_DATA);
+            ErrorCodes::CORRUPTED_DATA,
+            "Empty marks file '{}': {}, must be: {}",
+            full_mark_path,
+            file_size, expected_uncompressed_size);
     }
+
+    if (!index_granularity_info.mark_type.compressed && expected_uncompressed_size != file_size)
+        throw Exception(
+            ErrorCodes::CORRUPTED_DATA,
+            "Bad size of marks file '{}': {}, must be: {}",
+            full_mark_path,
+            file_size,
+            expected_uncompressed_size);
+
+    auto buffer = data_part_storage->readFile(mrk_path, read_settings.adjustBufferSize(file_size), file_size);
+    std::unique_ptr<ReadBuffer> reader;
+    if (!index_granularity_info.mark_type.compressed)
+        reader = std::move(buffer);
     else
+        reader = std::make_unique<CompressedReadBufferFromFile>(std::move(buffer));
+
+    /// When streaming, compress marks block-by-block via Builder to avoid
+    /// materializing the full plain marks array (can be hundreds of MiB
+    /// for compact parts with many substreams).
+    /// When not streaming, read all marks into a plain array first,
+    /// then compress (the constructor also uses Builder internally).
+    std::optional<MarksInCompressedFile::Builder> builder;
+    PODArray<MarkInCompressedFile> plain_marks;
+
+    if (use_streaming_compression)
+        builder.emplace(total_marks);
+    else
+        plain_marks.resize(total_marks);
+
+    auto byteSwapMarksIfNeeded = [](MarkInCompressedFile * marks_data, size_t count)
     {
-        auto buffer = disk->readFile(mrk_path, ReadSettings().adjustBufferSize(file_size), file_size);
-        size_t i = 0;
-        while (!buffer->eof())
+        if constexpr (std::endian::native == std::endian::big)
         {
-            res->read(*buffer, i * columns_in_mark, columns_in_mark);
-            buffer->seek(sizeof(size_t), SEEK_CUR);
-            ++i;
+            for (size_t i = 0; i < count; ++i)
+            {
+                marks_data[i].offset_in_compressed_file = std::byteswap(marks_data[i].offset_in_compressed_file);
+                marks_data[i].offset_in_decompressed_block = std::byteswap(marks_data[i].offset_in_decompressed_block);
+            }
         }
+    };
 
-        if (i * mark_size != file_size)
-            throw Exception("Cannot read all marks from file " + mrk_path, ErrorCodes::CANNOT_READ_ALL_DATA);
-    }
-    res->protect();
-    return res;
-}
-
-void MergeTreeMarksLoader::loadMarks()
-{
-    if (mark_cache)
+    if (!index_granularity_info.mark_type.adaptive)
     {
-        auto key = mark_cache->hash(mrk_path);
-        if (save_marks_in_cache)
+        chassert(expected_uncompressed_size == total_marks * sizeof(MarkInCompressedFile));
+
+        if (use_streaming_compression)
         {
-            auto callback = [this]{ return loadMarksImpl(); };
-            marks = mark_cache->getOrSet(key, callback);
+            PODArray<MarkInCompressedFile> read_buf(MarksInCompressedFile::MARKS_PER_BLOCK);
+            size_t marks_read = 0;
+            while (marks_read < total_marks)
+            {
+                size_t count = std::min(MarksInCompressedFile::MARKS_PER_BLOCK, total_marks - marks_read);
+                reader->readStrict(reinterpret_cast<char *>(read_buf.data()), count * sizeof(MarkInCompressedFile));
+                byteSwapMarksIfNeeded(read_buf.data(), count);
+                builder->addMarks(read_buf.data(), count);
+                marks_read += count;
+            }
         }
         else
         {
-            marks = mark_cache->get(key);
-            if (!marks)
-                marks = loadMarksImpl();
+            reader->readStrict(reinterpret_cast<char *>(plain_marks.data()), expected_uncompressed_size);
+            byteSwapMarksIfNeeded(plain_marks.data(), total_marks);
+        }
+
+        if (!reader->eof())
+            throw Exception(
+                ErrorCodes::CANNOT_READ_ALL_DATA,
+                "Cannot read all marks from file {}, is eof: {}, buffer size: {}, expected size: {}",
+                full_mark_path,
+                reader->eof(),
+                reader->buffer().size(),
+                expected_uncompressed_size);
+    }
+    else
+    {
+        /// Adaptive marks: each granule has num_columns_in_mark marks + a granularity value.
+        /// When streaming, read each granule's marks into a small buffer and feed to Builder.
+        /// Builder handles internal MARKS_PER_BLOCK buffering.
+        PODArray<MarkInCompressedFile> granule_buf;
+        if (use_streaming_compression)
+            granule_buf.resize(num_columns_in_mark);
+
+        for (size_t granule = 0; granule < marks_count; ++granule)
+        {
+            if (reader->eof())
+                throw Exception(
+                    ErrorCodes::CANNOT_READ_ALL_DATA,
+                    "Cannot read all marks from file {}, marks expected {} (bytes size {}), marks read {} (bytes size {})",
+                    full_mark_path, marks_count, expected_uncompressed_size, granule, reader->count());
+
+            size_t granularity = 0;
+            auto * dest = use_streaming_compression
+                ? granule_buf.data()
+                : plain_marks.data() + granule * num_columns_in_mark;
+            reader->readStrict(reinterpret_cast<char *>(dest), num_columns_in_mark * sizeof(MarkInCompressedFile));
+            readBinaryLittleEndian(granularity, *reader);
+
+            if (use_streaming_compression)
+            {
+                byteSwapMarksIfNeeded(granule_buf.data(), num_columns_in_mark);
+                builder->addMarks(granule_buf.data(), num_columns_in_mark);
+            }
+        }
+
+        if (!use_streaming_compression)
+            byteSwapMarksIfNeeded(plain_marks.data(), total_marks);
+
+        if (!reader->eof())
+            throw Exception(
+                ErrorCodes::CANNOT_READ_ALL_DATA,
+                "Too many marks in file {}, marks expected {} (bytes size {})",
+                full_mark_path, marks_count, expected_uncompressed_size);
+    }
+
+    auto res = use_streaming_compression
+        ? builder->finish()
+        : MarksInCompressedFile::create(plain_marks);
+
+    ProfileEvents::increment(ProfileEvents::LoadedMarksFiles);
+    ProfileEvents::increment(ProfileEvents::LoadedMarksCount, total_marks);
+    ProfileEvents::increment(ProfileEvents::LoadedMarksMemoryBytes, res->approximateMemoryUsage());
+
+    return res;
+}
+
+MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksSync()
+{
+    fiu_do_on(FailPoints::merge_tree_marks_load_sync_sleep, { sleepForMilliseconds(100); });
+
+    MarkCache::MappedPtr loaded_marks;
+
+    auto data_part_storage = data_part_reader->getDataPartStorage();
+
+    if (mark_cache)
+    {
+        auto key = MarkCache::hash(data_part_storage->getDiskName() + ":" + (fs::path(data_part_storage->getFullPath()) / mrk_path).string());
+
+        if (save_marks_in_cache)
+        {
+            auto callback = [this] { return loadMarksImpl(); };
+            loaded_marks = mark_cache->getOrSet(key, callback);
+        }
+        else
+        {
+            loaded_marks = mark_cache->getWithoutMetrics(key);
+            if (!loaded_marks)
+                loaded_marks = loadMarksImpl();
         }
     }
     else
-        marks = loadMarksImpl();
+    {
+        loaded_marks = loadMarksImpl();
+    }
 
-    if (!marks)
-        throw Exception("Failed to load marks: " + mrk_path, ErrorCodes::LOGICAL_ERROR);
+    if (!loaded_marks)
+    {
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR, "Failed to load marks: {}", (fs::path(data_part_storage->getFullPath()) / mrk_path).string());
+    }
+
+    return loaded_marks;
+}
+
+std::future<MarkCache::MappedPtr> MergeTreeMarksLoader::loadMarksAsync()
+{
+    /// Avoid queueing jobs into thread pool if marks are in cache
+    if (mark_cache)
+    {
+        auto data_part_storage = data_part_reader->getDataPartStorage();
+        auto key = MarkCache::hash(data_part_storage->getDiskName() + ":" + (fs::path(data_part_storage->getFullPath()) / mrk_path).string());
+        if (MarkCache::MappedPtr loaded_marks = mark_cache->getForAsyncLoading(key))
+        {
+            ProfileEvents::increment(ProfileEvents::MarksTasksFromCache);
+            auto promise = std::promise<MarkCache::MappedPtr>();
+            promise.set_value(std::move(loaded_marks));
+            return promise.get_future();
+        }
+    }
+
+    return scheduleFromThreadPoolUnsafe<MarkCache::MappedPtr>(
+        [this]() -> MarkCache::MappedPtr
+        {
+            auto component_guard = Coordination::setCurrentComponent("MergeTreeMarksLoader::loadMarksAsync");
+
+            /// Test-only: hold the task until the loader is destroyed, so a test can make the destructor win
+            /// the race against the thread pool deterministically. The wait is bounded so that a query which
+            /// does need these marks (and blocks in `loadMarks` on the future) cannot hang forever if the
+            /// fail point is left enabled by mistake.
+            fiu_do_on(FailPoints::marks_loader_hold_task_until_canceled,
+            {
+                for (size_t i = 0; i < 600 && !is_canceled; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            });
+
+            if (is_canceled)
+            {
+                ProfileEvents::increment(ProfileEvents::LoadingMarksTasksCanceled);
+                /// `is_canceled` is set only by the destructor, which then waits for this task and drops the
+                /// future without reading it, so nothing ever observes this exception - it only stops the task
+                /// from doing work that has become useless. Keep it out of `system.errors`, where it would look
+                /// like a failure: since `load_marks_asynchronously` is enabled by default, this happens on any
+                /// server whenever a reader is dropped before its marks are needed. `LoadingMarksTasksCanceled`
+                /// above is the counter for this event.
+                Exception::SuppressErrorCodesScope suppress_error_codes;
+                throw Exception(ErrorCodes::ASYNC_LOAD_CANCELED, "Background task for loading marks was canceled");
+            }
+
+            ProfileEvents::increment(ProfileEvents::BackgroundLoadingMarksTasks);
+            return loadMarksSync();
+        },
+        *load_marks_threadpool,
+        ThreadName::LOAD_MARKS);
+}
+
+void addMarksToCache(const IMergeTreeDataPart & part, const PlainMarksByName & cached_marks, MarkCache * mark_cache)
+{
+    MemoryTrackerBlockerInThread temporarily_disable_memory_tracker;
+
+    for (const auto & [stream_name, marks] : cached_marks)
+    {
+        auto mark_path = part.index_granularity_info.getMarksFilePath(stream_name);
+        auto key = MarkCache::hash(part.getDataPartStorage().getDiskName() + ":" + (fs::path(part.getRelativePathOfActivePart()) / mark_path).string());
+        mark_cache->set(key, MarksInCompressedFile::create(*marks));
+    }
+}
+
+Names getColumnsToPrewarmMarks(const MergeTreeSettings & settings, const NamesAndTypesList & columns_list)
+{
+    auto columns_str = settings[MergeTreeSetting::columns_to_prewarm_mark_cache].toString();
+    if (columns_str.empty())
+        return columns_list.getNames();
+
+    return parseIdentifiersOrStringLiterals(columns_str, Context::getGlobalContextInstance()->getSettingsRef());
 }
 
 }

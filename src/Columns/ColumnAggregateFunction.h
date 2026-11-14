@@ -1,17 +1,10 @@
 #pragma once
 
-#include <AggregateFunctions/IAggregateFunction.h>
-
+#include <AggregateFunctions/IAggregateFunction_fwd.h>
 #include <Columns/IColumn.h>
-#include <Common/PODArray.h>
-
 #include <Core/Field.h>
-
-#include <IO/ReadBufferFromString.h>
-#include <IO/WriteBuffer.h>
-#include <IO/WriteHelpers.h>
-
-#include <Functions/FunctionHelpers.h>
+#include <Common/Exception.h>
+#include <Common/PODArray.h>
 
 namespace DB
 {
@@ -24,7 +17,13 @@ namespace ErrorCodes
 class Arena;
 using ArenaPtr = std::shared_ptr<Arena>;
 using ConstArenaPtr = std::shared_ptr<const Arena>;
-using ConstArenas = std::vector<ConstArenaPtr>;
+using ConstArenas = VectorWithMemoryTracking<ConstArenaPtr>;
+
+class Context;
+using ContextPtr = std::shared_ptr<const Context>;
+
+struct ColumnWithTypeAndName;
+using ColumnsWithTypeAndName = VectorWithMemoryTracking<ColumnWithTypeAndName>;
 
 
 /** Column of states of aggregate functions.
@@ -51,13 +50,13 @@ using ConstArenas = std::vector<ConstArenaPtr>;
   *  specifying which individual values should be destroyed and which ones should not.
   * Clearly, this method would have a substantially non-zero price.
   */
-class ColumnAggregateFunction final : public COWHelper<IColumn, ColumnAggregateFunction>
+class ColumnAggregateFunction final : public COWHelper<IColumnHelper<ColumnAggregateFunction>, ColumnAggregateFunction>
 {
 public:
     using Container = PaddedPODArray<AggregateDataPtr>;
 
 private:
-    friend class COWHelper<IColumn, ColumnAggregateFunction>;
+    friend class COWHelper<IColumnHelper<ColumnAggregateFunction>, ColumnAggregateFunction>;
 
     /// Arenas used by function states that are created elsewhere. We own these
     /// arenas in the sense of extending their lifetime, but do not modify them.
@@ -75,6 +74,9 @@ private:
     /// Source column. Used (holds source from destruction),
     ///  if this column has been constructed from another and uses all or part of its values.
     ColumnPtr src;
+    /// Do not share the source column (`src`) after further modifications (i.e. insertRangeFrom()).
+    /// This may be useful for proper memory tracking, since source column may contain aggregate states.
+    bool force_data_ownership = false;
 
     /// Array of pointers to aggregation states, that are placed in arenas.
     Container data;
@@ -82,30 +84,37 @@ private:
     /// Name of the type to distinguish different aggregation states.
     String type_string;
 
+    std::optional<size_t> version;
+
     ColumnAggregateFunction() = default;
 
     /// Create a new column that has another column as a source.
     MutablePtr createView() const;
 
-    /// If we have another column as a source (owner of data), copy all data to ourself and reset source.
-    /// This is needed before inserting new elements, because we must own these elements (to destroy them in destructor),
-    ///  but ownership of different elements cannot be mixed by different columns.
-    void ensureOwnership();
+    /// Whether a state named `state_type_name` can be inserted into this column. The name may differ
+    /// from `type_string` and still denote the same state, see DataTypeAggregateFunction::nameMatchesState.
+    bool acceptsStateTypeName(const String & state_type_name) const;
 
-    ColumnAggregateFunction(const AggregateFunctionPtr & func_);
+    explicit ColumnAggregateFunction(const AggregateFunctionPtr & func_, std::optional<size_t> version_ = std::nullopt);
 
-    ColumnAggregateFunction(const AggregateFunctionPtr & func_,
-                            const ConstArenas & arenas_);
+    ColumnAggregateFunction(const AggregateFunctionPtr & func_, const ConstArenas & arenas_);
 
     ColumnAggregateFunction(const ColumnAggregateFunction & src_);
+
+    void insertFromWithOwnership(const IColumn & from, size_t n);
 
 public:
     ~ColumnAggregateFunction() override;
 
-    void set(const AggregateFunctionPtr & func_);
+    void set(const AggregateFunctionPtr & func_, std::optional<size_t> version_ = std::nullopt);
 
     AggregateFunctionPtr getAggregateFunction() { return func; }
     AggregateFunctionPtr getAggregateFunction() const { return func; }
+
+    /// If we have another column as a source (owner of data), copy all data to ourself and reset source.
+    /// This is needed before inserting new elements, because we must own these elements (to destroy them in destructor),
+    ///  but ownership of different elements cannot be mixed by different columns.
+    void ensureOwnership() override;
 
     /// Take shared ownership of Arena, that holds memory for states of aggregate functions.
     void addArena(ConstArenaPtr arena_);
@@ -115,7 +124,7 @@ public:
     /// This method is made static and receive MutableColumnPtr object to explicitly destroy it.
     static MutableColumnPtr convertToValues(MutableColumnPtr column);
 
-    std::string getName() const override { return "AggregateFunction(" + func->getName() + ")"; }
+    std::string getName() const override;
     const char * getFamilyName() const override { return "AggregateFunction"; }
     TypeIndex getDataType() const override { return TypeIndex::AggregateFunction; }
 
@@ -126,17 +135,47 @@ public:
         return getData().size();
     }
 
+    /// Real reserve (base IColumn::reserve is a no-op): lets a caller make a run of `push_back`
+    /// non-throwing.
+    void reserve(size_t n) override
+    {
+        data.reserve(n);
+    }
+
+    size_t capacity() const override
+    {
+        return data.capacity();
+    }
+
     MutableColumnPtr cloneEmpty() const override;
 
     Field operator[](size_t n) const override;
 
     void get(size_t n, Field & res) const override;
 
-    StringRef getDataAt(size_t n) const override;
+    void getValueNameImpl(WriteBufferFromOwnString &, size_t n, const Options &) const override;
+
+    bool isDefaultAt(size_t) const override
+    {
+        /// Aggregate function states have no meaningful default representation, so they are never considered default.
+        /// This is consistent with getNumberOfDefaultRows returning 0.
+        return false;
+    }
+
+    bool hasOnlyTypeDefaults() const override { return false; }
+
+    std::string_view getDataAt(size_t n) const override;
 
     void insertData(const char * pos, size_t length) override;
 
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
     void insertFrom(const IColumn & from, size_t n) override;
+#else
+    using IColumn::insertFrom;
+
+    void doInsertFrom(const IColumn & from, size_t n) override;
+#endif
+
 
     void insertFrom(ConstAggregateDataPtr place);
 
@@ -149,21 +188,31 @@ public:
 
     void insert(const Field & x) override;
 
+    bool tryInsert(const Field & x) override;
+
     void insertDefault() override;
 
-    StringRef serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const override;
+    std::string_view
+    serializeValueIntoArena(size_t n, Arena & arena, char const *& begin, const IColumn::SerializationSettings * settings) const override;
 
-    const char * deserializeAndInsertFromArena(const char * src_arena) override;
+    void deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings * settings) override;
 
-    const char * skipSerializedInArena(const char *) const override;
+    /// A state is serialized only by `serializeValueIntoArena`, as its size is known only once it is serialized.
+    std::optional<size_t> getSerializedValueSize(size_t, const IColumn::SerializationSettings *) const override { return std::nullopt; }
 
     void updateHashWithValue(size_t n, SipHash & hash) const override;
 
-    void updateWeakHash32(WeakHash32 & hash) const override;
+    void computeHashInto(size_t row_begin, size_t row_end, UInt32 * hash_out, bool initial) const override;
 
     void updateHashFast(SipHash & hash) const override;
 
     size_t byteSize() const override;
+
+    /// Uncompressed size of the states as serialized into a data part. byteSize() cannot be used for this
+    /// because it intentionally ignores states living in shared arenas (see byteSize()). Fixed-layout states
+    /// are sized from sizeOfData() without serializing; variable-size states are serialized exactly so the
+    /// figure never underestimates a skewed column. Used to honor index_granularity_bytes at write time.
+    size_t serializedSizeEstimate() const;
 
     size_t byteSizeAt(size_t n) const override;
 
@@ -171,11 +220,21 @@ public:
 
     void protect() override;
 
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
     void insertRangeFrom(const IColumn & from, size_t start, size_t length) override;
+#else
+    void doInsertRangeFrom(const IColumn & from, size_t start, size_t length) override;
+#endif
 
     void popBack(size_t n) override;
 
+    /// Removes the last n rows without destroying the states they point to, for rows that alias a state
+    /// owned elsewhere.
+    void popBackWithoutDestroy(size_t n);
+
     ColumnPtr filter(const Filter & filter, ssize_t result_size_hint) const override;
+
+    void filter(const Filter & filt) override;
 
     void expand(const Filter & mask, bool inverted) override;
 
@@ -188,27 +247,47 @@ public:
 
     ColumnPtr replicate(const Offsets & offsets) const override;
 
-    MutableColumns scatter(ColumnIndex num_columns, const Selector & selector) const override;
+    VectorWithMemoryTracking<MutableColumnPtr> scatter(size_t num_columns, const Selector & selector) const override;
 
-    void gather(ColumnGathererStream & gatherer_stream) override;
-
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
     int compareAt(size_t, size_t, const IColumn &, int) const override
+#else
+    int doCompareAt(size_t, size_t, const IColumn &, int) const override
+#endif
     {
         return 0;
     }
 
     void compareColumn(const IColumn &, size_t, PaddedPODArray<UInt64> *, PaddedPODArray<Int8> &, int, int) const override
     {
-        throw Exception("Method compareColumn is not supported for ColumnAggregateFunction", ErrorCodes::NOT_IMPLEMENTED);
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method compareColumn is not supported for ColumnAggregateFunction");
     }
 
     bool hasEqualValues() const override
     {
-        throw Exception("Method hasEqualValues is not supported for ColumnAggregateFunction", ErrorCodes::NOT_IMPLEMENTED);
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method hasEqualValues is not supported for ColumnAggregateFunction");
     }
 
-    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
-    void updatePermutation(bool reverse, size_t limit, int, Permutation & res, EqualRanges & equal_range) const override;
+    double getRatioOfDefaultRows(double) const override
+    {
+        return 0.0;
+    }
+
+    UInt64 getNumberOfDefaultRows() const override
+    {
+        return 0;
+    }
+
+    void getIndicesOfNonDefaultRows(Offsets &, size_t, size_t) const override
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method getIndicesOfNonDefaultRows is not supported for ColumnAggregateFunction");
+    }
+
+    void getPermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, Permutation & res) const override;
+
+    void updatePermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                        size_t limit, int, Permutation & res, EqualRanges & equal_ranges) const override;
 
     /** More efficient manipulation methods */
     Container & getData()
@@ -221,7 +300,7 @@ public:
         return data;
     }
 
-    void getExtremes(Field & min, Field & max) const override;
+    void getExtremes(Field & min, Field & max, size_t start, size_t end) const override;
 
     bool structureEquals(const IColumn &) const override;
 

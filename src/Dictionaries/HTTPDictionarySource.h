@@ -1,13 +1,14 @@
 #pragma once
 
+#include <Core/Block.h>
 #include <IO/ConnectionTimeouts.h>
 #include <IO/ReadWriteBufferFromHTTP.h>
 #include <Poco/Net/HTTPBasicCredentials.h>
 #include <Poco/URI.h>
-#include <base/LocalDateTime.h>
-#include "DictionaryStructure.h"
-#include "IDictionarySource.h"
-#include <Interpreters/Context.h>
+#include <Common/LocalDateTime.h>
+#include <Dictionaries/DictionaryStructure.h>
+#include <Dictionaries/IDictionarySource.h>
+#include <Interpreters/Context_fwd.h>
 #include <IO/CompressionMethod.h>
 
 namespace Poco
@@ -29,7 +30,11 @@ public:
         const std::string format;
         const std::string update_field;
         const UInt64 update_lag;
-        const ReadWriteBufferFromHTTP::HTTPHeaderEntries header_entries;
+        const HTTPHeaderEntries header_entries;
+        /// Whether the dictionary was created via DDL (`CREATE DICTIONARY`). For such dictionaries the
+        /// source URL is untrusted, so every HTTP request (including redirect hops) must be validated
+        /// against `remote_url_allow_hosts`.
+        const bool created_from_ddl = false;
     };
 
     HTTPDictionarySource(
@@ -37,19 +42,18 @@ public:
         const Configuration & configuration,
         const Poco::Net::HTTPBasicCredentials & credentials_,
         Block & sample_block_,
-        ContextPtr context_,
-        bool created_from_ddl);
+        ContextPtr context_);
 
     HTTPDictionarySource(const HTTPDictionarySource & other);
     HTTPDictionarySource & operator=(const HTTPDictionarySource &) = delete;
 
-    Pipe loadAll() override;
+    BlockIO loadAll() override;
 
-    Pipe loadUpdatedAll() override;
+    BlockIO loadUpdatedAll() override;
 
-    Pipe loadIds(const std::vector<UInt64> & ids) override;
+    BlockIO loadIds(const VectorWithMemoryTracking<UInt64> & ids) override;
 
-    Pipe loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows) override;
+    BlockIO loadKeys(const Columns & key_columns, const VectorWithMemoryTracking<size_t> & requested_rows) override;
 
     bool isModified() const override;
 
@@ -64,10 +68,12 @@ public:
 private:
     void getUpdateFieldAndDate(Poco::URI & uri);
 
-    // wrap buffer using encoding from made request
-    Pipe createWrappedBuffer(std::unique_ptr<ReadWriteBufferFromHTTP> http_buffer);
+    void checkCredentials() const;
 
-    Poco::Logger * log;
+    // wrap buffer using encoding from made request
+    QueryPipeline createWrappedBuffer(std::unique_ptr<ReadWriteBufferFromHTTP> http_buffer);
+
+    LoggerPtr log;
 
     LocalDateTime getLastModification() const;
 

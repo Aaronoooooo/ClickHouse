@@ -1,7 +1,9 @@
 #pragma once
 
 #include <Parsers/ASTQueryWithOutput.h>
+#include <Parsers/SelectUnionMode.h>
 
+namespace Poco::JSON { class Object; }
 
 namespace DB
 {
@@ -15,34 +17,35 @@ public:
 
     ASTPtr clone() const override;
 
-    void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    void updateTreeHashImpl(SipHash & hash_state, bool ignore_aliases) const override;
 
-    const char * getQueryKindString() const override { return "Select"; }
+    void formatQueryImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    void writeJSON(WriteBuffer & out) const override;
+    void readJSON(const Poco::JSON::Object & json) override;
 
-    enum class Mode
-    {
-        Unspecified,
-        ALL,
-        DISTINCT,
-        EXCEPT,
-        INTERSECT
-    };
+    QueryKind getQueryKind() const override { return QueryKind::Select; }
 
-    using UnionModes = std::vector<Mode>;
-    using UnionModesSet = std::unordered_set<Mode>;
-
-    Mode union_mode;
-
-    UnionModes list_of_modes;
-
+    SelectUnionMode union_mode{};
+    SelectUnionModes list_of_modes;
     bool is_normalized = false;
 
     ASTPtr list_of_selects;
 
-    UnionModesSet set_of_modes;
+    SelectUnionModesSet set_of_modes;
 
     /// Consider any mode other than ALL as non-default.
     bool hasNonDefaultUnionMode() const;
+
+    bool hasQueryParameters() const;
+
+    NameToNameMap getQueryParameters() const;
+
+private:
+    /// This variable is optional as we want to set it on the first call to hasQueryParameters
+    /// and return the same variable on future calls to hasQueryParameters
+    /// its mutable as we set it in const function
+    mutable std::optional<bool> has_query_parameters;
+
 };
 
 }

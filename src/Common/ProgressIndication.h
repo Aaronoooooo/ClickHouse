@@ -1,18 +1,21 @@
 #pragma once
 
-#include <unordered_map>
-#include <unordered_set>
 #include <IO/Progress.h>
-#include <Interpreters/Context.h>
+#include <Interpreters/Context_fwd.h>
 #include <base/types.h>
 #include <Common/Stopwatch.h>
+#include <Common/EventRateMeter.h>
 
-
-/// http://en.wikipedia.org/wiki/ANSI_escape_code
-#define CLEAR_TO_END_OF_LINE "\033[K"
+#include <iostream>
+#include <mutex>
+#include <unistd.h>
+#include <unordered_map>
+#include <vector>
 
 namespace DB
 {
+
+class WriteBufferFromFileDescriptor;
 
 struct ThreadEventData
 {
@@ -20,22 +23,38 @@ struct ThreadEventData
 
     UInt64 user_ms      = 0;
     UInt64 system_ms    = 0;
+    UInt64 waited_us    = 0;
     UInt64 memory_usage = 0;
+    UInt64 temp_data_on_disk_usage = 0;
+
+    // -1 used as flag 'is not shown for old servers'
+    Int64 peak_memory_usage = -1;
 };
 
-using ThreadIdToTimeMap = std::unordered_map<UInt64, ThreadEventData>;
-using HostToThreadTimesMap = std::unordered_map<String, ThreadIdToTimeMap>;
+using HostToTimesMap = std::unordered_map<String, ThreadEventData>;
 
 class ProgressIndication
 {
 public:
-    /// Write progress to stderr.
-    void writeProgress();
 
+    explicit ProgressIndication
+    (
+        std::ostream & output_stream_ = std::cout,
+        int in_fd_ = STDIN_FILENO,
+        int err_fd_ = STDERR_FILENO
+    )
+        : output_stream(output_stream_),
+        in_fd(in_fd_),
+        err_fd(err_fd_)
+    {
+    }
+
+    /// Write progress bar.
+    void writeProgress(WriteBufferFromFileDescriptor & message, std::unique_lock<std::mutex> & message_lock);
+    void clearProgressOutput(WriteBufferFromFileDescriptor & message, std::unique_lock<std::mutex> & message_lock);
+
+    /// Write summary.
     void writeFinalProgress();
-
-    /// Clear stderr output.
-    void clearProgressOutput();
 
     /// Reset progress values.
     void resetProgress();
@@ -44,37 +63,62 @@ public:
     /// 1. onProgress in clickhouse-client;
     /// 2. ProgressCallback via setProgressCallback methrod in:
     ///    - context (used in clickhouse-local, can also be added in arbitrary place)
-    ///    - SourceWithProgress (also in streams)
+    ///    - ISource (also in streams)
     ///    - readBufferFromFileDescriptor (for file processing progress)
     bool updateProgress(const Progress & value);
 
     /// In some cases there is a need to update progress value, when there is no access to progress_inidcation object.
     /// In this case it is added via context.
     /// `write_progress_on_update` is needed to write progress for loading files data via pipe in non-interactive mode.
-    void setFileProgressCallback(ContextMutablePtr context, bool write_progress_on_update = false);
+    void setFileProgressCallback(ContextMutablePtr context, WriteBufferFromFileDescriptor & message, std::mutex & message_mutex);
 
     /// How much seconds passed since query execution start.
-    double elapsedSeconds() const { return watch.elapsedSeconds(); }
+    double elapsedSeconds() const { return static_cast<double>(getElapsedNanoseconds()) / 1e9; }
 
-    void addThreadIdToList(String const & host, UInt64 thread_id);
-
-    void updateThreadEventData(HostToThreadTimesMap & new_thread_data);
-
-    bool print_hardware_utilization = false;
-
-private:
-
-    size_t getUsedThreadsCount() const;
-
-    UInt64 getApproximateCoresNumber() const;
+    /// How much seconds passed since query execution start, measured by the client's own clock.
+    /// Unlike `elapsedSeconds`, this never uses the server-reported time, which only advances when a
+    /// `Progress` packet arrives. The server does not send a final `Progress` packet when a query
+    /// fails, so after an error the server-reported time is the one from the last periodic packet and
+    /// can be arbitrarily older than the real duration of the query.
+    double clientElapsedSeconds() const { return watch.elapsedSeconds(); }
 
     struct MemoryUsage
     {
         UInt64 total = 0;
         UInt64 max   = 0;
+        Int64 peak  = -1;
     };
 
     MemoryUsage getMemoryUsage() const;
+
+    struct TempDataOnDiskUsage
+    {
+        UInt64 total = 0;
+        UInt64 max = 0;
+    };
+
+    /// Total amount of temporary data on disk used by the query across all hosts and the maximum per host (in bytes).
+    TempDataOnDiskUsage getTempDataOnDiskUsage() const;
+
+    void updateThreadEventData(HostToTimesMap & new_hosts_data);
+
+private:
+    struct ProfileSnapshot
+    {
+        double cpu_usage = 0;
+        /// Average number of threads sleeping in throttlers or waiting for the IO scheduler.
+        double waited = 0;
+        MemoryUsage memory;
+        TempDataOnDiskUsage temp_data_on_disk;
+    };
+
+    /// All resource usage values at once, consistent with each other.
+    ProfileSnapshot getProfileSnapshot();
+
+    static MemoryUsage sumMemoryUsage(const HostToTimesMap & hosts);
+    static TempDataOnDiskUsage sumTempDataOnDiskUsage(const HostToTimesMap & hosts);
+
+    UInt64 getElapsedNanoseconds() const;
 
     /// This flag controls whether to show the progress bar. We start showing it after
     /// the query has been executing for 0.5 seconds, and is still less than half complete.
@@ -84,17 +128,46 @@ private:
     /// to check whether progress output needs to be cleared.
     size_t written_progress_chars = 0;
 
+    /// Selects the frame of the spinning indicator. It is per instance, because several clients
+    /// (e.g. the sessions of the web terminal) can show progress concurrently in one process.
+    size_t indicator_frame = 0;
+
+    /// Progress counts at which the stalled state flipped; colors the bar by history.
+    /// The counts do not depend on the width of the terminal: the history is compacted to at most
+    /// `bar_history_resolution` cells, and rendered at the current width of the bar.
+    std::vector<std::pair<UInt64, bool>> bar_segments;
+    static constexpr size_t bar_history_resolution = 4096;
+    /// Whether the counts stored in `bar_segments` are numbers of rows (or of bytes otherwise).
+    bool bar_segments_in_rows = false;
+
     /// The server periodically sends information about how much data was read since last time.
     /// This information is stored here.
     Progress progress;
 
-    /// Track query execution time.
+    /// Track query execution time on client.
     Stopwatch watch;
 
     bool write_progress_on_update = false;
 
-    std::unordered_map<String, UInt64> host_active_cores;
-    HostToThreadTimesMap thread_data;
+    EventRateMeter cpu_usage_meter{static_cast<double>(clock_gettime_ns()), 2'000'000'000 /*ns*/, 4}; // average cpu utilization last 2 second, skip first 4 points
+    EventRateMeter waited_meter{static_cast<double>(clock_gettime_ns()), 2'000'000'000 /*ns*/, 4};
+    HostToTimesMap hosts_data;
+    /// In case of all of the above:
+    /// - clickhouse-local
+    /// - input_format_parallel_parsing=true
+    /// - write_progress_on_update=true
+    ///
+    /// It is possible concurrent access to the following:
+    /// - writeProgress() (class properties) (guarded with progress_mutex)
+    /// - hosts_data/cpu_usage_meter/waited_meter (guarded with profile_events_mutex)
+    ///
+    /// It is also possible to have more races if query is cancelled, so that clearProgressOutput() is called concurrently
+    mutable std::mutex profile_events_mutex;
+    mutable std::mutex progress_mutex;
+
+    std::ostream & output_stream;
+    int in_fd;
+    int err_fd;
 };
 
 }

@@ -1,24 +1,51 @@
 import time
 
 import pytest
+
 from helpers.cluster import ClickHouseCluster
+
+ORIGINAL_CREDENTIALS1 = """
+<clickhouse>
+    <interserver_http_port>9009</interserver_http_port>
+    <interserver_http_credentials>
+        <user>admin</user>
+        <password>222</password>
+    </interserver_http_credentials>
+</clickhouse>
+"""
 
 
 def _fill_nodes(nodes, shard):
+    # test_different_credentials and test_credentials_and_no_credentials reject an
+    # interserver fetch on purpose, and a failed queue entry is then not retried for
+    # min(2^num_tries ms, max_postpone_time_for_failed_replicated_{fetches,merges}_ms).
+    # A plain SYSTEM SYNC REPLICA waits for every entry present at call time, so with
+    # the default one-minute bounds a sync issued after the credentials are repaired
+    # waits out that window.
     for node in nodes:
         node.query(
-            '''
-                CREATE DATABASE test;
-                CREATE TABLE test_table(date Date, id UInt32, dummy UInt32)
-                ENGINE = ReplicatedMergeTree('/clickhouse/tables/test{shard}/replicated', '{replica}', date, id, 8192);
-            '''.format(shard=shard, replica=node.name))
+            """
+                CREATE DATABASE IF NOT EXISTS test;
+                CREATE TABLE IF NOT EXISTS test_table(date Date, id UInt32, dummy UInt32)
+                ENGINE = ReplicatedMergeTree('/clickhouse/tables/test{shard}/replicated', '{replica}') PARTITION BY toYYYYMM(date) ORDER BY id
+                SETTINGS max_postpone_time_for_failed_replicated_fetches_ms = 0, max_postpone_time_for_failed_replicated_merges_ms = 0;
+            """.format(
+                shard=shard, replica=node.name
+            )
+        )
 
 
 cluster = ClickHouseCluster(__file__)
-node1 = cluster.add_instance('node1', main_configs=['configs/remote_servers.xml', 'configs/credentials1.xml'],
-                             with_zookeeper=True)
-node2 = cluster.add_instance('node2', main_configs=['configs/remote_servers.xml', 'configs/credentials1.xml'],
-                             with_zookeeper=True)
+node1 = cluster.add_instance(
+    "node1",
+    main_configs=["configs/remote_servers.xml", "configs/credentials1.xml"],
+    with_zookeeper=True,
+)
+node2 = cluster.add_instance(
+    "node2",
+    main_configs=["configs/remote_servers.xml", "configs/credentials1.xml"],
+    with_zookeeper=True,
+)
 
 
 @pytest.fixture(scope="module")
@@ -35,23 +62,31 @@ def same_credentials_cluster():
 
 
 def test_same_credentials(same_credentials_cluster):
+    node1.query("TRUNCATE TABLE test_table")
+    node2.query("SYSTEM SYNC REPLICA test_table", timeout=10)
     node1.query("insert into test_table values ('2017-06-16', 111, 0)")
-    time.sleep(1)
+    node2.query("SYSTEM SYNC REPLICA test_table", timeout=60)
 
-    assert node1.query("SELECT id FROM test_table order by id") == '111\n'
-    assert node2.query("SELECT id FROM test_table order by id") == '111\n'
+    assert node1.query("SELECT id FROM test_table order by id") == "111\n"
+    assert node2.query("SELECT id FROM test_table order by id") == "111\n"
 
     node2.query("insert into test_table values ('2017-06-17', 222, 1)")
-    time.sleep(1)
+    node1.query("SYSTEM SYNC REPLICA test_table", timeout=60)
 
-    assert node1.query("SELECT id FROM test_table order by id") == '111\n222\n'
-    assert node2.query("SELECT id FROM test_table order by id") == '111\n222\n'
+    assert node1.query("SELECT id FROM test_table order by id") == "111\n222\n"
+    assert node2.query("SELECT id FROM test_table order by id") == "111\n222\n"
 
 
-node3 = cluster.add_instance('node3', main_configs=['configs/remote_servers.xml', 'configs/no_credentials.xml'],
-                             with_zookeeper=True)
-node4 = cluster.add_instance('node4', main_configs=['configs/remote_servers.xml', 'configs/no_credentials.xml'],
-                             with_zookeeper=True)
+node3 = cluster.add_instance(
+    "node3",
+    main_configs=["configs/remote_servers.xml", "configs/no_credentials.xml"],
+    with_zookeeper=True,
+)
+node4 = cluster.add_instance(
+    "node4",
+    main_configs=["configs/remote_servers.xml", "configs/no_credentials.xml"],
+    with_zookeeper=True,
+)
 
 
 @pytest.fixture(scope="module")
@@ -68,23 +103,31 @@ def no_credentials_cluster():
 
 
 def test_no_credentials(no_credentials_cluster):
+    node3.query("TRUNCATE TABLE test_table")
+    node4.query("SYSTEM SYNC REPLICA test_table", timeout=10)
     node3.query("insert into test_table values ('2017-06-18', 111, 0)")
-    time.sleep(1)
+    node4.query("SYSTEM SYNC REPLICA test_table", timeout=60)
 
-    assert node3.query("SELECT id FROM test_table order by id") == '111\n'
-    assert node4.query("SELECT id FROM test_table order by id") == '111\n'
+    assert node3.query("SELECT id FROM test_table order by id") == "111\n"
+    assert node4.query("SELECT id FROM test_table order by id") == "111\n"
 
     node4.query("insert into test_table values ('2017-06-19', 222, 1)")
-    time.sleep(1)
+    node3.query("SYSTEM SYNC REPLICA test_table", timeout=60)
 
-    assert node3.query("SELECT id FROM test_table order by id") == '111\n222\n'
-    assert node4.query("SELECT id FROM test_table order by id") == '111\n222\n'
+    assert node3.query("SELECT id FROM test_table order by id") == "111\n222\n"
+    assert node4.query("SELECT id FROM test_table order by id") == "111\n222\n"
 
 
-node5 = cluster.add_instance('node5', main_configs=['configs/remote_servers.xml', 'configs/credentials1.xml'],
-                             with_zookeeper=True)
-node6 = cluster.add_instance('node6', main_configs=['configs/remote_servers.xml', 'configs/credentials2.xml'],
-                             with_zookeeper=True)
+node5 = cluster.add_instance(
+    "node5",
+    main_configs=["configs/remote_servers.xml", "configs/credentials1.xml"],
+    with_zookeeper=True,
+)
+node6 = cluster.add_instance(
+    "node6",
+    main_configs=["configs/remote_servers.xml", "configs/credentials2.xml"],
+    with_zookeeper=True,
+)
 
 
 @pytest.fixture(scope="module")
@@ -101,17 +144,24 @@ def different_credentials_cluster():
 
 
 def test_different_credentials(different_credentials_cluster):
+    # Restore original credentials config in case a previous run modified it.
+    node5.replace_config(
+        "/etc/clickhouse-server/config.d/credentials1.xml", ORIGINAL_CREDENTIALS1
+    )
+    node5.query("SYSTEM RELOAD CONFIG")
+    node5.query("TRUNCATE TABLE test_table")
+    node6.query("TRUNCATE TABLE test_table")
     node5.query("insert into test_table values ('2017-06-20', 111, 0)")
     time.sleep(1)
 
-    assert node5.query("SELECT id FROM test_table order by id") == '111\n'
-    assert node6.query("SELECT id FROM test_table order by id") == ''
+    assert node5.query("SELECT id FROM test_table order by id") == "111\n"
+    assert node6.query("SELECT id FROM test_table order by id") == ""
 
     node6.query("insert into test_table values ('2017-06-21', 222, 1)")
     time.sleep(1)
 
-    assert node5.query("SELECT id FROM test_table order by id") == '111\n'
-    assert node6.query("SELECT id FROM test_table order by id") == '222\n'
+    assert node5.query("SELECT id FROM test_table order by id") == "111\n"
+    assert node6.query("SELECT id FROM test_table order by id") == "222\n"
 
     add_old = """
     <clickhouse>
@@ -135,15 +185,21 @@ def test_different_credentials(different_credentials_cluster):
 
     node5.query("SYSTEM RELOAD CONFIG")
     node5.query("INSERT INTO test_table values('2017-06-21', 333, 1)")
-    node6.query("SYSTEM SYNC REPLICA test_table", timeout=10)
+    node6.query("SYSTEM SYNC REPLICA test_table", timeout=30)
 
-    assert node6.query("SELECT id FROM test_table order by id") == '111\n222\n333\n'
+    assert node6.query("SELECT id FROM test_table order by id") == "111\n222\n333\n"
 
 
-node7 = cluster.add_instance('node7', main_configs=['configs/remote_servers.xml', 'configs/credentials1.xml'],
-                             with_zookeeper=True)
-node8 = cluster.add_instance('node8', main_configs=['configs/remote_servers.xml', 'configs/no_credentials.xml'],
-                             with_zookeeper=True)
+node7 = cluster.add_instance(
+    "node7",
+    main_configs=["configs/remote_servers.xml", "configs/credentials1.xml"],
+    with_zookeeper=True,
+)
+node8 = cluster.add_instance(
+    "node8",
+    main_configs=["configs/remote_servers.xml", "configs/no_credentials.xml"],
+    with_zookeeper=True,
+)
 
 
 @pytest.fixture(scope="module")
@@ -160,17 +216,24 @@ def credentials_and_no_credentials_cluster():
 
 
 def test_credentials_and_no_credentials(credentials_and_no_credentials_cluster):
+    # Restore original credentials config in case a previous run modified it.
+    node7.replace_config(
+        "/etc/clickhouse-server/config.d/credentials1.xml", ORIGINAL_CREDENTIALS1
+    )
+    node7.query("SYSTEM RELOAD CONFIG")
+    node7.query("TRUNCATE TABLE test_table")
+    node8.query("TRUNCATE TABLE test_table")
     node7.query("insert into test_table values ('2017-06-21', 111, 0)")
     time.sleep(1)
 
-    assert node7.query("SELECT id FROM test_table order by id") == '111\n'
-    assert node8.query("SELECT id FROM test_table order by id") == ''
+    assert node7.query("SELECT id FROM test_table order by id") == "111\n"
+    assert node8.query("SELECT id FROM test_table order by id") == ""
 
     node8.query("insert into test_table values ('2017-06-22', 222, 1)")
     time.sleep(1)
 
-    assert node7.query("SELECT id FROM test_table order by id") == '111\n'
-    assert node8.query("SELECT id FROM test_table order by id") == '222\n'
+    assert node7.query("SELECT id FROM test_table order by id") == "111\n"
+    assert node8.query("SELECT id FROM test_table order by id") == "222\n"
 
     allow_empty = """
     <clickhouse>
@@ -184,10 +247,11 @@ def test_credentials_and_no_credentials(credentials_and_no_credentials_cluster):
     """
 
     # change state: Flip node7 to mixed auth/non-auth (allow node8)
-    node7.replace_config("/etc/clickhouse-server/config.d/credentials1.xml",
-                         allow_empty)
+    node7.replace_config(
+        "/etc/clickhouse-server/config.d/credentials1.xml", allow_empty
+    )
 
     node7.query("SYSTEM RELOAD CONFIG")
     node7.query("insert into test_table values ('2017-06-22', 333, 1)")
-    node8.query("SYSTEM SYNC REPLICA test_table", timeout=10)
-    assert node8.query("SELECT id FROM test_table order by id") == '111\n222\n333\n'
+    node8.query("SYSTEM SYNC REPLICA test_table", timeout=30)
+    assert node8.query("SELECT id FROM test_table order by id") == "111\n222\n333\n"

@@ -1,22 +1,51 @@
+#include <Functions/multiIf.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionIfBase.h>
+#include <Functions/IFunctionAdaptors.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnDecimal.h>
 #include <Columns/MaskOperations.h>
+#include <Core/Settings.h>
 #include <Interpreters/castColumn.h>
 #include <Common/assert_cast.h>
 #include <Common/typeid_cast.h>
-#include <DataTypes/DataTypeNullable.h>
-#include <DataTypes/getLeastSupertype.h>
+#include <Columns/IColumn.h>
+#include <Common/VectorWithMemoryTracking.h>
 
+#include <limits>
+#include <Interpreters/Context.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/DataTypeEnum.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <DataTypes/DataTypeDate.h>
+#include <DataTypes/DataTypeDate32.h>
+#include <DataTypes/DataTypeDateTime.h>
+#include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeVariant.h>
+#include <DataTypes/getLeastSupertype.h>
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool allow_execute_multiif_columnar;
+    extern const SettingsBool optimize_if_transform_const_strings_to_lowcardinality;
+    extern const SettingsBool optimize_if_transform_strings_to_enum;
+    extern const SettingsBool use_variant_as_common_type;
+    extern const SettingsBool allow_lossy_numeric_supertype;
+}
+
 namespace ErrorCodes
 {
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+    extern const int NOT_IMPLEMENTED;
+    extern const int BAD_ARGUMENTS;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
 }
 
 namespace
@@ -36,20 +65,48 @@ class FunctionMultiIf final : public FunctionIfBase
 {
 public:
     static constexpr auto name = "multiIf";
-    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionMultiIf>(); }
+    static FunctionPtr create(ContextPtr context_)
+    {
+        const auto & settings = context_->getSettingsRef();
+        /// Mirror FunctionIf::create: the LowCardinality optimisation is disabled when
+        /// `optimize_if_transform_strings_to_enum` is enabled, so that `if` and `multiIf` produce
+        /// the same result type. Otherwise `multiIf` would return `LowCardinality(String)` while a
+        /// flag-less `if` returns `String`, and `MultiIfToIfPass` could no longer rewrite `multiIf` to `if`.
+        const bool use_low_cardinality_optimisation = settings[Setting::optimize_if_transform_const_strings_to_lowcardinality]
+            && !settings[Setting::optimize_if_transform_strings_to_enum];
+        return std::make_shared<FunctionMultiIf>(
+            settings[Setting::allow_execute_multiif_columnar],
+            settings[Setting::use_variant_as_common_type],
+            settings[Setting::allow_lossy_numeric_supertype],
+            use_low_cardinality_optimisation);
+    }
+
+    explicit FunctionMultiIf(
+        bool allow_execute_multiif_columnar_,
+        bool use_variant_as_common_type_,
+        bool allow_lossy_numeric_supertype_ = false,
+        bool optimize_if_transform_const_strings_to_lowcardinality_ = false)
+        : allow_execute_multiif_columnar(allow_execute_multiif_columnar_)
+        , use_variant_as_common_type(use_variant_as_common_type_)
+        , allow_lossy_numeric_supertype(allow_lossy_numeric_supertype_)
+        , optimize_if_transform_const_strings_to_lowcardinality(optimize_if_transform_const_strings_to_lowcardinality_)
+    {}
 
     String getName() const override { return name; }
     bool isVariadic() const override { return true; }
     bool isShortCircuit(ShortCircuitSettings & settings, size_t number_of_arguments) const override
     {
-        settings.enable_lazy_execution_for_first_argument = false;
+        settings.arguments_with_disabled_lazy_execution.insert(0);
         settings.enable_lazy_execution_for_common_descendants_of_arguments = (number_of_arguments != 3);
         settings.force_enable_lazy_execution = false;
         return true;
     }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
     size_t getNumberOfArguments() const override { return 0; }
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
     bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForNothing() const override { return false; }
+    bool canBeExecutedOnLowCardinalityDictionary() const override { return false; }
 
     ColumnNumbers getArgumentsThatDontImplyNullableReturnType(size_t number_of_arguments) const override
     {
@@ -59,10 +116,37 @@ public:
         return args;
     }
 
+    String getSignatureString() const override
+    {
+        /// Arguments: cond1, then1, cond2, then2, ..., else. The existing matcher engine
+        /// walks back through the args before `...` and groups them by index coherence:
+        /// (MaybeNullable(UInt8) | Nothing) has index 0; V1 has index 1; together they form
+        /// the repeating pair. The fixed group before `...` matches one mandatory pair, so
+        /// minimum arity is 3 (cond, then, else) — exactly matching the legacy check.
+        ///
+        /// `use_variant_as_common_type` selects `leastSupertypeOrVariant`, matching `if`.
+        if (use_variant_as_common_type)
+            return "(MaybeNullable(UInt8) | Nothing, V1, ..., E) -> leastSupertypeOrVariant(V1, ..., E)";
+        return "(MaybeNullable(UInt8) | Nothing, V1, ..., E) -> leastSupertype(V1, ..., E)";
+    }
+
+    /// Same as the `ColumnsWithTypeAndName` overload, without information about constant arguments.
     DataTypePtr getReturnTypeImpl(const DataTypes & args) const override
     {
-        /// Arguments are the following: cond1, then1, cond2, then2, ... condN, thenN, else.
+        ColumnsWithTypeAndName columns;
+        columns.reserve(args.size());
+        for (const auto & type : args)
+            columns.emplace_back(nullptr, type, String{});
+        return getReturnTypeImpl(columns);
+    }
 
+    /// The declarative signature cannot express `allow_lossy_numeric_supertype` (the `leastSupertype`
+    /// type-function always uses the strict mode), so when that setting is enabled, compute the common
+    /// type explicitly, mirroring the legacy implementation. It also cannot express the `LowCardinality`
+    /// result for constant string branches, which depends on the constness of the arguments.
+    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & args) const override
+    {
+        /// Arguments are the following: cond1, then1, cond2, then2, ... condN, thenN, else.
         auto for_conditions = [&args](auto && f)
         {
             size_t conditions_end = args.size() - 1;
@@ -78,70 +162,219 @@ public:
             f(args.back());
         };
 
-        if (!(args.size() >= 3 && args.size() % 2 == 1))
-            throw Exception{"Invalid number of arguments for function " + getName(),
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH};
-
-        for_conditions([&](const DataTypePtr & arg)
+        /// Unless `allow_lossy_numeric_supertype` is enabled, the declarative signature is authoritative for the
+        /// validation of the arguments and for the common type. Apply it to the LowCardinality-stripped arguments,
+        /// restoring the contract of the default LowCardinality implementation this function opted out of
+        /// (see `useDefaultImplementationForLowCardinalityColumns` above).
+        DataTypePtr signature_result_type;
+        if (!allow_lossy_numeric_supertype)
         {
-            const IDataType * nested_type;
-            if (arg->isNullable())
+            ColumnsWithTypeAndName stripped_args;
+            stripped_args.reserve(args.size());
+            for (const auto & arg : args)
             {
-                if (arg->onlyNull())
+                auto stripped_type = recursiveRemoveLowCardinality(arg.type);
+                /// The column is only used to check constness, which no position of the signature requires.
+                auto column = stripped_type.get() == arg.type.get() ? arg.column : nullptr;
+                stripped_args.emplace_back(std::move(column), std::move(stripped_type), arg.name);
+            }
+            signature_result_type = FunctionIfBase::getReturnTypeImpl(stripped_args);
+        }
+
+        if (!(args.size() >= 3 && args.size() % 2 == 1))
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Invalid number of arguments for function {}", getName());
+
+        size_t const_branches_count = 0;
+        size_t string_branches_count = 0;
+        size_t nullable_string_branches_count = 0;
+        size_t non_null_string_value_branches_count = 0;
+        size_t only_null_branches_count = 0;
+        /// Whether a constant prefix of the conditions already determines which branch is selected,
+        /// mirroring the way `executeImpl` walks the conditions: it skips the always-false ones and
+        /// stops at the first always-true one. It is not enough for *all* conditions to be constant -
+        /// a constant prefix is already sufficient, e.g. in `multiIf(1, 'max', number = 1, 'sum', 'avg')`
+        /// the first branch is always selected. If no condition is left to evaluate at runtime, the whole
+        /// expression (with all branches constant) folds into a single constant value.
+        auto is_selected_branch_decided_by_constants = [&args]()
+        {
+            size_t conditions_end = args.size() - 1;
+            for (size_t i = 0; i < conditions_end; i += 2)
+            {
+                const auto & condition = args[i];
+                /// A condition whose type is `Nullable(Nothing)` is always NULL and never true -
+                /// `executeImpl` skips it - even when it is not a constant (e.g. `materialize(NULL)`),
+                /// so it can be skipped from the type alone, without a column.
+                if (condition.type->onlyNull())
+                    continue;
+
+                if (!condition.column)
+                    return false;
+
+                const auto condition_column = condition.column->convertToFullColumnIfLowCardinality();
+                /// An always-NULL condition is never true - `executeImpl` skips it.
+                if (condition_column->onlyNull())
+                    continue;
+
+                const auto * condition_const_column = checkAndGetColumn<ColumnConst>(&*condition_column);
+                if (!condition_const_column)
+                    return false;
+
+                const Field value = condition_const_column->getField();
+                /// A constant false or NULL condition is skipped, a constant true one selects its branch.
+                if (value.isNull() || value.safeGet<UInt64>() == 0)
+                    continue;
+                return true;
+            }
+            /// Every condition is constant and false - the `else` branch is selected.
+            return true;
+        };
+
+        /// Whether every branch is the same constant value. Then the result is that value regardless of the
+        /// conditions, which `if` also recognises (see the identical-branch fast path in `if.cpp` returning a
+        /// `ColumnConst`). `if` therefore keeps plain `String` for `if(cond, x, x)`, so `multiIf` has to do the
+        /// same: otherwise the result types diverge, `MultiIfToIfPass` (which rewrites only when they match)
+        /// silently stops rewriting `multiIf(cond, x, x)`, and consumers of constant string arguments such as
+        /// `arrayReduce` no longer receive a `Const(String)`.
+        auto are_all_branches_identical_constants = [&for_branches]()
+        {
+            const ColumnWithTypeAndName * first_branch = nullptr;
+            bool identical = true;
+            for_branches([&](const ColumnWithTypeAndName & arg)
+            {
+                if (!identical)
                     return;
 
-                const DataTypeNullable & nullable_type = static_cast<const DataTypeNullable &>(*arg);
+                if (!arg.column || !isColumnConst(*arg.column))
+                {
+                    identical = false;
+                    return;
+                }
+
+                if (!first_branch)
+                {
+                    first_branch = &arg;
+                    return;
+                }
+
+                if (!recursiveRemoveLowCardinality(first_branch->type)->equals(*recursiveRemoveLowCardinality(arg.type))
+                    || (*first_branch->column)[0] != (*arg.column)[0])
+                    identical = false;
+            });
+            return identical;
+        };
+
+        for_conditions([&](const ColumnWithTypeAndName & arg)
+        {
+            const auto & arg_type = recursiveRemoveLowCardinality(arg.type);
+            const IDataType * nested_type = nullptr;
+            if (arg_type->isNullable())
+            {
+                if (arg_type->onlyNull())
+                    return;
+
+                const DataTypeNullable & nullable_type = static_cast<const DataTypeNullable &>(*arg_type);
                 nested_type = nullable_type.getNestedType().get();
             }
             else
             {
-                nested_type = arg.get();
+                nested_type = arg_type.get();
             }
 
             if (!WhichDataType(nested_type).isUInt8())
-                throw Exception{"Illegal type " + arg->getName() + " of argument (condition) "
-                    "of function " + getName() + ". Must be UInt8.",
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of argument (condition) of function {}. "
+                    "Must be UInt8.", arg_type->getName(), getName());
         });
 
         DataTypes types_of_branches;
         types_of_branches.reserve(args.size() / 2 + 1);
 
-        for_branches([&](const DataTypePtr & arg)
+        for_branches([&](const ColumnWithTypeAndName & arg)
         {
-            types_of_branches.emplace_back(arg);
+            /// Compute the common type on LowCardinality-stripped branch types, restoring the contract
+            /// of the default LowCardinality implementation this function opted out of (see
+            /// `useDefaultImplementationForLowCardinalityColumns` above). Otherwise an explicit
+            /// `LowCardinality` branch would leak into the result type (e.g. as
+            /// `Variant(..., LowCardinality(String), ...)` with `use_variant_as_common_type`),
+            /// diverging from `if`, whose default implementation strips it. The strip has to be
+            /// recursive, like `convertLowCardinalityColumnsToFull` in the default implementation:
+            /// a nested carrier such as `Map(String, LowCardinality(String))` must become
+            /// `Map(String, String)` as well.
+            const auto branch_type = recursiveRemoveLowCardinality(arg.type);
+            const bool is_const_branch = arg.column && isColumnConst(*arg.column);
+            const bool is_string_branch = isString(branch_type);
+            const bool is_nullable_string_branch = branch_type->isNullable() && isString(removeNullable(branch_type));
+            const_branches_count += is_const_branch;
+            string_branches_count += is_string_branch;
+            nullable_string_branches_count += is_nullable_string_branch;
+            non_null_string_value_branches_count
+                += is_string_branch || (is_nullable_string_branch && is_const_branch && !arg.column->isNullAt(0));
+            only_null_branches_count += branch_type->onlyNull();
+            types_of_branches.emplace_back(branch_type);
         });
 
-        return getLeastSupertype(types_of_branches);
+        auto const num_branches = types_of_branches.size();
+
+        /// If the selected branch is decided by constant conditions too, the whole expression is constant and gets
+        /// folded into a single `Const(LowCardinality(String))` value. `LowCardinality` gives no benefit for a
+        /// constant, and functions that opt out of the default LowCardinality implementation (e.g. `arrayReduce`,
+        /// `joinGet`, `tupleElement`) expect their constant string arguments as `Const(String)`, so keep plain
+        /// `String` then.
+        /// Whether all branches are identical constants is checked last, once the branches are known to be
+        /// (possibly nullable) strings or NULLs: materializing other constants, e.g. large arrays, as `Field`
+        /// is expensive and may even throw.
+        if (optimize_if_transform_const_strings_to_lowcardinality && const_branches_count == num_branches
+            && !is_selected_branch_decided_by_constants())
+        {
+            DataTypePtr low_cardinality_type;
+            if (string_branches_count == num_branches)
+                low_cardinality_type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+            /// A mix of (possibly nullable) string branches and only-NULL branches.
+            /// Require at least one constant branch whose value is a non-NULL string: a mix of only-NULL
+            /// branches without any string (e.g. `CASE WHEN ... THEN NULL ... END`) must keep its
+            /// `Nullable(Nothing)` common type, and a typed all-NULL case (every `Nullable(String)`
+            /// branch holding a NULL constant) must keep plain `Nullable(String)` - there is no
+            /// dictionary-compression benefit when no actual string value exists.
+            else if (
+                non_null_string_value_branches_count > 0
+                && (only_null_branches_count + string_branches_count + nullable_string_branches_count) == num_branches)
+                low_cardinality_type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()));
+
+            if (low_cardinality_type && !are_all_branches_identical_constants())
+                return low_cardinality_type;
+        }
+
+        if (signature_result_type)
+            return signature_result_type;
+
+        if (use_variant_as_common_type)
+            return getLeastSupertypeOrVariant(types_of_branches, allow_lossy_numeric_supertype);
+
+        return getLeastSupertype(types_of_branches, allow_lossy_numeric_supertype);
     }
+
+    struct Instruction
+    {
+        IColumn::Ptr condition = nullptr;
+        IColumn::Ptr source = nullptr;
+
+        bool condition_always_true = false;
+        bool condition_is_nullable = false;
+        bool source_is_constant = false;
+    };
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
-        ColumnsWithTypeAndName arguments = std::move(args);
+        ColumnsWithTypeAndName arguments = args;
         executeShortCircuitArguments(arguments);
         /** We will gather values from columns in branches to result column,
         *  depending on values of conditions.
         */
-        struct Instruction
-        {
-            IColumn::Ptr condition = nullptr;
-            IColumn::Ptr source = nullptr;
 
-            bool condition_always_true = false;
-            bool condition_is_nullable = false;
-            bool source_is_constant = false;
-
-            bool condition_is_short = false;
-            bool source_is_short = false;
-            size_t condition_index = 0;
-            size_t source_index = 0;
-        };
-
-        std::vector<Instruction> instructions;
+        VectorWithMemoryTracking<Instruction> instructions;
         instructions.reserve(arguments.size() / 2 + 1);
 
         Columns converted_columns_holder;
-        converted_columns_holder.reserve(instructions.size());
+        converted_columns_holder.reserve(instructions.capacity());
 
         const DataTypePtr & return_type = result_type;
 
@@ -168,13 +401,13 @@ public:
                 if (cond_col->onlyNull())
                     continue;
 
-                if (const auto * column_const = checkAndGetColumn<ColumnConst>(*cond_col))
+                if (const auto * column_const = checkAndGetColumn<ColumnConst>(&*cond_col))
                 {
                     Field value = column_const->getField();
 
                     if (value.isNull())
                         continue;
-                    if (value.get<UInt64>() == 0)
+                    if (value.safeGet<UInt64>() == 0)
                         continue;
 
                     instruction.condition_always_true = true;
@@ -184,12 +417,24 @@ public:
                     instruction.condition = cond_col;
                     instruction.condition_is_nullable = instruction.condition->isNullable();
                 }
-
-                instruction.condition_is_short = cond_col->size() < arguments[0].column->size();
             }
 
-            const ColumnWithTypeAndName & source_col = arguments[source_idx];
-            instruction.source_is_short = source_col.column->size() < arguments[0].column->size();
+            ColumnWithTypeAndName source_col = arguments[source_idx];
+            /// The common type is computed on LowCardinality-stripped branch types (see getReturnTypeImpl).
+            /// When it is not LowCardinality itself, convert a LowCardinality branch to its full column -
+            /// as the default LowCardinality implementation did before this function opted out of it -
+            /// since castColumn cannot cast e.g. LowCardinality(String) to a Variant that only
+            /// contains String. The check and the strip are recursive so that nested carriers like
+            /// `Map(String, LowCardinality(String))` are normalized too, matching getReturnTypeImpl.
+            if (!return_type->lowCardinality())
+            {
+                auto full_type = recursiveRemoveLowCardinality(source_col.type);
+                if (full_type.get() != source_col.type.get())
+                {
+                    source_col.column = recursiveRemoveLowCardinality(source_col.column);
+                    source_col.type = std::move(full_type);
+                }
+            }
             if (source_col.type->equals(*return_type))
             {
                 instruction.source = source_col.column;
@@ -210,44 +455,118 @@ public:
                 break;
         }
 
-        MutableColumnPtr res = return_type->createColumn();
-
         /// Special case if first instruction condition is always true and source is constant
-        if (instructions.size() == 1 && instructions.front().source_is_constant
-            && instructions.front().condition_always_true)
+        if (instructions.size() == 1 && instructions.front().source_is_constant && instructions.front().condition_always_true)
         {
+            MutableColumnPtr res = return_type->createColumn();
             auto & instruction = instructions.front();
             res->insertFrom(assert_cast<const ColumnConst &>(*instruction.source).getDataColumn(), 0);
             return ColumnConst::create(std::move(res), instruction.source->size());
         }
 
-        size_t rows = input_rows_count;
+        /// Fast path when data is empty.
+        /// We should account for the above case when the result is constant, otherwise we might produce a full column instead of a
+        /// ColumnConst. But only for the header (while building pipeline, i.e. when input_rows_count==0), then we will get on with a
+        /// normal execution and return ColumnConst from the happy path.
+        /// It will break code that creates some data structures based on the input header column types.
+        if (input_rows_count == 0)
+            return result_type->createColumn();
 
+        const WhichDataType which(removeNullable(result_type));
+        bool execute_multiif_columnar = allow_execute_multiif_columnar && instructions.size() <= std::numeric_limits<UInt8>::max()
+            && (which.isInt() || which.isUInt() || which.isFloat() || which.isDecimal() || which.isDateOrDate32OrDateTimeOrDateTime64()
+                || which.isEnum() || which.isIPv4() || which.isIPv6());
+
+        size_t rows = input_rows_count;
+        if (!execute_multiif_columnar)
+        {
+            MutableColumnPtr res = return_type->createColumn();
+            res->reserve(rows);
+            executeInstructions(instructions, rows, res);
+            return std::move(res);
+        }
+
+#define EXECUTE_INSTRUCTIONS_COLUMNAR(TYPE, FIELD, INDEX) \
+    if (which.is##TYPE()) \
+    { \
+        MutableColumnPtr res = result_type->createColumn(); \
+        if (result_type->isNullable()) \
+        { \
+            auto & res_nullable = assert_cast<ColumnNullable &>(*res); \
+            auto & res_data = assert_cast<ColumnVectorOrDecimal<FIELD> &>(res_nullable.getNestedColumn()).getData(); \
+            auto & res_null_map = res_nullable.getNullMapData(); \
+            executeInstructionsColumnar<FIELD, INDEX, true>(instructions, rows, res_data, &res_null_map); \
+        } \
+        else \
+        { \
+            auto & res_data = assert_cast<ColumnVectorOrDecimal<FIELD> &>(*res).getData(); \
+            executeInstructionsColumnar<FIELD, INDEX, false>(instructions, rows, res_data, nullptr); \
+        } \
+        return std::move(res); \
+    }
+
+#define ENUMERATE_NUMERIC_TYPES(M, INDEX) \
+    M(UInt8, UInt8, INDEX) \
+    M(UInt16, UInt16, INDEX) \
+    M(UInt32, UInt32, INDEX) \
+    M(UInt64, UInt64, INDEX) \
+    M(Int8, Int8, INDEX) \
+    M(Int16, Int16, INDEX) \
+    M(Int32, Int32, INDEX) \
+    M(Int64, Int64, INDEX) \
+    M(Float32, Float32, INDEX) \
+    M(Float64, Float64, INDEX) \
+    M(UInt128, UInt128, INDEX) \
+    M(UInt256, UInt256, INDEX) \
+    M(Int128, Int128, INDEX) \
+    M(Int256, Int256, INDEX) \
+    M(Decimal32, Decimal32, INDEX) \
+    M(Decimal64, Decimal64, INDEX) \
+    M(Decimal128, Decimal128, INDEX) \
+    M(Decimal256, Decimal256, INDEX) \
+    M(Date, UInt16, INDEX) \
+    M(Date32, Int32, INDEX) \
+    M(DateTime, UInt32, INDEX) \
+    M(DateTime64, DateTime64, INDEX) \
+    M(Enum8, Int8, INDEX) \
+    M(Enum16, Int16, INDEX) \
+    M(IPv4, IPv4, INDEX) \
+    M(IPv6, IPv6, INDEX) \
+    throw Exception( \
+        ErrorCodes::NOT_IMPLEMENTED, "Columnar execution of function {} not implemented for type {}", getName(), result_type->getName());
+
+        ENUMERATE_NUMERIC_TYPES(EXECUTE_INSTRUCTIONS_COLUMNAR, UInt8)
+    }
+#undef ENUMERATE_NUMERIC_TYPES
+#undef EXECUTE_INSTRUCTIONS_COLUMNAR
+
+private:
+
+    static void executeInstructions(VectorWithMemoryTracking<Instruction> & instructions, size_t rows, const MutableColumnPtr & res)
+    {
         for (size_t i = 0; i < rows; ++i)
         {
             for (auto & instruction : instructions)
             {
                 bool insert = false;
 
-                size_t condition_index = instruction.condition_is_short ? instruction.condition_index++ : i;
                 if (instruction.condition_always_true)
                     insert = true;
                 else if (!instruction.condition_is_nullable)
-                    insert = assert_cast<const ColumnUInt8 &>(*instruction.condition).getData()[condition_index];
+                    insert = assert_cast<const ColumnUInt8 &>(*instruction.condition).getData()[i];
                 else
                 {
                     const ColumnNullable & condition_nullable = assert_cast<const ColumnNullable &>(*instruction.condition);
                     const ColumnUInt8 & condition_nested = assert_cast<const ColumnUInt8 &>(condition_nullable.getNestedColumn());
                     const NullMap & condition_null_map = condition_nullable.getNullMapData();
 
-                    insert = !condition_null_map[condition_index] && condition_nested.getData()[condition_index];
+                    insert = !condition_null_map[i] && condition_nested.getData()[i];
                 }
 
                 if (insert)
                 {
-                    size_t source_index = instruction.source_is_short ? instruction.source_index++ : i;
                     if (!instruction.source_is_constant)
-                        res->insertFrom(*instruction.source, source_index);
+                        res->insertFrom(*instruction.source, i);
                     else
                         res->insertFrom(assert_cast<const ColumnConst &>(*instruction.source).getDataColumn(), 0);
 
@@ -255,16 +574,129 @@ public:
                 }
             }
         }
-
-        return res;
     }
 
-private:
+    /// We should read source from which instruction on each row?
+    template <typename S>
+    static NO_INLINE void calculateInserts(const VectorWithMemoryTracking<Instruction> & instructions, size_t rows, PaddedPODArray<S> & inserts)
+    {
+        for (S i = static_cast<S>(instructions.size() - 1); i != static_cast<S>(-1); --i)
+        {
+            const auto & instruction = instructions[i];
+            if (instruction.condition_always_true)
+            {
+                for (size_t row_i = 0; row_i < rows; ++row_i)
+                    inserts[row_i] = i;
+            }
+            else if (!instruction.condition_is_nullable)
+            {
+                const auto & cond_data = assert_cast<const ColumnUInt8 &>(*instruction.condition).getData();
+                for (size_t row_i = 0; row_i < rows; ++row_i)
+                {
+                    /// Equivalent to below code. But it is able to utilize SIMD instructions.
+                    /// if (cond_data[row_i])
+                    ///     inserts[row_i] = i;
+
+                    inserts[row_i] += (!!cond_data[row_i]) * (i - inserts[row_i]);
+                }
+            }
+            else
+            {
+                const ColumnNullable & condition_nullable = assert_cast<const ColumnNullable &>(*instruction.condition);
+                const ColumnUInt8 & condition_nested = assert_cast<const ColumnUInt8 &>(condition_nullable.getNestedColumn());
+                const auto & condition_nested_data = condition_nested.getData();
+                const NullMap & condition_null_map = condition_nullable.getNullMapData();
+
+                for (size_t row_i = 0; row_i < rows; ++row_i)
+                {
+                    /// Equivalent to below code. But it is able to utilize SIMD instructions.
+                    /// if (!condition_null_map[row_i] && condition_nested_data[row_i])
+                    ///     inserts[row_i] = i;
+                    inserts[row_i] += (~condition_null_map[row_i] & (!!condition_nested_data[row_i])) * (i - inserts[row_i]);
+                }
+            }
+        }
+    }
+
+    template <typename T, typename S, bool nullable_result = false>
+    static NO_INLINE void executeInstructionsColumnar(
+        const VectorWithMemoryTracking<Instruction> & instructions,
+        size_t rows,
+        PaddedPODArray<T> & res_data,
+        PaddedPODArray<UInt8> * res_null_map = nullptr)
+    {
+        PaddedPODArray<S> inserts(rows, static_cast<S>(instructions.size()));
+        calculateInserts(instructions, rows, inserts);
+
+        res_data.resize_exact(rows);
+        if constexpr (nullable_result)
+        {
+            if (!res_null_map)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid result null_map while result type is nullable");
+
+            res_null_map->resize_exact(rows);
+        }
+
+        VectorWithMemoryTracking<const T *> data_cols(instructions.size(), nullptr);
+        VectorWithMemoryTracking<const UInt8 *> null_map_cols(instructions.size(), nullptr);
+        for (size_t i = 0; i < instructions.size(); ++i)
+        {
+            const auto & instruction = instructions[i];
+            const IColumn * non_const_col = instructions[i].source_is_constant
+                ? &assert_cast<const ColumnConst &>(*instruction.source).getDataColumn()
+                : instruction.source.get();
+            const ColumnNullable * nullable_col = checkAndGetColumn<ColumnNullable>(non_const_col);
+            data_cols[i] = nullable_col ? assert_cast<const ColumnVectorOrDecimal<T> &>(nullable_col->getNestedColumn()).getData().data()
+                                        : assert_cast<const ColumnVectorOrDecimal<T> &>(*non_const_col).getData().data();
+            null_map_cols[i] = nullable_col ? assert_cast<const ColumnUInt8 &>(nullable_col->getNullMapColumn()).getData().data() : nullptr;
+        }
+
+        std::unique_ptr<PaddedPODArray<UInt8>> shared_null_map;
+        if constexpr (nullable_result)
+        {
+            for (auto & col : null_map_cols)
+            {
+                if (!col)
+                {
+                    if (!shared_null_map)
+                        shared_null_map = std::make_unique<PaddedPODArray<UInt8>>(rows, 0);
+
+                    col = shared_null_map->data();
+                }
+            }
+        }
+
+        /// A constant source is read at index 0 on every row, a column source at `row_i`.
+        VectorWithMemoryTracking<size_t> index_masks(instructions.size());
+        for (size_t i = 0; i < instructions.size(); ++i)
+            index_masks[i] = instructions[i].source_is_constant ? 0 : std::numeric_limits<size_t>::max();
+
+        /// Raw pointers for the row loop: the stores into the result may alias the vectors' buffers as far as
+        /// the compiler knows, and clang-23 reloads `data()` of every vector on each row otherwise.
+        const S * inserts_data = inserts.data();
+        const size_t * index_masks_data = index_masks.data();
+        const T * const * data_cols_data = data_cols.data();
+        const UInt8 * const * null_map_cols_data = null_map_cols.data();
+        T * res = res_data.data();
+        UInt8 * res_null = nullable_result ? res_null_map->data() : nullptr;
+
+        for (size_t row_i = 0; row_i < rows; ++row_i)
+        {
+            S insert = inserts_data[row_i];
+            size_t index = row_i & index_masks_data[insert];
+            res[row_i] = data_cols_data[insert][index];
+            if constexpr (nullable_result)
+                res_null[row_i] = null_map_cols_data[insert][index];
+        }
+    }
+
     static void executeShortCircuitArguments(ColumnsWithTypeAndName & arguments)
     {
-        int last_short_circuit_argument_index = checkShirtCircuitArguments(arguments);
+        int last_short_circuit_argument_index = checkShortCircuitArguments(arguments);
         if (last_short_circuit_argument_index < 0)
             return;
+
+        executeColumnIfNeeded(arguments[0]);
 
         /// Let's denote x_i' = maskedExecute(x_i, mask).
         /// multiIf(x_0, y_0, x_1, y_1, x_2, y_2, ..., x_{n-1}, y_{n-1}, y_n)
@@ -289,7 +721,10 @@ private:
         {
             auto & cond_column = arguments[i - 1].column;
             /// If condition is const or null and value is false, we can skip execution of expression after this condition.
-            if ((isColumnConst(*cond_column) || cond_column->onlyNull()) && !cond_column->empty() && !cond_column->getBool(0))
+            /// `onlyNull` columns (e.g. `Const(Nullable(Nothing))`) are treated as false: their dummy nested column would
+            /// throw from `getBool`, and per the loop preamble `multiIf` already treats NULL conditions as 0.
+            if ((isColumnConst(*cond_column) || cond_column->onlyNull()) && !cond_column->empty()
+                && (cond_column->onlyNull() || !cond_column->getBool(0)))
             {
                 condition_mask_info.has_ones = false;
                 condition_mask_info.has_zeros = true;
@@ -326,19 +761,85 @@ private:
         for (; i <= last_short_circuit_argument_index; ++i)
             executeColumnIfNeeded(arguments[i], true);
     }
+
+    const bool allow_execute_multiif_columnar;
+    const bool use_variant_as_common_type;
+    const bool allow_lossy_numeric_supertype;
+    const bool optimize_if_transform_const_strings_to_lowcardinality;
 };
 
 }
 
-void registerFunctionMultiIf(FunctionFactory & factory)
+REGISTER_FUNCTION(MultiIf)
 {
-    factory.registerFunction<FunctionMultiIf>();
+    FunctionDocumentation::Description description = R"(
+Allows writing the [`CASE`](/reference/operators#conditional-expression) operator more compactly in the query.
+Evaluates each condition in order. For the first condition that is true (non-zero and not `NULL`), returns the corresponding branch value.
+If none of the conditions are true, returns the `else` value.
+
+Setting [`short_circuit_function_evaluation`](/reference/settings/session-settings/short-circuit-function-evaluation#short_circuit_function_evaluation) controls
+whether short-circuit evaluation is used. If enabled, the `then_i` expression is evaluated only on rows where
+`((NOT cond_1) AND ... AND (NOT cond_{i-1}) AND cond_i)` is true.
+
+For example, with short-circuit evaluation, no division-by-zero exception is thrown when executing the following query:
+
+```sql
+SELECT multiIf(number = 2, intDiv(1, number), number = 5) FROM numbers(10)
+```
+
+All branch and else expressions must have a common supertype. `NULL` conditions are treated as false.
+    )";
+    FunctionDocumentation::Syntax syntax = R"(
+multiIf(cond_1, then_1, cond_2, then_2, ..., else)
+    )";
+    FunctionDocumentation::Arguments arguments = {
+        {"cond_N", "The N-th evaluated condition which controls if `then_N` is returned.", {"UInt8", "Nullable(UInt8)", "NULL"}},
+        {"then_N", "The result of the function when `cond_N` is true."},
+        {"else", "The result of the function if none of the conditions is true."}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the result of `then_N` for matching `cond_N`, otherwise returns the `else` condition."};
+    FunctionDocumentation::Examples examples = {
+        {"Example usage", R"(
+CREATE TABLE LEFT_RIGHT (left Nullable(UInt8), right Nullable(UInt8)) ENGINE = Memory;
+INSERT INTO LEFT_RIGHT VALUES (NULL, 4), (1, 3), (2, 2), (3, 1), (4, NULL);
+
+SELECT
+    left,
+    right,
+    multiIf(left < right, 'left is smaller', left > right, 'left is greater', left = right, 'Both equal', 'Null value') AS result
+FROM LEFT_RIGHT;
+    )",
+    R"(
+┌─left─┬─right─┬─result──────────┐
+│ ᴺᵁᴸᴸ │     4 │ Null value      │
+│    1 │     3 │ left is smaller │
+│    2 │     2 │ Both equal      │
+│    3 │     1 │ left is greater │
+│    4 │  ᴺᵁᴸᴸ │ Null value      │
+└──────┴───────┴─────────────────┘
+    )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Conditional;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionMultiIf>(documentation);
 
     /// These are obsolete function names.
-    factory.registerFunction<FunctionMultiIf>("caseWithoutExpr");
-    factory.registerFunction<FunctionMultiIf>("caseWithoutExpression");
+    factory.registerAlias("caseWithoutExpr", "multiIf");
+    factory.registerAlias("caseWithoutExpression", "multiIf");
 }
 
+FunctionOverloadResolverPtr createInternalMultiIfOverloadResolver(
+    bool allow_execute_multiif_columnar,
+    bool use_variant_as_common_type,
+    bool allow_lossy_numeric_supertype,
+    bool optimize_if_transform_const_strings_to_lowcardinality)
+{
+    return std::make_unique<FunctionToOverloadResolverAdaptor>(std::make_shared<FunctionMultiIf>(
+        allow_execute_multiif_columnar,
+        use_variant_as_common_type,
+        allow_lossy_numeric_supertype,
+        optimize_if_transform_const_strings_to_lowcardinality));
 }
-
-
+}

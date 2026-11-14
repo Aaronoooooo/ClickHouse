@@ -10,7 +10,6 @@
 namespace DB
 {
 
-
 /** To retrieve data directly from multiple replicas (connections) from one shard
   * within a single thread. As a degenerate case, it can also work with one connection.
   * It is assumed that all functions except sendCancel are always executed in one thread.
@@ -21,14 +20,12 @@ class MultiplexedConnections final : public IConnections
 {
 public:
     /// Accepts ready connection.
-    MultiplexedConnections(Connection & connection, const Settings & settings_, const ThrottlerPtr & throttler_);
+    MultiplexedConnections(Connection & connection, ContextPtr context_, const ThrottlerPtr & throttler_);
     /// Accepts ready connection and keep it alive before drain
-    MultiplexedConnections(std::shared_ptr<Connection> connection_, const Settings & settings_, const ThrottlerPtr & throttler_);
+    MultiplexedConnections(std::shared_ptr<Connection> connection_, ContextPtr context_, const ThrottlerPtr & throttler_);
 
     /// Accepts a vector of connections to replicas of one shard already taken from pool.
-    MultiplexedConnections(
-        std::vector<IConnectionPool::Entry> && connections,
-        const Settings & settings_, const ThrottlerPtr & throttler_);
+    MultiplexedConnections(std::vector<IConnectionPool::Entry> && connections, ContextPtr context_, const ThrottlerPtr & throttler_);
 
     void sendScalarsData(Scalars & data) override;
     void sendExternalTablesData(std::vector<ExternalTablesData> & data) override;
@@ -38,19 +35,23 @@ public:
         const String & query,
         const String & query_id,
         UInt64 stage,
-        const ClientInfo & client_info,
-        bool with_pending_data) override;
+        ClientInfo & client_info,
+        bool with_pending_data,
+        const std::vector<String> & external_roles) override;
 
-    void sendReadTaskResponse(const String &) override;
+    void sendQueryPlan(const QueryPlan & query_plan) override;
+
+    bool supportsQueryPlanSerializationVersion(UInt64 version) const override;
+
+    void sendClusterFunctionReadTaskResponse(const ClusterFunctionReadTaskResponse & response) override;
+    void sendMergeTreeReadTaskResponse(const ParallelReadResponse & response) override;
+    void sendMergeTreeAllRangesAnnouncementResponse(const InitialAllRangesAnnouncementResponse & response) override;
 
     Packet receivePacket() override;
 
     void disconnect() override;
 
     void sendCancel() override;
-
-    /// Send parts' uuids to replicas to exclude them from query processing
-    void sendIgnoredPartUUIDs(const std::vector<UUID> & uuids) override;
 
     Packet drain() override;
 
@@ -62,8 +63,16 @@ public:
     /// Without locking, because sendCancel() does not change the state of the replicas.
     bool hasActiveConnections() const override { return active_connection_count > 0; }
 
+    void setReplicaInfo(ReplicaInfo value) override { replica_info = value; }
+
+    void setDistributedFanout(size_t total_connections) override { distributed_fanout = total_connections; }
+
+    void setAsyncCallback(AsyncCallback async_callback) override;
+
 private:
-    Packet receivePacketUnlocked(AsyncCallback async_callback, bool is_draining) override;
+    Packet receivePacketUnlocked(AsyncCallback async_callback) override;
+
+    UInt64 receivePacketTypeUnlocked(AsyncCallback async_callback) override;
 
     /// Internal version of `dumpAddresses` function without locking.
     std::string dumpAddressesUnlocked() const;
@@ -76,17 +85,13 @@ private:
     };
 
     /// Get a replica where you can read the data.
-    ReplicaState & getReplicaForReading(bool is_draining);
+    ReplicaState & getReplicaForReading();
 
     /// Mark the replica as invalid.
     void invalidateReplica(ReplicaState & replica_state);
 
+    ContextPtr context;
     const Settings & settings;
-
-    /// The following two fields are from settings but can be referenced outside the lifetime of
-    /// settings when connection is drained asynchronously.
-    Poco::Timespan drain_timeout;
-    Poco::Timespan receive_timeout;
 
     /// The current number of valid connections to the replicas of this shard.
     size_t active_connection_count = 0;
@@ -102,8 +107,14 @@ private:
     bool sent_query = false;
     bool cancelled = false;
 
-    /// A mutex for the sendCancel function to execute safely
-    /// in separate thread.
+    /// std::nullopt if parallel reading from replicas is not used
+    std::optional<ReplicaInfo> replica_info;
+
+    /// Total number of remote connections across all shards in the distributed query.
+    /// Used to scale interactive_delay to reduce progress/profile event traffic.
+    size_t distributed_fanout = 0;
+
+    /// A mutex for the sendCancel function to execute safely in separate thread.
     mutable std::mutex cancel_mutex;
 
     friend struct RemoteQueryExecutorRoutine;

@@ -1,14 +1,16 @@
 #pragma once
 
-#include "config_core.h"
+#include "config.h"
 
 #include <Access/Credentials.h>
+#include <Common/Logger.h>
 #include <base/types.h>
 #include <memory>
 
 #if USE_KRB5
 #   include <gssapi/gssapi.h>
 #   include <gssapi/gssapi_ext.h>
+#   include <gssapi/gssapi_krb5.h>
 #   define MAYBE_NORETURN
 #else
 #   define MAYBE_NORETURN [[noreturn]]
@@ -19,6 +21,12 @@ namespace Poco { class Logger; }
 namespace DB
 {
 
+#if USE_KRB5
+/// Copy a GSS buffer into a String verbatim, preserving any trailing NUL bytes.
+/// Exposed for unit testing; see the definition for the rationale.
+String bufferToString(const gss_buffer_desc & buf);
+#endif
+
 class GSSAcceptorContext
     : public Credentials
 {
@@ -28,10 +36,11 @@ public:
         String mechanism = "1.2.840.113554.1.2.2"; // OID: krb5
         String principal;
         String realm;
+        String keytab;
     };
 
     explicit GSSAcceptorContext(const Params & params_);
-    virtual ~GSSAcceptorContext() override;
+    ~GSSAcceptorContext() override;
 
     GSSAcceptorContext(const GSSAcceptorContext &) = delete;
     GSSAcceptorContext(GSSAcceptorContext &&) = delete;
@@ -40,14 +49,13 @@ public:
 
     const String & getRealm() const;
     bool isFailed() const;
-    MAYBE_NORETURN String processToken(const String & input_token, Poco::Logger * log);
+    MAYBE_NORETURN String processToken(const String & input_token, LoggerPtr log);
 
 private:
     void reset();
     void resetHandles() noexcept;
     void initHandles();
 
-private:
     const Params params;
 
     bool is_failed = false;

@@ -30,27 +30,12 @@
 #  - zstd homepage : http://www.zstd.net/
 # ################################################################
 
-# Get library version based on information from input content (use regular exp)
-function(GetLibraryVersion _content _outputVar1 _outputVar2 _outputVar3)
-    string(REGEX MATCHALL ".*define ZSTD_VERSION_MAJOR+.* ([0-9]+).*define ZSTD_VERSION_MINOR+.* ([0-9]+).*define ZSTD_VERSION_RELEASE+.* ([0-9]+)" VERSION_REGEX "${_content}")
-    SET(${_outputVar1} ${CMAKE_MATCH_1} PARENT_SCOPE)
-    SET(${_outputVar2} ${CMAKE_MATCH_2} PARENT_SCOPE)
-    SET(${_outputVar3} ${CMAKE_MATCH_3} PARENT_SCOPE)
-endfunction()
-
 # Define library directory, where sources and header files are located
 SET(LIBRARY_DIR "${ClickHouse_SOURCE_DIR}/contrib/zstd/lib")
 INCLUDE_DIRECTORIES(BEFORE ${LIBRARY_DIR} "${LIBRARY_DIR}/common")
 
-# Read file content
-FILE(READ "${LIBRARY_DIR}/zstd.h" HEADER_CONTENT)
-
-# Parse version
-GetLibraryVersion("${HEADER_CONTENT}" LIBVER_MAJOR LIBVER_MINOR LIBVER_RELEASE)
-MESSAGE(STATUS "ZSTD VERSION ${LIBVER_MAJOR}.${LIBVER_MINOR}.${LIBVER_RELEASE}")
-
 # cd contrib/zstd/lib
-# find . -name '*.c' | grep -vP 'deprecated|legacy' | sort | sed 's/^\./        "${LIBRARY_DIR}/"'
+# find . -name '*.c' -or -name '*.S' | grep -vP 'deprecated|legacy' | sort | sed -e 's/^\./        \"\${LIBRARY_DIR\}/;s/$/"/'
 SET(Sources
         "${LIBRARY_DIR}/common/debug.c"
         "${LIBRARY_DIR}/common/entropy_common.c"
@@ -73,6 +58,8 @@ SET(Sources
         "${LIBRARY_DIR}/compress/zstd_ldm.c"
         "${LIBRARY_DIR}/compress/zstdmt_compress.c"
         "${LIBRARY_DIR}/compress/zstd_opt.c"
+        "${LIBRARY_DIR}/compress/zstd_preSplit.c"
+        "${LIBRARY_DIR}/decompress/huf_decompress_amd64.S"
         "${LIBRARY_DIR}/decompress/huf_decompress.c"
         "${LIBRARY_DIR}/decompress/zstd_ddict.c"
         "${LIBRARY_DIR}/decompress/zstd_decompress_block.c"
@@ -80,12 +67,16 @@ SET(Sources
         "${LIBRARY_DIR}/dictBuilder/cover.c"
         "${LIBRARY_DIR}/dictBuilder/divsufsort.c"
         "${LIBRARY_DIR}/dictBuilder/fastcover.c"
-        "${LIBRARY_DIR}/dictBuilder/zdict.c")
+        "${LIBRARY_DIR}/dictBuilder/zdict.c"
+)
 
 # cd contrib/zstd/lib
-# find . -name '*.h' | grep -vP 'deprecated|legacy' | sort | sed 's/^\./        "${LIBRARY_DIR}/"'
+# find . -name '*.h' | grep -vP 'deprecated|legacy' | sort | sed -e 's/^\./        \"\${LIBRARY_DIR\}/;s/$/"/'
 SET(Headers
+        "${LIBRARY_DIR}/common/allocations.h"
+        "${LIBRARY_DIR}/common/bits.h"
         "${LIBRARY_DIR}/common/bitstream.h"
+        "${LIBRARY_DIR}/common/bmi2.h"
         "${LIBRARY_DIR}/common/compiler.h"
         "${LIBRARY_DIR}/common/cpu.h"
         "${LIBRARY_DIR}/common/debug.h"
@@ -94,11 +85,13 @@ SET(Headers
         "${LIBRARY_DIR}/common/huf.h"
         "${LIBRARY_DIR}/common/mem.h"
         "${LIBRARY_DIR}/common/pool.h"
+        "${LIBRARY_DIR}/common/portability_macros.h"
         "${LIBRARY_DIR}/common/threading.h"
         "${LIBRARY_DIR}/common/xxhash.h"
         "${LIBRARY_DIR}/common/zstd_deps.h"
         "${LIBRARY_DIR}/common/zstd_internal.h"
         "${LIBRARY_DIR}/common/zstd_trace.h"
+        "${LIBRARY_DIR}/compress/clevels.h"
         "${LIBRARY_DIR}/compress/hist.h"
         "${LIBRARY_DIR}/compress/zstd_compress_internal.h"
         "${LIBRARY_DIR}/compress/zstd_compress_literals.h"
@@ -112,6 +105,7 @@ SET(Headers
         "${LIBRARY_DIR}/compress/zstd_ldm.h"
         "${LIBRARY_DIR}/compress/zstdmt_compress.h"
         "${LIBRARY_DIR}/compress/zstd_opt.h"
+        "${LIBRARY_DIR}/compress/zstd_preSplit.h"
         "${LIBRARY_DIR}/decompress/zstd_ddict.h"
         "${LIBRARY_DIR}/decompress/zstd_decompress_block.h"
         "${LIBRARY_DIR}/decompress/zstd_decompress_internal.h"
@@ -119,7 +113,8 @@ SET(Headers
         "${LIBRARY_DIR}/dictBuilder/divsufsort.h"
         "${LIBRARY_DIR}/zdict.h"
         "${LIBRARY_DIR}/zstd_errors.h"
-        "${LIBRARY_DIR}/zstd.h")
+        "${LIBRARY_DIR}/zstd.h"
+)
 
 SET(ZSTD_LEGACY_SUPPORT true)
 
@@ -148,7 +143,7 @@ IF (ZSTD_LEGACY_SUPPORT)
             "${LIBRARY_LEGACY_DIR}/zstd_v07.h")
 ENDIF (ZSTD_LEGACY_SUPPORT)
 
-ADD_LIBRARY(zstd ${Sources} ${Headers})
-
-target_include_directories (zstd PUBLIC ${LIBRARY_DIR})
-target_compile_options(zstd PRIVATE -fno-sanitize=undefined)
+add_library(_zstd ${Sources} ${Headers})
+add_library(ch_contrib::zstd ALIAS _zstd)
+target_include_directories(_zstd BEFORE PUBLIC ${LIBRARY_DIR})
+target_compile_options(_zstd PRIVATE -fno-sanitize=undefined)

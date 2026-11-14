@@ -1,14 +1,22 @@
 #include <Poco/UTF8Encoding.h>
 #include <IO/WriteBufferValidUTF8.h>
+#include <IO/writeValidUTF8.h>
 #include <base/types.h>
-
-#ifdef __SSE2__
-    #include <emmintrin.h>
-#endif
-
+#include <Common/Exception.h>
+#include <Common/FailPoint.h>
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int FAULT_INJECTED;
+}
+
+namespace FailPoints
+{
+    extern const char write_buffer_valid_utf8_finalize_throw[];
+}
 
 const size_t WriteBufferValidUTF8::DEFAULT_SIZE = 4096;
 
@@ -49,7 +57,7 @@ inline void WriteBufferValidUTF8::putReplacement()
 }
 
 
-inline void WriteBufferValidUTF8::putValid(char *data, size_t len)
+inline void WriteBufferValidUTF8::putValid(const char *data, size_t len)
 {
     if (len == 0)
         return;
@@ -61,24 +69,17 @@ inline void WriteBufferValidUTF8::putValid(char *data, size_t len)
 
 void WriteBufferValidUTF8::nextImpl()
 {
-    char * p = memory.data();
-    char * valid_start = p;
+    const char * p = memory.data();
+    const char * valid_start = p;
 
     while (p < pos)
     {
-#ifdef __SSE2__
         /// Fast skip of ASCII
-        static constexpr size_t SIMD_BYTES = 16;
-        const char * simd_end = p + (pos - p) / SIMD_BYTES * SIMD_BYTES;
-
-        while (p < simd_end && !_mm_movemask_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p))))
-            p += SIMD_BYTES;
-
+        p = skipASCIIBlocks(p, pos);
         if (!(p < pos))
             break;
-#endif
 
-        size_t len = length_of_utf8_sequence[static_cast<unsigned char>(*p)];
+        UInt8 len = length_of_utf8_sequence[static_cast<unsigned char>(*p)];
 
         if (len > 4)
         { // NOLINT
@@ -93,7 +94,7 @@ void WriteBufferValidUTF8::nextImpl()
             /// Sequence was not fully written to this buffer.
             break;
         }
-        else if (Poco::UTF8Encoding::isLegal(reinterpret_cast<unsigned char *>(p), len))
+        else if (Poco::UTF8Encoding::isLegal(reinterpret_cast<const unsigned char *>(p), len))
         {
             /// Valid sequence.
             p += len;
@@ -117,24 +118,66 @@ void WriteBufferValidUTF8::nextImpl()
         memory[i] = p[i];
 
     working_buffer = Buffer(&memory[cnt], memory.data() + memory.size());
-
-    /// Propagate next() to the output buffer
-    output_buffer.next();
 }
 
 WriteBufferValidUTF8::~WriteBufferValidUTF8()
 {
-    finalize();
+    if (!canceled)
+    {
+        try
+        {
+            finalize();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(__PRETTY_FUNCTION__);
+        }
+    }
 }
 
 void WriteBufferValidUTF8::finalizeImpl()
 {
+    /// Test-only: emulate the destination buffer failing while the last buffered bytes of a string are
+    /// being flushed. The destructor of this class suppresses such a failure, so callers that write
+    /// into a live response stream have to flush explicitly - see
+    /// `IFramingFormat::writeJSONStringValidUTF8`.
+    fiu_do_on(FailPoints::write_buffer_valid_utf8_finalize_throw,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault while flushing a UTF-8 validating buffer");
+    });
+
     /// Write all complete sequences from buffer.
     nextImpl();
 
-    /// If unfinished sequence at end, then write replacement.
+    /// Handle remaining bytes if we have an incomplete sequence
     if (working_buffer.begin() != memory.data())
-        putReplacement();
+    {
+        const char * p = memory.data();
+        const char * end = working_buffer.begin();
+
+        while (p < end)
+        {
+            UInt8 len = length_of_utf8_sequence[static_cast<const unsigned char>(*p)];
+            if (p + len > end)
+            {
+                /// Incomplete sequence. Skip one byte.
+                putReplacement();
+                ++p;
+            }
+            else if (Poco::UTF8Encoding::isLegal(reinterpret_cast<const unsigned char *>(p), len))
+            {
+                /// Valid sequence
+                putValid(p, len);
+                p += len;
+            }
+            else
+            {
+                /// Invalid sequence, skip first byte.
+                putReplacement();
+                ++p;
+            }
+        }
+    }
 }
 
 }

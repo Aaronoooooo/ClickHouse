@@ -1,6 +1,16 @@
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <iterator>
+#include <map>
+#include <optional>
+#include <ranges>
+#include <utility>
+#if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
+#include <Common/CurrentThread.h>
+#endif
 #include <Common/ErrorCodes.h>
 #include <Common/Exception.h>
-#include <chrono>
 
 /** Previously, these constants were located in one enum.
   * But in this case there is a problem: when you add a new constant, you need to recompile
@@ -11,9 +21,16 @@
   * Later it was converted to the lookup table, to provide:
   * - errorCodeToName()
   * - system.errors table
+  *
+  * The list below is flat: every error code is written out explicitly, and the codes are not required to be
+  * contiguous - the registry keeps a counter only for the codes that are actually declared. The gaps are an
+  * artifact of the history of the list, they are NOT a feature to build upon: do not introduce "blocks" of
+  * error codes reserved per component (`FOO_BASE + 1`, `FOO_BASE + 2`, ...). Such a design makes errors that
+  * belong to several components duplicated under different names, and makes one block overflow into another.
+  * A new error code should simply take the next free value.
   */
 
-#define APPLY_FOR_ERROR_CODES(M) \
+#define APPLY_FOR_BUILTIN_ERROR_CODES(M) \
     M(0, OK) \
     M(1, UNSUPPORTED_METHOD) \
     M(2, UNSUPPORTED_PARAMETER) \
@@ -29,21 +46,14 @@
     M(13, SIZES_OF_COLUMNS_IN_TUPLE_DOESNT_MATCH) \
     M(15, DUPLICATE_COLUMN) \
     M(16, NO_SUCH_COLUMN_IN_TABLE) \
-    M(17, DELIMITER_IN_STRING_LITERAL_DOESNT_MATCH) \
-    M(18, CANNOT_INSERT_ELEMENT_INTO_CONSTANT_COLUMN) \
     M(19, SIZE_OF_FIXED_STRING_DOESNT_MATCH) \
     M(20, NUMBER_OF_COLUMNS_DOESNT_MATCH) \
-    M(21, CANNOT_READ_ALL_DATA_FROM_TAB_SEPARATED_INPUT) \
-    M(22, CANNOT_PARSE_ALL_VALUE_FROM_TAB_SEPARATED_INPUT) \
     M(23, CANNOT_READ_FROM_ISTREAM) \
     M(24, CANNOT_WRITE_TO_OSTREAM) \
     M(25, CANNOT_PARSE_ESCAPE_SEQUENCE) \
     M(26, CANNOT_PARSE_QUOTED_STRING) \
     M(27, CANNOT_PARSE_INPUT_ASSERTION_FAILED) \
     M(28, CANNOT_PRINT_FLOAT_OR_DOUBLE_NUMBER) \
-    M(29, CANNOT_PRINT_INTEGER) \
-    M(30, CANNOT_READ_SIZE_OF_COMPRESSED_CHUNK) \
-    M(31, CANNOT_READ_COMPRESSED_CHUNK) \
     M(32, ATTEMPT_TO_READ_AFTER_EOF) \
     M(33, CANNOT_READ_ALL_DATA) \
     M(34, TOO_MANY_ARGUMENTS_FOR_FUNCTION) \
@@ -57,7 +67,6 @@
     M(42, NUMBER_OF_ARGUMENTS_DOESNT_MATCH) \
     M(43, ILLEGAL_TYPE_OF_ARGUMENT) \
     M(44, ILLEGAL_COLUMN) \
-    M(45, ILLEGAL_NUMBER_OF_RESULT_COLUMNS) \
     M(46, UNKNOWN_FUNCTION) \
     M(47, UNKNOWN_IDENTIFIER) \
     M(48, NOT_IMPLEMENTED) \
@@ -66,20 +75,14 @@
     M(51, EMPTY_LIST_OF_COLUMNS_QUERIED) \
     M(52, COLUMN_QUERIED_MORE_THAN_ONCE) \
     M(53, TYPE_MISMATCH) \
-    M(54, STORAGE_DOESNT_ALLOW_PARAMETERS) \
     M(55, STORAGE_REQUIRES_PARAMETER) \
     M(56, UNKNOWN_STORAGE) \
     M(57, TABLE_ALREADY_EXISTS) \
     M(58, TABLE_METADATA_ALREADY_EXISTS) \
     M(59, ILLEGAL_TYPE_OF_COLUMN_FOR_FILTER) \
     M(60, UNKNOWN_TABLE) \
-    M(61, ONLY_FILTER_COLUMN_IN_BLOCK) \
     M(62, SYNTAX_ERROR) \
     M(63, UNKNOWN_AGGREGATE_FUNCTION) \
-    M(64, CANNOT_READ_AGGREGATE_FUNCTION_FROM_TEXT) \
-    M(65, CANNOT_WRITE_AGGREGATE_FUNCTION_AS_TEXT) \
-    M(66, NOT_A_COLUMN) \
-    M(67, ILLEGAL_KEY_OF_AGGREGATION) \
     M(68, CANNOT_GET_SIZE_OF_FIELD) \
     M(69, ARGUMENT_OUT_OF_BOUND) \
     M(70, CANNOT_CONVERT_TYPE) \
@@ -109,16 +112,11 @@
     M(94, CANNOT_MERGE_DIFFERENT_AGGREGATED_DATA_VARIANTS) \
     M(95, CANNOT_READ_FROM_SOCKET) \
     M(96, CANNOT_WRITE_TO_SOCKET) \
-    M(97, CANNOT_READ_ALL_DATA_FROM_CHUNKED_INPUT) \
-    M(98, CANNOT_WRITE_TO_EMPTY_BLOCK_OUTPUT_STREAM) \
     M(99, UNKNOWN_PACKET_FROM_CLIENT) \
     M(100, UNKNOWN_PACKET_FROM_SERVER) \
     M(101, UNEXPECTED_PACKET_FROM_CLIENT) \
     M(102, UNEXPECTED_PACKET_FROM_SERVER) \
-    M(103, RECEIVED_DATA_FOR_WRONG_QUERY_ID) \
     M(104, TOO_SMALL_BUFFER_SIZE) \
-    M(105, CANNOT_READ_HISTORY) \
-    M(106, CANNOT_APPEND_HISTORY) \
     M(107, FILE_DOESNT_EXIST) \
     M(108, NO_DATA_TO_INSERT) \
     M(109, CANNOT_BLOCK_SIGNAL) \
@@ -137,7 +135,6 @@
     M(123, UNKNOWN_TYPE_OF_AST_NODE) \
     M(124, INCORRECT_ELEMENT_OF_SET) \
     M(125, INCORRECT_RESULT_OF_SCALAR_SUBQUERY) \
-    M(126, CANNOT_GET_RETURN_TYPE) \
     M(127, ILLEGAL_INDEX) \
     M(128, TOO_LARGE_ARRAY_SIZE) \
     M(129, FUNCTION_IS_SPECIAL) \
@@ -149,30 +146,17 @@
     M(137, UNKNOWN_ELEMENT_IN_CONFIG) \
     M(138, EXCESSIVE_ELEMENT_IN_CONFIG) \
     M(139, NO_ELEMENTS_IN_CONFIG) \
-    M(140, ALL_REQUESTED_COLUMNS_ARE_MISSING) \
     M(141, SAMPLING_NOT_SUPPORTED) \
     M(142, NOT_FOUND_NODE) \
-    M(143, FOUND_MORE_THAN_ONE_NODE) \
-    M(144, FIRST_DATE_IS_BIGGER_THAN_LAST_DATE) \
     M(145, UNKNOWN_OVERFLOW_MODE) \
-    M(146, QUERY_SECTION_DOESNT_MAKE_SENSE) \
-    M(147, NOT_FOUND_FUNCTION_ELEMENT_FOR_AGGREGATE) \
-    M(148, NOT_FOUND_RELATION_ELEMENT_FOR_CONDITION) \
-    M(149, NOT_FOUND_RHS_ELEMENT_FOR_CONDITION) \
-    M(150, EMPTY_LIST_OF_ATTRIBUTES_PASSED) \
-    M(151, INDEX_OF_COLUMN_IN_SORT_CLAUSE_IS_OUT_OF_RANGE) \
     M(152, UNKNOWN_DIRECTION_OF_SORTING) \
     M(153, ILLEGAL_DIVISION) \
-    M(154, AGGREGATE_FUNCTION_NOT_APPLICABLE) \
-    M(155, UNKNOWN_RELATION) \
     M(156, DICTIONARIES_WAS_NOT_LOADED) \
-    M(157, ILLEGAL_OVERFLOW_MODE) \
     M(158, TOO_MANY_ROWS) \
     M(159, TIMEOUT_EXCEEDED) \
     M(160, TOO_SLOW) \
     M(161, TOO_MANY_COLUMNS) \
     M(162, TOO_DEEP_SUBQUERIES) \
-    M(163, TOO_DEEP_PIPELINE) \
     M(164, READONLY) \
     M(165, TOO_MANY_TEMPORARY_COLUMNS) \
     M(166, TOO_MANY_TEMPORARY_NON_CONST_COLUMNS) \
@@ -183,36 +167,27 @@
     M(172, CANNOT_CREATE_DIRECTORY) \
     M(173, CANNOT_ALLOCATE_MEMORY) \
     M(174, CYCLIC_ALIASES) \
-    M(176, CHUNK_NOT_FOUND) \
-    M(177, DUPLICATE_CHUNK_NAME) \
-    M(178, MULTIPLE_ALIASES_FOR_EXPRESSION) \
     M(179, MULTIPLE_EXPRESSIONS_FOR_ALIAS) \
     M(180, THERE_IS_NO_PROFILE) \
     M(181, ILLEGAL_FINAL) \
     M(182, ILLEGAL_PREWHERE) \
     M(183, UNEXPECTED_EXPRESSION) \
     M(184, ILLEGAL_AGGREGATION) \
-    M(185, UNSUPPORTED_MYISAM_BLOCK_TYPE) \
     M(186, UNSUPPORTED_COLLATION_LOCALE) \
     M(187, COLLATION_COMPARISON_FAILED) \
-    M(188, UNKNOWN_ACTION) \
-    M(189, TABLE_MUST_NOT_BE_CREATED_MANUALLY) \
-    M(190, SIZES_OF_ARRAYS_DOESNT_MATCH) \
+    M(190, SIZES_OF_ARRAYS_DONT_MATCH) \
     M(191, SET_SIZE_LIMIT_EXCEEDED) \
     M(192, UNKNOWN_USER) \
     M(193, WRONG_PASSWORD) \
     M(194, REQUIRED_PASSWORD) \
     M(195, IP_ADDRESS_NOT_ALLOWED) \
     M(196, UNKNOWN_ADDRESS_PATTERN_TYPE) \
-    M(197, SERVER_REVISION_IS_TOO_OLD) \
     M(198, DNS_ERROR) \
     M(199, UNKNOWN_QUOTA) \
-    M(200, QUOTA_DOESNT_ALLOW_KEYS) \
-    M(201, QUOTA_EXPIRED) \
+    M(201, QUOTA_EXCEEDED) \
     M(202, TOO_MANY_SIMULTANEOUS_QUERIES) \
     M(203, NO_FREE_CONNECTION) \
     M(204, CANNOT_FSYNC) \
-    M(205, NESTED_TYPE_TOO_DEEP) \
     M(206, ALIAS_REQUIRED) \
     M(207, AMBIGUOUS_IDENTIFIER) \
     M(208, EMPTY_NESTED_TABLE) \
@@ -229,7 +204,6 @@
     M(219, DATABASE_NOT_EMPTY) \
     M(220, DUPLICATE_INTERSERVER_IO_ENDPOINT) \
     M(221, NO_SUCH_INTERSERVER_IO_ENDPOINT) \
-    M(222, ADDING_REPLICA_TO_NON_EMPTY_TABLE) \
     M(223, UNEXPECTED_AST_STRUCTURE) \
     M(224, REPLICA_IS_ALREADY_ACTIVE) \
     M(225, NO_ZOOKEEPER) \
@@ -253,12 +227,10 @@
     M(243, NOT_ENOUGH_SPACE) \
     M(244, UNEXPECTED_ZOOKEEPER_ERROR) \
     M(246, CORRUPTED_DATA) \
-    M(247, INCORRECT_MARK) \
     M(248, INVALID_PARTITION_VALUE) \
-    M(250, NOT_ENOUGH_BLOCK_NUMBERS) \
     M(251, NO_SUCH_REPLICA) \
     M(252, TOO_MANY_PARTS) \
-    M(253, REPLICA_IS_ALREADY_EXIST) \
+    M(253, REPLICA_ALREADY_EXISTS) \
     M(254, NO_ACTIVE_REPLICAS) \
     M(255, TOO_MANY_RETRIES_TO_FETCH_PARTS) \
     M(256, PARTITION_ALREADY_EXISTS) \
@@ -271,8 +243,6 @@
     M(264, INCOMPATIBLE_TYPE_OF_JOIN) \
     M(265, NO_AVAILABLE_REPLICA) \
     M(266, MISMATCH_REPLICAS_DATA_SOURCES) \
-    M(267, STORAGE_DOESNT_SUPPORT_PARALLEL_REPLICAS) \
-    M(268, CPUID_ERROR) \
     M(269, INFINITE_LOOP) \
     M(270, CANNOT_COMPRESS) \
     M(271, CANNOT_DECOMPRESS) \
@@ -295,9 +265,8 @@
     M(290, LIMIT_EXCEEDED) \
     M(291, DATABASE_ACCESS_DENIED) \
     M(293, MONGODB_CANNOT_AUTHENTICATE) \
-    M(294, INVALID_BLOCK_EXTRA_INFO) \
+    M(294, CANNOT_WRITE_TO_FILE) \
     M(295, RECEIVED_EMPTY_DATA) \
-    M(296, NO_REMOTE_SHARD_FOUND) \
     M(297, SHARD_HAS_NO_CONNECTIONS) \
     M(298, CANNOT_PIPE) \
     M(299, CANNOT_FORK) \
@@ -311,13 +280,10 @@
     M(307, TOO_MANY_BYTES) \
     M(308, UNEXPECTED_NODE_IN_ZOOKEEPER) \
     M(309, FUNCTION_CANNOT_HAVE_PARAMETERS) \
-    M(317, INVALID_SHARD_WEIGHT) \
     M(318, INVALID_CONFIG_PARAMETER) \
     M(319, UNKNOWN_STATUS_OF_INSERT) \
     M(321, VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE) \
-    M(335, BARRIER_TIMEOUT) \
     M(336, UNKNOWN_DATABASE_ENGINE) \
-    M(337, DDL_GUARD_IS_ACTIVE) \
     M(341, UNFINISHED) \
     M(342, METADATA_MISMATCH) \
     M(344, SUPPORT_IS_DISABLED) \
@@ -325,14 +291,10 @@
     M(346, CANNOT_CONVERT_CHARSET) \
     M(347, CANNOT_LOAD_CONFIG) \
     M(349, CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN) \
-    M(350, INCOMPATIBLE_SOURCE_TABLES) \
-    M(351, AMBIGUOUS_TABLE_NAME) \
     M(352, AMBIGUOUS_COLUMN_NAME) \
     M(353, INDEX_OF_POSITIONAL_ARGUMENT_IS_OUT_OF_RANGE) \
     M(354, ZLIB_INFLATE_FAILED) \
     M(355, ZLIB_DEFLATE_FAILED) \
-    M(356, BAD_LAMBDA) \
-    M(357, RESERVED_IDENTIFIER_NAME) \
     M(358, INTO_OUTFILE_NOT_ALLOWED) \
     M(359, TABLE_SIZE_EXCEEDS_MAX_DROP_SIZE_LIMIT) \
     M(360, CANNOT_CREATE_CHARSET_CONVERTER) \
@@ -341,7 +303,6 @@
     M(363, CANNOT_CREATE_IO_BUFFER) \
     M(364, RECEIVED_ERROR_TOO_MANY_REQUESTS) \
     M(366, SIZES_OF_NESTED_COLUMNS_ARE_INCONSISTENT) \
-    M(367, TOO_MANY_FETCHES) \
     M(369, ALL_REPLICAS_ARE_STALE) \
     M(370, DATA_TYPE_CANNOT_BE_USED_IN_TABLES) \
     M(371, INCONSISTENT_CLUSTER_DEFINITION) \
@@ -352,7 +313,6 @@
     M(376, CANNOT_PARSE_UUID) \
     M(377, ILLEGAL_SYNTAX_FOR_DATA_TYPE) \
     M(378, DATA_TYPE_CANNOT_HAVE_ARGUMENTS) \
-    M(379, UNKNOWN_STATUS_OF_DISTRIBUTED_DDL_TASK) \
     M(380, CANNOT_KILL) \
     M(381, HTTP_LENGTH_REQUIRED) \
     M(382, CANNOT_LOAD_CATBOOST_MODEL) \
@@ -378,11 +338,9 @@
     M(402, CANNOT_IOSETUP) \
     M(403, INVALID_JOIN_ON_EXPRESSION) \
     M(404, BAD_ODBC_CONNECTION_STRING) \
-    M(405, PARTITION_SIZE_EXCEEDS_MAX_DROP_SIZE_LIMIT) \
     M(406, TOP_AND_LIMIT_TOGETHER) \
     M(407, DECIMAL_OVERFLOW) \
     M(408, BAD_REQUEST_PARAMETER) \
-    M(409, EXTERNAL_EXECUTABLE_NOT_FOUND) \
     M(410, EXTERNAL_SERVER_IS_NOT_RESPONDING) \
     M(411, PTHREAD_ERROR) \
     M(412, NETLINK_ERROR) \
@@ -399,7 +357,6 @@
     M(424, CANNOT_LINK) \
     M(425, SYSTEM_ERROR) \
     M(427, CANNOT_COMPILE_REGEXP) \
-    M(428, UNKNOWN_LOG_LEVEL) \
     M(429, FAILED_TO_GETPWUID) \
     M(430, MISMATCHING_USERS_FOR_PROCESS_AND_DATA) \
     M(431, ILLEGAL_SYNTAX_FOR_CODEC_TYPE) \
@@ -433,7 +390,6 @@
     M(459, CANNOT_SET_THREAD_PRIORITY) \
     M(460, CANNOT_CREATE_TIMER) \
     M(461, CANNOT_SET_TIMER_PERIOD) \
-    M(462, CANNOT_DELETE_TIMER) \
     M(463, CANNOT_FCNTL) \
     M(464, CANNOT_PARSE_ELF) \
     M(465, CANNOT_PARSE_DWARF) \
@@ -441,7 +397,6 @@
     M(467, CANNOT_PARSE_BOOL) \
     M(468, CANNOT_PTHREAD_ATTR) \
     M(469, VIOLATED_CONSTRAINT) \
-    M(470, QUERY_IS_NOT_SUPPORTED_IN_LIVE_VIEW) \
     M(471, INVALID_SETTING_VALUE) \
     M(472, READONLY_SETTING) \
     M(473, DEADLOCK_AVOIDED) \
@@ -456,26 +411,22 @@
     M(482, DICTIONARY_ACCESS_DENIED) \
     M(483, TOO_MANY_REDIRECTS) \
     M(484, INTERNAL_REDIS_ERROR) \
-    M(485, SCALAR_ALREADY_EXISTS) \
     M(487, CANNOT_GET_CREATE_DICTIONARY_QUERY) \
-    M(488, UNKNOWN_DICTIONARY) \
     M(489, INCORRECT_DICTIONARY_DEFINITION) \
     M(490, CANNOT_FORMAT_DATETIME) \
     M(491, UNACCEPTABLE_URL) \
     M(492, ACCESS_ENTITY_NOT_FOUND) \
     M(493, ACCESS_ENTITY_ALREADY_EXISTS) \
-    M(494, ACCESS_ENTITY_FOUND_DUPLICATES) \
     M(495, ACCESS_STORAGE_READONLY) \
     M(496, QUOTA_REQUIRES_CLIENT_KEY) \
     M(497, ACCESS_DENIED) \
     M(498, LIMIT_BY_WITH_TIES_IS_NOT_SUPPORTED) \
     M(499, S3_ERROR) \
+    M(500, AZURE_BLOB_STORAGE_ERROR) \
     M(501, CANNOT_CREATE_DATABASE) \
     M(502, CANNOT_SIGQUEUE) \
     M(503, AGGREGATE_FUNCTION_THROW) \
     M(504, FILE_ALREADY_EXISTS) \
-    M(505, CANNOT_DELETE_DIRECTORY) \
-    M(506, UNEXPECTED_ERROR_CODE) \
     M(507, UNABLE_TO_SKIP_UNUSED_SHARDS) \
     M(508, UNKNOWN_ACCESS_TYPE) \
     M(509, INVALID_GRANT) \
@@ -500,8 +451,6 @@
     M(530, CANNOT_CONNECT_RABBITMQ) \
     M(531, CANNOT_FSTAT) \
     M(532, LDAP_ERROR) \
-    M(533, INCONSISTENT_RESERVATIONS) \
-    M(534, NO_RESERVATIONS_PROVIDED) \
     M(535, UNKNOWN_RAID_TYPE) \
     M(536, CANNOT_RESTORE_FROM_FIELD_DUMP) \
     M(537, ILLEGAL_MYSQL_VARIABLE) \
@@ -517,13 +466,11 @@
     M(547, INVALID_RAID_TYPE) \
     M(548, UNKNOWN_VOLUME) \
     M(549, DATA_TYPE_CANNOT_BE_USED_IN_KEY) \
-    M(550, CONDITIONAL_TREE_PARENT_NOT_FOUND) \
-    M(551, ILLEGAL_PROJECTION_MANIPULATOR) \
     M(552, UNRECOGNIZED_ARGUMENTS) \
     M(553, LZMA_STREAM_ENCODER_FAILED) \
     M(554, LZMA_STREAM_DECODER_FAILED) \
     M(555, ROCKSDB_ERROR) \
-    M(556, SYNC_MYSQL_USER_ACCESS_ERROR)\
+    M(556, SYNC_MYSQL_USER_ACCESS_ERROR) \
     M(557, UNKNOWN_UNION) \
     M(558, EXPECTED_ALL_OR_DISTINCT) \
     M(559, INVALID_GRPC_QUERY_INFO) \
@@ -574,13 +521,11 @@
     M(604, BACKUP_ENTRY_ALREADY_EXISTS) \
     M(605, BACKUP_ENTRY_NOT_FOUND) \
     M(606, BACKUP_IS_EMPTY) \
-    M(607, BACKUP_ELEMENT_DUPLICATE) \
+    M(607, CANNOT_RESTORE_DATABASE) \
     M(608, CANNOT_RESTORE_TABLE) \
     M(609, FUNCTION_ALREADY_EXISTS) \
     M(610, CANNOT_DROP_FUNCTION) \
     M(611, CANNOT_CREATE_RECURSIVE_FUNCTION) \
-    M(612, OBJECT_ALREADY_STORED_ON_DISK) \
-    M(613, OBJECT_WAS_NOT_STORED_ON_DISK) \
     M(614, POSTGRESQL_CONNECTION_FAILURE) \
     M(615, CANNOT_ADVISE) \
     M(616, UNKNOWN_READ_METHOD) \
@@ -598,90 +543,411 @@
     M(628, OFFSET_FETCH_WITHOUT_ORDER_BY) \
     M(629, HTTP_RANGE_NOT_SATISFIABLE) \
     M(630, HAVE_DEPENDENT_OBJECTS) \
-    \
+    M(631, UNKNOWN_FILE_SIZE) \
+    M(632, UNEXPECTED_DATA_AFTER_PARSED_VALUE) \
+    M(634, MONGODB_ERROR) \
+    M(635, CANNOT_POLL) \
+    M(636, CANNOT_EXTRACT_TABLE_STRUCTURE) \
+    M(637, INVALID_TABLE_OVERRIDE) \
+    M(638, SNAPPY_UNCOMPRESS_FAILED) \
+    M(639, SNAPPY_COMPRESS_FAILED) \
+    M(640, NO_HIVEMETASTORE) \
+    M(641, CANNOT_APPEND_TO_FILE) \
+    M(642, CANNOT_PACK_ARCHIVE) \
+    M(643, CANNOT_UNPACK_ARCHIVE) \
+    M(645, NUMBER_OF_DIMENSIONS_MISMATCHED) \
+    M(647, CANNOT_BACKUP_TABLE) \
+    M(648, WRONG_DDL_RENAMING_SETTINGS) \
+    M(649, INVALID_TRANSACTION) \
+    M(650, SERIALIZATION_ERROR) \
+    M(651, CAPN_PROTO_BAD_TYPE) \
+    M(652, ONLY_NULLS_WHILE_READING_SCHEMA) \
+    M(653, CANNOT_PARSE_BACKUP_SETTINGS) \
+    M(654, WRONG_BACKUP_SETTINGS) \
+    M(655, FAILED_TO_SYNC_BACKUP_OR_RESTORE) \
+    M(659, UNKNOWN_STATUS_OF_TRANSACTION) \
+    M(660, HDFS_ERROR) \
+    M(661, CANNOT_SEND_SIGNAL) \
+    M(662, FS_METADATA_ERROR) \
+    M(663, INCONSISTENT_METADATA_FOR_BACKUP) \
+    M(664, ACCESS_STORAGE_DOESNT_ALLOW_BACKUP) \
+    M(665, CANNOT_CONNECT_NATS) \
+    M(667, NOT_INITIALIZED) \
+    M(668, INVALID_STATE) \
+    M(669, NAMED_COLLECTION_DOESNT_EXIST) \
+    M(670, NAMED_COLLECTION_ALREADY_EXISTS) \
+    M(671, NAMED_COLLECTION_IS_IMMUTABLE) \
+    M(672, INVALID_SCHEDULER_NODE) \
+    M(673, RESOURCE_ACCESS_DENIED) \
+    M(674, RESOURCE_NOT_FOUND) \
+    M(675, CANNOT_PARSE_IPV4) \
+    M(676, CANNOT_PARSE_IPV6) \
+    M(677, THREAD_WAS_CANCELED) \
+    M(678, IO_URING_INIT_FAILED) \
+    M(679, IO_URING_SUBMIT_ERROR) \
+    M(690, MIXED_ACCESS_PARAMETER_TYPES) \
+    M(691, UNKNOWN_ELEMENT_OF_ENUM) \
+    M(692, TOO_MANY_MUTATIONS) \
+    M(693, AWS_ERROR) \
+    M(694, ASYNC_LOAD_CYCLE) \
+    M(695, ASYNC_LOAD_FAILED) \
+    M(696, ASYNC_LOAD_CANCELED) \
+    M(697, CANNOT_RESTORE_TO_NONENCRYPTED_DISK) \
+    M(698, INVALID_REDIS_STORAGE_TYPE) \
+    M(699, INVALID_REDIS_TABLE_STRUCTURE) \
+    M(700, USER_SESSION_LIMIT_EXCEEDED) \
+    M(701, CLUSTER_DOESNT_EXIST) \
+    M(702, CLIENT_INFO_DOES_NOT_MATCH) \
+    M(703, INVALID_IDENTIFIER) \
+    M(704, QUERY_CACHE_USED_WITH_NONDETERMINISTIC_FUNCTIONS) \
+    M(705, TABLE_NOT_EMPTY) \
+    M(706, LIBSSH_ERROR) \
+    M(707, GCP_ERROR) \
+    M(708, ILLEGAL_STATISTICS) \
+    M(709, CANNOT_GET_REPLICATED_DATABASE_SNAPSHOT) \
+    M(710, FAULT_INJECTED) \
+    M(711, FILECACHE_ACCESS_DENIED) \
+    M(712, TOO_MANY_MATERIALIZED_VIEWS) \
+    M(713, BROKEN_PROJECTION) \
+    M(714, UNEXPECTED_CLUSTER) \
+    M(715, CANNOT_DETECT_FORMAT) \
+    M(716, CANNOT_FORGET_PARTITION) \
+    M(717, EXPERIMENTAL_FEATURE_ERROR) \
+    M(718, TOO_SLOW_PARSING) \
+    M(719, QUERY_CACHE_USED_WITH_SYSTEM_TABLE) \
+    M(720, USER_EXPIRED) \
+    M(721, DEPRECATED_FUNCTION) \
+    M(722, ASYNC_LOAD_WAIT_FAILED) \
+    M(723, PARQUET_EXCEPTION) \
+    M(724, TOO_MANY_TABLES) \
+    M(725, TOO_MANY_DATABASES) \
+    M(726, UNEXPECTED_HTTP_HEADERS) \
+    M(727, UNEXPECTED_TABLE_ENGINE) \
+    M(728, UNEXPECTED_DATA_TYPE) \
+    M(729, ILLEGAL_TIME_SERIES_TAGS) \
+    M(730, REFRESH_FAILED) \
+    M(731, QUERY_CACHE_USED_WITH_NON_THROW_OVERFLOW_MODE) \
+    M(733, TABLE_IS_BEING_RESTARTED) \
+    M(734, CANNOT_WRITE_AFTER_BUFFER_CANCELED) \
+    M(735, QUERY_WAS_CANCELLED_BY_CLIENT) \
+    M(736, DATALAKE_DATABASE_ERROR) \
+    M(737, GOOGLE_CLOUD_ERROR) \
+    M(738, PART_IS_LOCKED) \
+    M(739, BUZZHOUSE) \
+    M(740, POTENTIALLY_BROKEN_DATA_PART) \
+    M(741, TABLE_UUID_MISMATCH) \
+    M(742, DELTA_KERNEL_ERROR) \
+    M(743, ICEBERG_SPECIFICATION_VIOLATION) \
+    M(744, SESSION_ID_EMPTY) \
+    M(745, SERVER_OVERLOADED) \
+    M(746, DEPENDENCIES_NOT_FOUND) \
+    M(747, FILECACHE_CANNOT_WRITE_THROUGH_CACHE_WITH_CONCURRENT_READS) /* private error code */ \
+    M(748, AVRO_EXCEPTION) \
+    M(749, TCP_CONNECTION_LIMIT_REACHED) \
+    M(750, ARROWFLIGHT_INTERNAL_ERROR) \
+    M(751, ARROWFLIGHT_CONNECTION_FAILURE) \
+    M(752, ARROWFLIGHT_FETCH_SCHEMA_ERROR) \
+    M(753, ARROWFLIGHT_WRITE_ERROR) \
+    M(754, UDF_EXECUTION_FAILED) \
+    M(755, TOO_LARGE_LIGHTWEIGHT_UPDATES) \
+    M(756, CANNOT_PARSE_PROMQL_QUERY) \
+    M(757, CANNOT_GET_THREAD_PRIORITY) \
+    M(758, TOO_MANY_NAMED_COLLECTIONS) \
+    M(759, LICENSING_EXCEPTION) \
+    M(760, UNICODE_ERROR) \
+    M(761, ACME_ERROR) \
+    M(762, HTTP_CONNECTION_LIMIT_REACHED) \
+    M(763, SESSION_REFUSED) \
+    M(764, DEDUPLICATION_IS_NOT_POSSIBLE) \
+    M(765, UNKNOWN_MASKING_POLICY) \
+    M(766, INSTRUMENTATION_ERROR) \
+    M(767, REQUIRED_SECOND_FACTOR) \
+    M(768, CANNOT_EXECUTE_PROMQL_QUERY) \
+    M(769, NAMED_COLLECTION_IS_USED) \
+    M(770, WASM_ERROR) \
+    M(771, CACHE_CANNOT_WRITE_TO_CACHE_DISK) \
+    M(772, INCOMPATIBLE_SCHEMA) \
+    M(773, MALFORMED_AI_PROVIDER_RESPONSE) \
+    M(774, TABLE_IS_PERMANENTLY_READ_ONLY) \
+    M(775, STATELESS_WORKER_DISCOVERY_ERROR) \
+    M(776, RESOURCE_LIMIT_EXCEEDED) \
+    M(777, MEMORY_RESERVATION_KILLED) \
+    M(778, MEMORY_RESERVATION_FAILED) \
+    M(779, UNSUPPORTED_MEDIA_TYPE) \
+    M(780, SW_SERVER_NO_WORKERS_AVAILABLE) \
+    M(781, AI_PROVIDER_RESPONSE_TRUNCATED) \
+    M(782, AI_PROVIDER_RESPONSE_INCOMPLETE) \
+    M(783, SSH_AGENT_ERROR) \
+    M(784, OBJECT_STORAGE_QUEUE_POST_PROCESSING_FAILED) \
+    M(785, NOTHING_TO_KILL) \
+    M(786, BAD_FUNCTION_SIGNATURE) \
+    M(787, UNKNOWN_DISTRIBUTED_ASYNC_INSERT_FORMAT_VERSION) \
+\
+    M(900, DISTRIBUTED_CACHE_ERROR) \
+    M(901, CANNOT_USE_DISTRIBUTED_CACHE) \
+    M(902, PROTOCOL_VERSION_MISMATCH) \
+    M(903, DISTRIBUTED_CACHE_REGISTRY_SHUTDOWN) \
+    M(904, TOO_MANY_UNAVAILABLE_SHARDS) \
+    M(905, DISTRIBUTED_CACHE_SERVER_IN_BACKOFF) \
+    M(906, AST_FUZZER_ORACLE_MISMATCH) \
+    M(907, DISTRIBUTED_CACHE_UNEXPECTED_SERVER_CERTIFICATE) \
+    M(908, DISTRIBUTED_CACHE_SERVER_SLOW_DOWN) \
+\
     M(999, KEEPER_EXCEPTION) \
     M(1000, POCO_EXCEPTION) \
     M(1001, STD_EXCEPTION) \
     M(1002, UNKNOWN_EXCEPTION) \
+    M(1003, SSH_EXCEPTION) \
+    M(1004, STARTUP_SCRIPTS_ERROR) \
+    M(1005, STALE_VERSION) \
+    M(1006, INVALID_CURSOR_LOOKUP) \
+    M(1007, ILLEGAL_STREAM) \
+    M(1008, TEMPORARY_DATA_NOT_IN_CACHE) \
+    M(1009, S3_OBJECT_CHANGED_DURING_READ) \
+    M(1010, UNIQUE_KEY_DENSE_INDEX_UNREADABLE) \
+    M(1011, HANDLER_ALREADY_EXISTS) \
+    M(1012, HANDLER_DOESNT_EXIST) \
+    M(1013, AMBIGUOUS_HANDLER) \
+    M(1014, TRANSACTION_ROLLBACK_PARTIAL_FAILURE) \
+    M(1015, FILE_CHANGED_DURING_READ) \
+    M(1016, TABLE_SIZE_LIMIT_EXCEEDED) \
+    M(1017, ASYNC_INSERT_FLUSH_TIMEOUT) \
+    M(1018, EXCHANGE_PEER_DISCONNECTED) \
+    M(1019, QUERY_SLOT_ACQUISITION_TIMEOUT) \
+    M(1020, MEMORY_RESERVATION_ACQUISITION_TIMEOUT) \
+    M(1021, AZURE_OBJECT_CHANGED_DURING_READ) \
+    M(1022, SEMI_ANTI_JOIN_COLUMN_ACCESS_DENIED) \
+    M(1023, XGBOOST_ERROR) \
+    M(1024, BUZZHOUSE_ORACLE) \
+    M(1025, GPU_ERROR) \
+    M(1026, ICEBERG_CATALOG_CONCURRENT_UPDATE) \
+    M(1027, AMBER_ERROR) \
+    /* Error codes do not have to be contiguous, they only have to be unique - this is checked by a `static_assert` below. */
 
-/* See END */
+#ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
+#define APPLY_FOR_ERROR_CODES(M) APPLY_FOR_BUILTIN_ERROR_CODES(M) APPLY_FOR_EXTERNAL_ERROR_CODES(M)
+#else
+#define APPLY_FOR_ERROR_CODES(M) APPLY_FOR_BUILTIN_ERROR_CODES(M)
+#endif
 
 namespace DB
 {
 namespace ErrorCodes
 {
+
 #define M(VALUE, NAME) extern const ErrorCode NAME = VALUE;
+APPLY_FOR_ERROR_CODES(M)
+#undef M
+
+ErrorValues values;
+
+namespace
+{
+
+constexpr size_t COUNT = []
+{
+    size_t result = 0;
+#define M(VALUE, NAME) ++result;
     APPLY_FOR_ERROR_CODES(M)
 #undef M
+    return result;
+}();
 
-    constexpr ErrorCode END = 3000;
-    ErrorPairHolder values[END + 1]{};
-
-    struct ErrorCodesNames
-    {
-        std::string_view names[END + 1];
-        ErrorCodesNames()
-        {
-#define M(VALUE, NAME) names[VALUE] = std::string_view(#NAME);
-            APPLY_FOR_ERROR_CODES(M)
+/// Error codes in the order of their declaration.
+constexpr std::array<ErrorCode, COUNT> codes{
+#define M(VALUE, NAME) VALUE,
+    APPLY_FOR_ERROR_CODES(M)
 #undef M
-        }
-    } error_codes_names;
+};
 
-    std::string_view getName(ErrorCode error_code)
+/** The name of every declared error code, `names[i]` being the name of `codes[i]`.
+  * Unlike the error counters, the names are also needed by a standalone build of the parser.
+  */
+constexpr std::array<std::string_view, COUNT> names{
+#define M(VALUE, NAME) std::string_view{#NAME},
+    APPLY_FOR_ERROR_CODES(M)
+#undef M
+};
+
+/// Pairs of (error code, its position in `codes` and `names`), sorted by the error code, to look codes up.
+constexpr auto sorted_codes = []
+{
+    std::array<std::pair<ErrorCode, size_t>, COUNT> result{};
+    for (size_t i = 0; i < COUNT; ++i)
+        result[i] = {codes[i], i};
+    std::ranges::sort(result);
+    return result;
+}();
+
+static_assert(
+    std::ranges::adjacent_find(sorted_codes, {}, &std::pair<ErrorCode, size_t>::first) == sorted_codes.end(), "Error codes must be unique");
+static_assert(sorted_codes.front().first >= 0, "Error codes must be non-negative");
+
+/// The largest declared error code. Everything outside of [0, LAST] is accounted under it.
+constexpr ErrorCode LAST = sorted_codes.back().first;
+
+/// The position of `error_code` in `codes` and `names`, if it is declared.
+std::optional<size_t> findIndex(ErrorCode error_code)
+{
+    const auto it = std::ranges::lower_bound(sorted_codes, error_code, {}, &std::pair<ErrorCode, size_t>::first);
+    if (it == sorted_codes.end() || it->first != error_code)
+        return {};
+    return it->second;
+}
+
+/** The counters of all error codes.
+  *
+  * The declared error codes are not dense - there are large gaps between them - so a counter is kept only for a code
+  * that actually exists, instead of an `ErrorPairHolder` per every value in the range. Custom error codes (see the
+  * setting `allow_custom_error_code_in_throwif`) have no name and are not declared; they used to occupy a slot in the
+  * dense array and are still counted separately, but their counters are allocated lazily, on the first occurrence.
+  */
+class ErrorRegistry
+{
+public:
+    static ErrorRegistry & get()
     {
-        if (error_code < 0 || error_code >= END)
-            return std::string_view();
-        return error_codes_names.names[error_code];
+        /// Intentionally leaked: an error can be reported at any point of the shutdown, after the destructors
+        /// of the objects with static storage duration have run.
+        static ErrorRegistry & registry = *new ErrorRegistry;
+        return registry;
     }
 
-    ErrorCode getErrorCodeByName(std::string_view error_name)
+    ErrorPairHolder & operator[]([[maybe_unused]] ErrorCode error_code)
     {
-        for (size_t i = 0, end = ErrorCodes::end(); i < end; ++i)
+#if defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
+        /** A standalone build of the parser needs the names of error codes only, and never counts errors,
+          * so it does not pay for the counters of the whole table.
+          */
+        static ErrorPairHolder stub;
+        return stub;
+#else
+        if (const auto index = findIndex(error_code))
+            return holders[*index];
+
+        if (error_code >= 0 && error_code < LAST)
+            return custom(error_code);
+
+        /// For everything outside of the range of declared error codes, use the last one.
+        return holders[sorted_codes.back().second];
+#endif
+    }
+
+    /// All error codes that have a counter: the declared ones plus the custom ones seen so far, in ascending order.
+    std::vector<ErrorCode> getCodes() const
+    {
+        std::vector<ErrorCode> result;
+        result.reserve(COUNT);
+        for (const auto & [error_code, _] : sorted_codes)
+            result.push_back(error_code);
+
+#if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
         {
-            std::string_view name = ErrorCodes::getName(i);
-
-            if (name.empty())
-                continue;
-
-            if (name == error_name)
-                return i;
+            std::lock_guard lock(custom_mutex);
+            for (const auto & [error_code, _] : custom_holders)
+                result.push_back(error_code);
         }
+        std::ranges::sort(result);
+#endif
+
+        return result;
+    }
+
+private:
+#if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
+    /// The counter of a custom error code, created on the first occurrence of that code.
+    ErrorPairHolder & custom(ErrorCode error_code)
+    {
+        std::lock_guard lock(custom_mutex);
+        /// Entries are never removed and `std::map` keeps them in place, so the reference stays valid.
+        return custom_holders.try_emplace(error_code).first->second;
+    }
+
+    /** One `ErrorPairHolder` per declared error code, each holding two `Error` structs - the last message,
+      * format string, query id and captured stack trace, local and remote - plus a mutex.
+      */
+    std::array<ErrorPairHolder, COUNT> holders{};
+
+    std::map<ErrorCode, ErrorPairHolder> custom_holders TSA_GUARDED_BY(custom_mutex);
+    mutable std::mutex custom_mutex;
+#endif
+};
+
+}
+
+ErrorPairHolder & ErrorValues::operator[](ErrorCode error_code)
+{
+    return ErrorRegistry::get()[error_code];
+}
+
+std::string_view getName(ErrorCode error_code)
+{
+    if (const auto index = findIndex(error_code))
+        return names[*index];
+    return {};
+}
+
+ErrorCode getErrorCodeByName(std::string_view error_name)
+{
+    const auto it = std::ranges::find(names, error_name);
+    if (it == names.end())
         throw Exception(NO_SUCH_ERROR_CODE, "No error code with name: '{}'", error_name);
-    }
+    return codes[static_cast<size_t>(std::distance(names.begin(), it))];
+}
 
-    ErrorCode end() { return END + 1; }
+std::vector<ErrorCode> getCodes()
+{
+    return ErrorRegistry::get().getCodes();
+}
 
-    void increment(ErrorCode error_code, bool remote, const std::string & message, const FramePointers & trace)
-    {
-        if (error_code < 0 || error_code >= end())
-        {
-            /// For everything outside the range, use END.
-            /// (end() is the pointer pass the end, while END is the last value that has an element in values array).
-            error_code = end() - 1;
-        }
+size_t
+increment(ErrorCode error_code, bool remote, const std::string & message, const std::string & format_string, const FramePointers & trace)
+{
+    return values[error_code].increment(remote, message, format_string, trace);
+}
 
-        values[error_code].increment(remote, message, trace);
-    }
+void extendedMessage(ErrorCode error_code, bool remote, size_t error_index, const std::string & message)
+{
+    values[error_code].extendedMessage(remote, error_index, message);
+}
 
-    void ErrorPairHolder::increment(bool remote, const std::string & message, const FramePointers & trace)
-    {
-        const auto now = std::chrono::system_clock::now();
+size_t ErrorPairHolder::increment(bool remote, const std::string & message, const std::string & format_string, const FramePointers & trace)
+{
+    size_t error_index = 0;
+#if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
+    const auto now = std::chrono::system_clock::now();
 
-        std::lock_guard lock(mutex);
+    std::lock_guard lock(mutex);
+    auto & error = remote ? value.remote : value.local;
 
-        auto & error = remote ? value.remote : value.local;
+    error_index = error.count++;
+    error.message = message;
+    error.format_string = format_string;
+    error.trace = trace;
+    error.error_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    error.query_id = CurrentThread::getQueryId();
+#endif
 
-        ++error.count;
-        error.message = message;
-        error.trace = trace;
-        error.error_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    }
-    ErrorPair ErrorPairHolder::get()
-    {
-        std::lock_guard lock(mutex);
-        return value;
-    }
+    return error_index;
+}
+
+void ErrorPairHolder::extendedMessage(bool remote, size_t error_index, const std::string & new_message)
+{
+#if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
+    std::lock_guard lock(mutex);
+    auto & error = remote ? value.remote : value.local;
+
+    /// This function is supposed to extend the current message.
+    if ((error.count == error_index + 1) && new_message.starts_with(error.message))
+        error.message = new_message;
+#endif
+}
+
+ErrorPair ErrorPairHolder::get()
+{
+    std::lock_guard lock(mutex);
+    return value;
+}
 }
 
 }

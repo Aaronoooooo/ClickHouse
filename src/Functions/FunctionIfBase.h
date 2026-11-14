@@ -1,9 +1,17 @@
 #pragma once
 
 #include <Functions/IFunction.h>
-#include <DataTypes/Native.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <Common/VectorWithMemoryTracking.h>
 
-#include <Common/config.h>
+#include "config.h"
+
+#if USE_EMBEDDED_COMPILER
+#    include <llvm/IR/IRBuilder.h>
+#    include <Core/DecimalFunctions.h>
+#    include <Core/DecimalScaleBounds.h>
+#    include <DataTypes/Native.h>
+#endif
 
 namespace DB
 {
@@ -12,66 +20,112 @@ class FunctionIfBase : public IFunction
 {
 #if USE_EMBEDDED_COMPILER
 public:
-    bool isCompilableImpl(const DataTypes & types) const override
+    bool isCompilableImpl(const DataTypes & types, const DataTypePtr & result_type) const override
     {
+        if (!canBeNativeType(result_type))
+            return false;
+
         /// It's difficult to compare Date and DateTime - cannot use JIT compilation.
         bool has_date = false;
         bool has_datetime = false;
+
+        const auto result_nested = removeNullable(result_type);
 
         for (const auto & type : types)
         {
             auto type_removed_nullable = removeNullable(type);
             WhichDataType which(type_removed_nullable);
 
-            if (which.isDate())
+            if (which.isDateOrDate32())
                 has_date = true;
-            if (which.isDateTime())
+            if (which.isDateTimeOrDateTime64())
                 has_datetime = true;
 
             if (has_date && has_datetime)
                 return false;
 
-            if (!isCompilableType(type_removed_nullable))
+            if (!canBeNativeType(type_removed_nullable))
+                return false;
+
+            if (scaleLiftCanOverflow(*type_removed_nullable, *result_nested))
                 return false;
         }
+
         return true;
     }
 
-    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const DataTypes & types, Values values) const override
+    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const ValuesWithType & arguments, const DataTypePtr & result_type) const override
     {
         auto & b = static_cast<llvm::IRBuilder<> &>(builder);
-        auto return_type = getReturnTypeImpl(types);
 
         auto * head = b.GetInsertBlock();
         auto * join = llvm::BasicBlock::Create(head->getContext(), "join_block", head->getParent());
 
-        std::vector<std::pair<llvm::BasicBlock *, llvm::Value *>> returns;
-        for (size_t i = 0; i + 1 < types.size(); i += 2)
+        VectorWithMemoryTracking<std::pair<llvm::BasicBlock *, llvm::Value *>> returns;
+        for (size_t i = 0; i + 1 < arguments.size(); i += 2)
         {
             auto * then = llvm::BasicBlock::Create(head->getContext(), "then_" + std::to_string(i), head->getParent());
             auto * next = llvm::BasicBlock::Create(head->getContext(), "next_" + std::to_string(i), head->getParent());
-            auto * cond = values[i];
+            const auto & cond = arguments[i];
 
-            b.CreateCondBr(nativeBoolCast(b, types[i], cond), then, next);
+            b.CreateCondBr(nativeBoolCast(b, cond), then, next);
             b.SetInsertPoint(then);
 
-            auto * value = nativeCast(b, types[i + 1], values[i + 1], return_type);
+            /// Use `nativeCastWithDecimalScale` to correctly lift integer branches to a
+            /// `Decimal` `result_type` (and to convert between `Decimal` types of different scales).
+            /// Plain `nativeCast` reinterprets the integer bits without applying the `10^scale`
+            /// factor, which silently produces wrong values when the analyzer leaves a non-`Decimal`
+            /// branch unconverted (e.g. `if(cond, decimal_col, 1)` with `result_type = Decimal(P, S)`).
+            auto * value = nativeCastWithDecimalScale(b, arguments[i + 1], result_type);
             returns.emplace_back(b.GetInsertBlock(), value);
             b.CreateBr(join);
             b.SetInsertPoint(next);
         }
 
-        auto * else_value = nativeCast(b, types.back(), values.back(), return_type);
+        auto * else_value = nativeCastWithDecimalScale(b, arguments.back(), result_type);
         returns.emplace_back(b.GetInsertBlock(), else_value);
         b.CreateBr(join);
 
         b.SetInsertPoint(join);
 
-        auto * phi = b.CreatePHI(toNativeType(b, return_type), returns.size());
+        auto * phi = b.CreatePHI(toNativeType(b, result_type), static_cast<unsigned>(returns.size()));
         for (const auto & [block, value] : returns)
             phi->addIncoming(value, block);
 
         return phi;
+    }
+
+private:
+    /// Compiled code can neither raise nor clamp, so a `Decimal`, `DateTime64` or `Time64` branch whose lift to the result scale
+    /// can leave the result storage, where the interpreted cast raises `DECIMAL_OVERFLOW` (or, for a `DateTime64`
+    /// branch of a `DateTime64` result or a `Time64` branch of a `Time64` result, clamps to the range of the result), is not compilable.
+    static bool scaleLiftCanOverflow(const IDataType & branch, const IDataType & result)
+    {
+        const bool same_family = (isDecimal(branch) && isDecimal(result))
+            || ((isDateTime64(branch) || isTime64(branch)) && (isDateTime64(result) || isTime64(result)));
+        if (!same_family)
+            return false;
+        if (branch.getSizeOfValueInMemory() > result.getSizeOfValueInMemory())
+            return true;
+        const UInt32 branch_scale = getDecimalScale(branch);
+        const UInt32 result_scale = getDecimalScale(result);
+        if (result_scale <= branch_scale)
+            return false;
+        if (result.getSizeOfValueInMemory() > sizeof(Int64))
+        {
+            Int128 lowest = std::numeric_limits<Int128>::lowest();
+            if (branch.getSizeOfValueInMemory() == sizeof(Int32))
+                lowest = std::numeric_limits<Int32>::lowest();
+            else if (branch.getSizeOfValueInMemory() == sizeof(Int64))
+                lowest = std::numeric_limits<Int64>::lowest();
+            return !DecimalScaleBounds<Int128>(DecimalUtils::scaleMultiplier<Int128>(result_scale - branch_scale)).fits(lowest);
+        }
+        const bool branch_is_32 = branch.getSizeOfValueInMemory() == sizeof(Int32);
+        const Int64 lowest = branch_is_32 ? std::numeric_limits<Int32>::lowest() : std::numeric_limits<Int64>::lowest();
+        Int64 lifted = 0;
+        if (common::mulOverflow(lowest, DecimalUtils::scaleMultiplier<Int64>(result_scale - branch_scale), lifted))
+            return true;
+        return result.getSizeOfValueInMemory() == sizeof(Int32) && lifted < std::numeric_limits<Int32>::lowest();
     }
 #endif
 };

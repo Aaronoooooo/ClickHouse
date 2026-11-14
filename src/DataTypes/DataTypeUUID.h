@@ -8,16 +8,20 @@
 namespace DB
 {
 
-class DataTypeUUID : public IDataType
+constexpr size_t UUID_BINARY_LENGTH = 16;
+
+class DataTypeUUID final : public IDataType
 {
 public:
     static constexpr bool is_parametric = false;
 
     using FieldType = UUID;
     using ColumnType = ColumnVector<UUID>;
+    static constexpr auto type_id = TypeIndex::UUID;
 
     const char * getFamilyName() const override { return "UUID"; }
-    TypeIndex getTypeId() const override { return TypeIndex::UUID; }
+
+    TypeIndex getTypeId() const override { return type_id; }
 
     Field getDefault() const override;
 
@@ -41,7 +45,9 @@ public:
     bool isCategorial() const override { return true; }
     bool canBeInsideLowCardinality() const override { return true; }
 
-    SerializationPtr doGetDefaultSerialization() const override;
+    void updateHashImpl(SipHash &) const override {}
+
+    SerializationPtr doGetSerialization(const SerializationInfoSettings &) const override;
 };
 
 }

@@ -1,2 +1,2 @@
-add_executable(test-connect test_connect.cpp)
-target_link_libraries (test-connect PRIVATE dbms)
+# Examples are built as part of the clickhouse-examples multi-call binary.
+# See src/Examples/CMakeLists.txt

@@ -4,12 +4,16 @@
 #include <IO/WriteBuffer.h>
 #include <IO/copyData.h>
 
+#include <istream>
+
 
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int ATTEMPT_TO_READ_AFTER_EOF;
+    extern const int CANNOT_READ_ALL_DATA;
+    extern const int CANNOT_READ_FROM_ISTREAM;
 }
 
 namespace
@@ -30,11 +34,11 @@ void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t 
         bytes -= count;
 
         if (throttler)
-            throttler->add(count);
+            throttler->throttle(count);
     }
 
     if (check_bytes && bytes > 0)
-        throw Exception("Attempt to read after EOF.", ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF);
+        throw Exception(ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF, "Attempt to read after EOF, left to copy {} bytes.", bytes);
 }
 
 void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t bytes, std::function<void()> cancellation_hook, ThrottlerPtr throttler)
@@ -52,11 +56,11 @@ void copyDataImpl(ReadBuffer & from, WriteBuffer & to, bool check_bytes, size_t 
         bytes -= count;
 
         if (throttler)
-            throttler->add(count);
+            throttler->throttle(count);
     }
 
     if (check_bytes && bytes > 0)
-        throw Exception("Attempt to read after EOF.", ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF);
+        throw Exception(ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF, "Attempt to read after EOF.");
 }
 
 }
@@ -91,6 +95,13 @@ void copyData(ReadBuffer & from, WriteBuffer & to, size_t bytes, std::function<v
     copyDataImpl(from, to, true, bytes, cancellation_hook, nullptr);
 }
 
+void copyDataMaxBytes(ReadBuffer & from, WriteBuffer & to, size_t max_bytes)
+{
+    copyDataImpl(from, to, false, max_bytes, nullptr, nullptr);
+    if (!from.eof())
+        throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA, "Cannot read all data, max readable size reached.");
+}
+
 void copyDataWithThrottler(ReadBuffer & from, WriteBuffer & to, const std::atomic<int> & is_cancelled, ThrottlerPtr throttler)
 {
     copyDataImpl(from, to, false, std::numeric_limits<size_t>::max(), &is_cancelled, throttler);
@@ -99,6 +110,38 @@ void copyDataWithThrottler(ReadBuffer & from, WriteBuffer & to, const std::atomi
 void copyDataWithThrottler(ReadBuffer & from, WriteBuffer & to, size_t bytes, const std::atomic<int> & is_cancelled, ThrottlerPtr throttler)
 {
     copyDataImpl(from, to, true, bytes, &is_cancelled, throttler);
+}
+
+size_t copyFromIStreamToWriteBuffer(std::istream & from, WriteBuffer & to)
+{
+    size_t total_copied = 0;
+
+    while (true)
+    {
+        to.nextIfAtEnd();
+
+        const size_t space = to.available();
+        chassert(space != 0);
+
+        from.read(to.position(), static_cast<std::streamsize>(space));
+        const size_t copied = static_cast<size_t>(from.gcount());
+
+        to.position() += copied;
+        total_copied += copied;
+
+        if (copied != space)
+        {
+            if (!from.eof())
+                throw Exception(
+                    ErrorCodes::CANNOT_READ_FROM_ISTREAM,
+                    "{} after {} bytes",
+                    from.fail() ? "Cannot read from istream" : "Unexpected state of istream",
+                    total_copied);
+            break;
+        }
+    }
+
+    return total_copied;
 }
 
 }

@@ -8,9 +8,13 @@ from helpers.client import QueryRuntimeException
 from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
-node = cluster.add_instance('node', stay_alive=True)
+node = cluster.add_instance(
+    "node",
+    stay_alive=True,
+)
 
-@pytest.fixture(scope='module', autouse=True)
+
+@pytest.fixture(scope="module", autouse=True)
 def start_cluster():
     try:
         cluster.start()
@@ -18,52 +22,72 @@ def start_cluster():
     finally:
         cluster.shutdown()
 
-def break_part(table, part_name):
-    node.exec_in_container(['bash', '-c', f'rm /var/lib/clickhouse/data/default/{table}/{part_name}/columns.txt'])
 
-def remove_part(table, part_name):
-    node.exec_in_container(['bash', '-c', f'rm -r /var/lib/clickhouse/data/default/{table}/{part_name}'])
+def break_part(data_path, part_name):
+
+    node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"rm {data_path}/{part_name}/primary.cidx",
+        ]
+    )
+
+
+def remove_part(data_path, part_name):
+    node.exec_in_container(["bash", "-c", f"rm -r {data_path}/{part_name}"])
+
 
 def get_count(table):
-    return int(node.query(f'SELECT count() FROM {table}').strip())
+    return int(node.query(f"SELECT count() FROM {table}").strip())
+
 
 def detach_table(table):
-    node.query(f'DETACH TABLE {table}')
+    node.query(f"DETACH TABLE {table}")
+
+
 def attach_table(table):
-    node.query(f'ATTACH TABLE {table}')
+    node.query(f"ATTACH TABLE {table}")
+
 
 def check_table(table):
     rows = 900
     per_part_rows = 90
 
-    node.query(f'INSERT INTO {table} SELECT * FROM numbers(900)')
+    node.query(f"INSERT INTO {table} SELECT * FROM numbers(900)")
 
     assert get_count(table) == rows
 
+    data_path = node.query(
+        f"SELECT arrayElement(data_paths, 1) FROM system.tables WHERE database='default' AND name='{table}'"
+    ).strip()
+
     # break one part, and check that clickhouse will be alive
-    break_part(table, '0_1_1_0')
+    break_part(data_path, "0_1_1_0")
     rows -= per_part_rows
     detach_table(table)
     attach_table(table)
     assert get_count(table) == rows
 
     # break two parts, and check that clickhouse will not start
-    break_part(table, '1_2_2_0')
-    break_part(table, '2_3_3_0')
-    rows -= per_part_rows*2
+    break_part(data_path, "1_2_2_0")
+    break_part(data_path, "2_3_3_0")
+    rows -= per_part_rows * 2
     detach_table(table)
     with pytest.raises(QueryRuntimeException):
         attach_table(table)
 
     # now remove one part, and check
-    remove_part(table, '1_2_2_0')
+    remove_part(data_path, "1_2_2_0")
     attach_table(table)
     assert get_count(table) == rows
 
-    node.query(f'DROP TABLE {table}')
+    node.query(f"DROP TABLE {table}")
+
 
 def test_max_suspicious_broken_parts():
-    node.query("""
+    node.query(
+        """
     CREATE TABLE test_max_suspicious_broken_parts (
         key Int
     )
@@ -72,11 +96,14 @@ def test_max_suspicious_broken_parts():
     PARTITION BY key%10
     SETTINGS
         max_suspicious_broken_parts = 1;
-    """)
-    check_table('test_max_suspicious_broken_parts')
+    """
+    )
+    check_table("test_max_suspicious_broken_parts")
+
 
 def test_max_suspicious_broken_parts_bytes():
-    node.query("""
+    node.query(
+        """
     CREATE TABLE test_max_suspicious_broken_parts_bytes (
         key Int
     )
@@ -85,13 +112,20 @@ def test_max_suspicious_broken_parts_bytes():
     PARTITION BY key%10
     SETTINGS
         max_suspicious_broken_parts = 10,
-        /* one part takes ~751 byte, so we allow failure of one part with these limit */
-        max_suspicious_broken_parts_bytes = 1000;
-    """)
-    check_table('test_max_suspicious_broken_parts_bytes')
+        serialization_info_version = 'basic',
+        /* one part takes ~1010 byte, so we allow failure of one part with these limit */
+        max_suspicious_broken_parts_bytes = 1500,
+        /* Disable implicit index and statistics as they'd change the size */
+        add_minmax_index_for_numeric_columns=0,
+        auto_statistics_types='';
+    """
+    )
+    check_table("test_max_suspicious_broken_parts_bytes")
+
 
 def test_max_suspicious_broken_parts__wide():
-    node.query("""
+    node.query(
+        """
     CREATE TABLE test_max_suspicious_broken_parts__wide (
         key Int
     )
@@ -101,11 +135,14 @@ def test_max_suspicious_broken_parts__wide():
     SETTINGS
         min_bytes_for_wide_part = 0,
         max_suspicious_broken_parts = 1;
-    """)
-    check_table('test_max_suspicious_broken_parts__wide')
+    """
+    )
+    check_table("test_max_suspicious_broken_parts__wide")
+
 
 def test_max_suspicious_broken_parts_bytes__wide():
-    node.query("""
+    node.query(
+        """
     CREATE TABLE test_max_suspicious_broken_parts_bytes__wide (
         key Int
     )
@@ -114,8 +151,13 @@ def test_max_suspicious_broken_parts_bytes__wide():
     PARTITION BY key%10
     SETTINGS
         min_bytes_for_wide_part = 0,
+        serialization_info_version = 'basic',
         max_suspicious_broken_parts = 10,
-        /* one part takes ~750 byte, so we allow failure of one part with these limit */
-        max_suspicious_broken_parts_bytes = 1000;
-    """)
-    check_table('test_max_suspicious_broken_parts_bytes__wide')
+        /* one part takes ~1009 byte, so we allow failure of one part with these limit */
+        max_suspicious_broken_parts_bytes = 1500,
+        /* Disable implicit index and statistics as they'd change the size */
+        add_minmax_index_for_numeric_columns=0,
+        auto_statistics_types='';
+    """
+    )
+    check_table("test_max_suspicious_broken_parts_bytes__wide")

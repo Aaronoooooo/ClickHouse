@@ -5,8 +5,16 @@
                 <type>s3</type>
                 <endpoint>http://minio1:9001/root/data/</endpoint>
                 <access_key_id>minio</access_key_id>
-                <secret_access_key>minio123</secret_access_key>
+                <secret_access_key>ClickHouse_Minio_P@ssw0rd</secret_access_key>
             </s3>
+            <s3_cache>
+                <type>cache</type>
+                <disk>s3</disk>
+                <path>./s3_cache/</path>
+                <max_size>1000000</max_size>
+                <max_file_segment_size>262144</max_file_segment_size>
+                <boundary_alignment>262144</boundary_alignment>
+            </s3_cache>
         </disks>
         <policies>
             <s3>
@@ -16,12 +24,20 @@
                     </main>
                 </volumes>
             </s3>
+            <s3_cache>
+                <volumes>
+                    <main>
+                        <disk>s3_cache</disk>
+                    </main>
+                </volumes>
+            </s3_cache>
         </policies>
     </storage_configuration>
 
     <merge_tree>
         <min_bytes_for_wide_part>0</min_bytes_for_wide_part>
-        <allow_remote_fs_zero_copy_replication>0</allow_remote_fs_zero_copy_replication>
+        <ratio_of_defaults_for_sparse_serialization>1.0</ratio_of_defaults_for_sparse_serialization>
+        <serialization_info_version>basic</serialization_info_version>
     </merge_tree>
 
     <remote_servers>

@@ -1,63 +1,67 @@
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferValidUTF8.h>
 #include <Processors/Formats/Impl/JSONCompactEachRowRowOutputFormat.h>
+#include <Processors/Port.h>
 #include <Formats/FormatFactory.h>
 #include <Formats/registerWithNamesAndTypes.h>
-
+#include <Formats/JSONUtils.h>
+#include <Core/Block.h>
 
 namespace DB
 {
 
 
 JSONCompactEachRowRowOutputFormat::JSONCompactEachRowRowOutputFormat(WriteBuffer & out_,
-        const Block & header_,
-        const RowOutputFormatParams & params_,
+        SharedHeader header_,
         const FormatSettings & settings_,
         bool with_names_,
-        bool with_types_,
-        bool yield_strings_)
-        : IRowOutputFormat(header_, out_, params_), settings(settings_), with_names(with_names_), with_types(with_types_), yield_strings(yield_strings_)
+        bool with_types_)
+    : RowOutputFormatWithExceptionHandlerAdaptor<RowOutputFormatWithUTF8ValidationAdaptor, bool>(header_, out_, settings_.json.valid_output_on_exception, settings_.json.validate_utf8)
+    , settings(settings_)
+    , with_names(with_names_)
+    , with_types(with_types_)
 {
+    ostr = RowOutputFormatWithExceptionHandlerAdaptor::getWriteBufferPtr();
 }
 
 
 void JSONCompactEachRowRowOutputFormat::writeField(const IColumn & column, const ISerialization & serialization, size_t row_num)
 {
-    if (yield_strings)
+    if (settings.json.serialize_as_strings)
     {
         WriteBufferFromOwnString buf;
 
         serialization.serializeText(column, row_num, buf, settings);
-        writeJSONString(buf.str(), out, settings);
+        writeJSONString(buf.str(), *ostr, settings);
     }
     else
-        serialization.serializeTextJSON(column, row_num, out, settings);
+        serialization.serializeTextJSON(column, row_num, *ostr, settings);
 }
 
 
 void JSONCompactEachRowRowOutputFormat::writeFieldDelimiter()
 {
-    writeCString(", ", out);
+    writeCString(", ", *ostr);
 }
 
 
 void JSONCompactEachRowRowOutputFormat::writeRowStartDelimiter()
 {
-    writeChar('[', out);
+    writeChar('[', *ostr);
 }
 
 
 void JSONCompactEachRowRowOutputFormat::writeRowEndDelimiter()
 {
-    writeCString("]\n", out);
+    writeCString("]\n", *ostr);
 }
 
 void JSONCompactEachRowRowOutputFormat::writeTotals(const Columns & columns, size_t row_num)
 {
-    writeChar('\n', out);
-    size_t num_columns = columns.size();
+    writeChar('\n', *ostr);
+    size_t columns_size = columns.size();
     writeRowStartDelimiter();
-    for (size_t i = 0; i < num_columns; ++i)
+    for (size_t i = 0; i < columns_size; ++i)
     {
         if (i != 0)
             writeFieldDelimiter();
@@ -67,15 +71,16 @@ void JSONCompactEachRowRowOutputFormat::writeTotals(const Columns & columns, siz
     writeRowEndDelimiter();
 }
 
-void JSONCompactEachRowRowOutputFormat::writeLine(const std::vector<String> & values)
+void JSONCompactEachRowRowOutputFormat::writeLine(std::span<const String> values)
 {
+    JSONUtils::makeNamesValidJSONStrings(values, settings, settings.json.validate_utf8);
     writeRowStartDelimiter();
     for (size_t i = 0; i < values.size(); ++i)
     {
-        writeChar('\"', out);
-        writeString(values[i], out);
-        writeChar('\"', out);
-        if (i != values.size() - 1)
+        writeChar('\"', *ostr);
+        writeString(values[i], *ostr);
+        writeChar('\"', *ostr);
+        if (i + 1 != values.size())
             writeFieldDelimiter();
     }
     writeRowEndDelimiter();
@@ -86,18 +91,32 @@ void JSONCompactEachRowRowOutputFormat::writePrefix()
     const auto & header = getPort(PortKind::Main).getHeader();
 
     if (with_names)
-        writeLine(header.getNames());
+        writeLine(JSONUtils::makeNamesValidJSONStrings(header.getNames(), settings, settings.json.validate_utf8));
 
     if (with_types)
-        writeLine(header.getDataTypeNames());
+        writeLine(JSONUtils::makeNamesValidJSONStrings(header.getDataTypeNames(), settings, settings.json.validate_utf8));
 }
 
-void JSONCompactEachRowRowOutputFormat::consumeTotals(DB::Chunk chunk)
+void JSONCompactEachRowRowOutputFormat::writeSuffix()
 {
-    if (with_names)
-        IRowOutputFormat::consumeTotals(std::move(chunk));
+    if (!exception_message.empty())
+    {
+        if (haveWrittenData())
+            writeRowBetweenDelimiter();
+
+        writeRowStartDelimiter();
+        writeJSONString(exception_message, *ostr, settings);
+        writeRowEndDelimiter();
+    }
 }
 
+void JSONCompactEachRowRowOutputFormat::resetFormatterImpl()
+{
+    RowOutputFormatWithExceptionHandlerAdaptor::resetFormatterImpl();
+    ostr = RowOutputFormatWithExceptionHandlerAdaptor::getWriteBufferPtr();
+}
+
+void registerOutputFormatJSONCompactEachRow(FormatFactory & factory);
 void registerOutputFormatJSONCompactEachRow(FormatFactory & factory)
 {
     for (bool yield_strings : {false, true})
@@ -107,13 +126,42 @@ void registerOutputFormatJSONCompactEachRow(FormatFactory & factory)
             factory.registerOutputFormat(format_name, [yield_strings, with_names, with_types](
                 WriteBuffer & buf,
                 const Block & sample,
-                const RowOutputFormatParams & params,
-                const FormatSettings & format_settings)
+                const FormatSettings & format_settings,
+                FormatFilterInfoPtr /*format_filter_info*/)
             {
-                return std::make_shared<JSONCompactEachRowRowOutputFormat>(buf, sample, params, format_settings, with_names, with_types, yield_strings);
+                FormatSettings settings = format_settings;
+                settings.json.serialize_as_strings = yield_strings;
+
+                return std::make_shared<JSONCompactEachRowRowOutputFormat>(buf, std::make_shared<const Block>(sample), settings, with_names, with_types);
             });
 
             factory.markOutputFormatSupportsParallelFormatting(format_name);
+
+            /// The `WithNames` variants write a header row of names (and the `WithNamesAndTypes` ones a
+            /// row of type names too) via `makeNamesValidJSONStrings` with `output_format_json_validate_utf8`.
+            /// When validation is off, a name or type name that is not valid UTF-8 (a quoted alias with
+            /// arbitrary bytes, or a named `Tuple`/`Enum` element with such bytes) makes the header, and
+            /// hence the output, non-textual. The row values of the non-`Strings` variants can also
+            /// synthesize object keys from named `Tuple` element names (see
+            /// `tupleElementNamesMayProduceRawBytesInJSON`); the `Strings` variants write a `Tuple`
+            /// value in its plain text form, which carries no element names - but that plain text
+            /// form writes the `Bool` representations verbatim (see
+            /// `boolRepresentationsMayProduceRawBytesInJSONStrings`). All of this is knowable from
+            /// the header and the settings, so the text framings reject or base64-encode the output
+            /// accordingly.
+            factory.registerOutputFormatMayProduceRawBytesChecker(
+                format_name,
+                [with_names, with_types, yield_strings](const FormatSettings & settings, const Block & header)
+                {
+                    return (with_names
+                            && JSONUtils::namesMayProduceRawBytesInJSON(header.getNames(), settings, settings.json.validate_utf8))
+                        || (with_types
+                            && JSONUtils::namesMayProduceRawBytesInJSON(header.getDataTypeNames(), settings, settings.json.validate_utf8))
+                        || (!yield_strings
+                            && JSONUtils::tupleElementNamesMayProduceRawBytesInJSON(header, settings, settings.json.validate_utf8))
+                        || (yield_strings
+                            && JSONUtils::boolRepresentationsMayProduceRawBytesInJSONStrings(header, settings, settings.json.validate_utf8));
+                });
         };
 
         registerWithNamesAndTypes(yield_strings ? "JSONCompactStringsEachRow" : "JSONCompactEachRow", register_func);

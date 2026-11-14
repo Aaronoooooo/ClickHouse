@@ -1,10 +1,18 @@
 #include <Interpreters/ExpressionActions.h>
 #include <Columns/ColumnFunction.h>
+#include <Columns/ColumnReplicated.h>
 #include <Columns/ColumnsCommon.h>
+#include <Columns/validateColumnType.h>
+#include <Common/HashTable/Hash.h>
 #include <Common/PODArray.h>
+#include <Common/SipHash.h>
 #include <Common/ProfileEvents.h>
+#include <Common/assert_cast.h>
 #include <IO/WriteHelpers.h>
+#include <IO/Operators.h>
 #include <Functions/IFunction.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+
 
 namespace ProfileEvents
 {
@@ -21,8 +29,24 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-ColumnFunction::ColumnFunction(size_t size, FunctionBasePtr function_, const ColumnsWithTypeAndName & columns_to_capture, bool is_short_circuit_argument_, bool is_function_compiled_)
-        : size_(size), function(function_), is_short_circuit_argument(is_short_circuit_argument_), is_function_compiled(is_function_compiled_)
+ColumnFunction::ColumnFunction(
+    size_t size,
+    FunctionBasePtr function_,
+    const ColumnsWithTypeAndName & columns_to_capture,
+    bool is_short_circuit_argument_,
+    bool is_function_compiled_,
+    bool recursively_convert_result_to_full_column_if_low_cardinality_,
+    bool allow_lazy_replicated_captures_,
+    ShortCircuitArgumentStatisticsPtr short_circuit_argument_statistics_,
+    std::optional<size_t> short_circuit_eager_argument_)
+    : elements_size(size)
+    , function(function_)
+    , is_short_circuit_argument(is_short_circuit_argument_)
+    , recursively_convert_result_to_full_column_if_low_cardinality(recursively_convert_result_to_full_column_if_low_cardinality_)
+    , is_function_compiled(is_function_compiled_)
+    , allow_lazy_replicated_captures(allow_lazy_replicated_captures_)
+    , short_circuit_argument_statistics(std::move(short_circuit_argument_statistics_))
+    , short_circuit_eager_argument(short_circuit_eager_argument_)
 {
     appendArguments(columns_to_capture);
 }
@@ -33,37 +57,205 @@ MutableColumnPtr ColumnFunction::cloneResized(size_t size) const
     for (auto & column : capture)
         column.column = column.column->cloneResized(size);
 
-    return ColumnFunction::create(size, function, capture, is_short_circuit_argument, is_function_compiled);
+    return ColumnFunction::create(
+        size,
+        function,
+        capture,
+        is_short_circuit_argument,
+        is_function_compiled,
+        /*recursively_convert_result_to_full_column_if_low_cardinality_=*/ false,
+        allow_lazy_replicated_captures,
+        short_circuit_argument_statistics,
+        short_circuit_eager_argument);
 }
 
 ColumnPtr ColumnFunction::replicate(const Offsets & offsets) const
 {
-    if (size_ != offsets.size())
-        throw Exception("Size of offsets (" + toString(offsets.size()) + ") doesn't match size of column ("
-                        + toString(size_) + ")", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+    if (elements_size != offsets.size())
+        throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH, "Size of offsets ({}) doesn't match size of column ({})",
+                        offsets.size(), elements_size);
 
     ColumnsWithTypeAndName capture = captured_columns;
+    ColumnPtr replication_indexes;
     for (auto & column : capture)
-        column.column = column.column->replicate(offsets);
+    {
+        if (allow_lazy_replicated_captures && isLazyReplicationUseful(column.column))
+        {
+            /// Wrap the capture into ColumnReplicated instead of physically copying it.
+            if (!replication_indexes)
+                replication_indexes = convertOffsetsToIndexes(offsets);
+            /// All captures share the same indexes column, so that functions inside
+            /// the lambda can use the common-indexes fast path
+            column.column = ColumnReplicated::create(column.column, replication_indexes);
+        }
+        else
+        {
+            column.column = column.column->replicate(offsets);
+        }
+    }
 
-    size_t replicated_size = 0 == size_ ? 0 : offsets.back();
-    return ColumnFunction::create(replicated_size, function, capture, is_short_circuit_argument, is_function_compiled);
+    size_t replicated_size = 0 == elements_size ? 0 : offsets.back();
+    return ColumnFunction::create(
+        replicated_size,
+        function,
+        capture,
+        is_short_circuit_argument,
+        is_function_compiled,
+        /*recursively_convert_result_to_full_column_if_low_cardinality_=*/ false,
+        allow_lazy_replicated_captures,
+        short_circuit_argument_statistics,
+        short_circuit_eager_argument);
 }
 
 ColumnPtr ColumnFunction::cut(size_t start, size_t length) const
 {
+    if (start == 0 && length == size())
+        return getPtr();
     ColumnsWithTypeAndName capture = captured_columns;
     for (auto & column : capture)
         column.column = column.column->cut(start, length);
 
-    return ColumnFunction::create(length, function, capture, is_short_circuit_argument, is_function_compiled);
+    return ColumnFunction::create(
+        length,
+        function,
+        capture,
+        is_short_circuit_argument,
+        is_function_compiled,
+        recursively_convert_result_to_full_column_if_low_cardinality,
+        allow_lazy_replicated_captures,
+        short_circuit_argument_statistics,
+        short_circuit_eager_argument);
+}
+
+Field ColumnFunction::operator[](size_t n) const
+{
+    Field res;
+    get(n, res);
+    return res;
+}
+
+void ColumnFunction::get(size_t n, Field & res) const
+{
+    const size_t tuple_size = captured_columns.size();
+
+    res = Tuple();
+    Tuple & res_tuple = res.safeGet<Tuple>();
+    res_tuple.reserve(tuple_size);
+
+    for (size_t i = 0; i < tuple_size; ++i)
+        res_tuple.push_back((*captured_columns[i].column)[n]);
+}
+
+void ColumnFunction::getValueNameImpl(WriteBufferFromOwnString & name_buf, size_t n, const Options & options) const
+{
+    size_t size = captured_columns.size();
+
+    if (options.notFull(name_buf))
+    {
+        if (size > 1)
+            name_buf << "(";
+        else
+            name_buf << "tuple(";
+    }
+
+    for (size_t i = 0; i < size; ++i)
+    {
+        if (options.notFull(name_buf) && i > 0)
+            name_buf << ", ";
+        captured_columns[i].column->getValueNameImpl(name_buf, n, options);
+    }
+    if (options.notFull(name_buf))
+        name_buf << ")";
+}
+
+
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
+void ColumnFunction::insertFrom(const IColumn & src, size_t n)
+#else
+void ColumnFunction::doInsertFrom(const IColumn & src, size_t n)
+#endif
+{
+    const ColumnFunction & src_func = assert_cast<const ColumnFunction &>(src);
+
+    if (!function->isEqual(*src_func.function))
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Cannot insert into ColumnFunction from a column with a different function ({} vs {})",
+            function->getName(),
+            src_func.function->getName());
+
+    size_t num_captured_columns = captured_columns.size();
+    chassert(num_captured_columns == src_func.captured_columns.size());
+
+    for (size_t i = 0; i < num_captured_columns; ++i)
+    {
+        auto mut_column = IColumn::mutate(std::move(captured_columns[i].column));
+        mut_column->insertFrom(*src_func.captured_columns[i].column, n);
+        captured_columns[i].column = std::move(mut_column);
+    }
+
+    ++elements_size;
+}
+
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
+void ColumnFunction::insertRangeFrom(const IColumn & src, size_t start, size_t length)
+#else
+void ColumnFunction::doInsertRangeFrom(const IColumn & src, size_t start, size_t length)
+#endif
+{
+    const ColumnFunction & src_func = assert_cast<const ColumnFunction &>(src);
+
+    if (!function->isEqual(*src_func.function))
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Cannot concatenate ColumnFunction with a different function ({} vs {})",
+            function->getName(),
+            src_func.function->getName());
+
+    size_t num_captured_columns = captured_columns.size();
+    chassert(num_captured_columns == src_func.captured_columns.size());
+
+    for (size_t i = 0; i < num_captured_columns; ++i)
+    {
+        auto mut_column = IColumn::mutate(std::move(captured_columns[i].column));
+        mut_column->insertRangeFrom(*src_func.captured_columns[i].column, start, length);
+        captured_columns[i].column = std::move(mut_column);
+    }
+
+    elements_size += length;
+}
+
+bool ColumnFunction::structureEquals(const IColumn & rhs) const
+{
+    const auto * rhs_func = typeid_cast<const ColumnFunction *>(&rhs);
+    if (!rhs_func)
+        return false;
+
+    /// insertRangeFrom keeps the destination function for all appended rows. Require the same
+    /// callable (IFunctionBase::isEqual), not merely the same wrapper typeid — FunctionExpression
+    /// and FunctionToFunctionBaseAdaptor each wrap many distinct callables.
+    if (!function->isEqual(*rhs_func->function))
+        return false;
+
+    if (captured_columns.size() != rhs_func->captured_columns.size())
+        return false;
+
+    for (size_t i = 0; i < captured_columns.size(); ++i)
+    {
+        if (!captured_columns[i].type->equals(*rhs_func->captured_columns[i].type))
+            return false;
+        if (!captured_columns[i].column->structureEquals(*rhs_func->captured_columns[i].column))
+            return false;
+    }
+
+    return true;
 }
 
 ColumnPtr ColumnFunction::filter(const Filter & filt, ssize_t result_size_hint) const
 {
-    if (size_ != filt.size())
-        throw Exception("Size of filter (" + toString(filt.size()) + ") doesn't match size of column ("
-                        + toString(size_) + ")", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+    if (elements_size != filt.size())
+        throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH, "Size of filter ({}) doesn't match size of column ({})",
+                        filt.size(), elements_size);
 
     ColumnsWithTypeAndName capture = captured_columns;
     for (auto & column : capture)
@@ -77,7 +269,31 @@ ColumnPtr ColumnFunction::filter(const Filter & filt, ssize_t result_size_hint) 
     else
         filtered_size = capture.front().column->size();
 
-    return ColumnFunction::create(filtered_size, function, capture, is_short_circuit_argument, is_function_compiled);
+    return ColumnFunction::create(
+        filtered_size,
+        function,
+        capture,
+        is_short_circuit_argument,
+        is_function_compiled,
+        recursively_convert_result_to_full_column_if_low_cardinality,
+        allow_lazy_replicated_captures,
+        short_circuit_argument_statistics,
+        short_circuit_eager_argument);
+}
+
+void ColumnFunction::filter(const Filter & filt)
+{
+    if (elements_size != filt.size())
+        throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH, "Size of filter ({}) doesn't match size of column ({})",
+                        filt.size(), elements_size);
+
+    for (auto & column : captured_columns)
+        column.column->assumeMutable()->filter(filt);
+
+    if (captured_columns.empty())
+        elements_size = countBytesInFilter(filt);
+    else
+        elements_size = captured_columns.front().column->size();
 }
 
 void ColumnFunction::expand(const Filter & mask, bool inverted)
@@ -88,7 +304,7 @@ void ColumnFunction::expand(const Filter & mask, bool inverted)
         column.column->assumeMutable()->expand(mask, inverted);
     }
 
-    size_ = mask.size();
+    elements_size = mask.size();
 }
 
 ColumnPtr ColumnFunction::permute(const Permutation & perm, size_t limit) const
@@ -99,7 +315,16 @@ ColumnPtr ColumnFunction::permute(const Permutation & perm, size_t limit) const
     for (auto & column : capture)
         column.column = column.column->permute(perm, limit);
 
-    return ColumnFunction::create(limit, function, capture, is_short_circuit_argument, is_function_compiled);
+    return ColumnFunction::create(
+        limit,
+        function,
+        capture,
+        is_short_circuit_argument,
+        is_function_compiled,
+        recursively_convert_result_to_full_column_if_low_cardinality,
+        allow_lazy_replicated_captures,
+        short_circuit_argument_statistics,
+        short_circuit_eager_argument);
 }
 
 ColumnPtr ColumnFunction::index(const IColumn & indexes, size_t limit) const
@@ -108,36 +333,54 @@ ColumnPtr ColumnFunction::index(const IColumn & indexes, size_t limit) const
     for (auto & column : capture)
         column.column = column.column->index(indexes, limit);
 
-    return ColumnFunction::create(limit, function, capture, is_short_circuit_argument, is_function_compiled);
+    return ColumnFunction::create(
+        limit == 0 ? indexes.size() : limit,
+        function,
+        capture,
+        is_short_circuit_argument,
+        is_function_compiled,
+        recursively_convert_result_to_full_column_if_low_cardinality,
+        allow_lazy_replicated_captures,
+        short_circuit_argument_statistics,
+        short_circuit_eager_argument);
 }
 
-std::vector<MutableColumnPtr> ColumnFunction::scatter(IColumn::ColumnIndex num_columns,
+VectorWithMemoryTracking<MutableColumnPtr> ColumnFunction::scatter(size_t num_columns,
                                                       const IColumn::Selector & selector) const
 {
-    if (size_ != selector.size())
-        throw Exception("Size of selector (" + toString(selector.size()) + ") doesn't match size of column ("
-                        + toString(size_) + ")", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+    if (elements_size != selector.size())
+        throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH, "Size of selector ({}) doesn't match size of column ({})",
+                        selector.size(), elements_size);
 
-    std::vector<size_t> counts;
+    VectorWithMemoryTracking<size_t> counts;
     if (captured_columns.empty())
         counts = countColumnsSizeInSelector(num_columns, selector);
 
-    std::vector<ColumnsWithTypeAndName> captures(num_columns, captured_columns);
+    VectorWithMemoryTracking<ColumnsWithTypeAndName> captures(num_columns, captured_columns);
 
     for (size_t capture = 0; capture < captured_columns.size(); ++capture)
     {
         auto parts = captured_columns[capture].column->scatter(num_columns, selector);
-        for (IColumn::ColumnIndex part = 0; part < num_columns; ++part)
+        for (size_t part = 0; part < num_columns; ++part)
             captures[part][capture].column = std::move(parts[part]);
     }
 
-    std::vector<MutableColumnPtr> columns;
+    VectorWithMemoryTracking<MutableColumnPtr> columns;
     columns.reserve(num_columns);
-    for (IColumn::ColumnIndex part = 0; part < num_columns; ++part)
+    for (size_t part = 0; part < num_columns; ++part)
     {
         auto & capture = captures[part];
         size_t capture_size = capture.empty() ? counts[part] : capture.front().column->size();
-        columns.emplace_back(ColumnFunction::create(capture_size, function, std::move(capture), is_short_circuit_argument));
+        columns.emplace_back(ColumnFunction::create(
+            capture_size,
+            function,
+            std::move(capture),
+            is_short_circuit_argument,
+            is_function_compiled,
+            recursively_convert_result_to_full_column_if_low_cardinality,
+            allow_lazy_replicated_captures,
+            short_circuit_argument_statistics,
+            short_circuit_eager_argument));
     }
 
     return columns;
@@ -170,6 +413,56 @@ size_t ColumnFunction::allocatedBytes() const
     return total_size;
 }
 
+void ColumnFunction::updateHashWithValue(size_t n, SipHash & hash) const
+{
+    hash.update(function->getName());
+    for (const auto & column : captured_columns)
+        column.column->updateHashWithValue(n, hash);
+}
+
+void ColumnFunction::computeHashInto(size_t row_begin, size_t row_end, UInt32 * hash_out, bool initial) const
+{
+    const size_t n = row_end - row_begin;
+
+    if (captured_columns.empty())
+    {
+        /// No captures: a single fixed per-row hash (all bits set).
+        if (initial)
+            for (size_t i = 0; i < n; ++i)
+                hash_out[i] = WEAK_HASH32_INITIAL_VALUE;
+        else
+            for (size_t i = 0; i < n; ++i)
+                hash_out[i] = combineWeakHash32(WEAK_HASH32_INITIAL_VALUE, hash_out[i]);
+        return;
+    }
+
+    if (initial)
+    {
+        /// Seed with `WEAK_HASH32_INITIAL_VALUE` and chain every capture.
+        for (size_t i = 0; i < n; ++i)
+            hash_out[i] = WEAK_HASH32_INITIAL_VALUE;
+        for (const auto & column : captured_columns)
+            column.column->computeHashInto(row_begin, row_end, hash_out, false);
+        return;
+    }
+
+    /// Non-initial: build the finalized function row hash in a scratch buffer, then combine that
+    /// single value into the prior key columns' hash (rather than streaming captures straight into
+    /// `hash_out`) so composition stays representation-independent. See IColumn::computeHashInto.
+    PaddedPODArray<UInt32> function_hash(n, WEAK_HASH32_INITIAL_VALUE);
+    for (const auto & column : captured_columns)
+        column.column->computeHashInto(row_begin, row_end, function_hash.data(), false);
+    for (size_t i = 0; i < n; ++i)
+        hash_out[i] = combineWeakHash32(function_hash[i], hash_out[i]);
+}
+
+void ColumnFunction::updateHashFast(SipHash & hash) const
+{
+    hash.update(function->getName());
+    for (const auto & column : captured_columns)
+        column.column->updateHashFast(hash);
+}
+
 void ColumnFunction::appendArguments(const ColumnsWithTypeAndName & columns)
 {
     auto args = function->getArgumentTypes().size();
@@ -177,10 +470,9 @@ void ColumnFunction::appendArguments(const ColumnsWithTypeAndName & columns)
     auto wanna_capture = columns.size();
 
     if (were_captured + wanna_capture > args)
-        throw Exception("Cannot capture " + toString(wanna_capture) + " columns because function " + function->getName()
-                        + " has " + toString(args) + " arguments" +
-                        (were_captured ? " and " + toString(were_captured) + " columns have already been captured" : "")
-                        + ".", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot capture {} column(s) because function {} has {} arguments{}.",
+                        wanna_capture, function->getName(), args,
+                        (were_captured ? " and " + toString(were_captured) + " columns have already been captured" : ""));
 
     for (const auto & column : columns)
         appendArgument(column);
@@ -188,39 +480,66 @@ void ColumnFunction::appendArguments(const ColumnsWithTypeAndName & columns)
 
 void ColumnFunction::appendArgument(const ColumnWithTypeAndName & column)
 {
-    const auto & argumnet_types = function->getArgumentTypes();
-
+    const auto & argument_types = function->getArgumentTypes();
     auto index = captured_columns.size();
-    if (!is_short_circuit_argument && !column.type->equals(*argumnet_types[index]))
-        throw Exception("Cannot capture column " + std::to_string(argumnet_types.size()) +
-                        " because it has incompatible type: got " + column.type->getName() +
-                        ", but " + argumnet_types[index]->getName() + " is expected.", ErrorCodes::LOGICAL_ERROR);
+    if (!is_short_circuit_argument && !column.type->equals(*argument_types[index]))
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot capture column {} because it has incompatible type: "
+                        "got {}, but {} is expected.", argument_types.size(), column.type->getName(), argument_types[index]->getName());
 
-    captured_columns.push_back(column);
+    auto captured_column = column;
+    /// Keep replicated captures lazy if allowed: some functions inside the lambda handle
+    /// ColumnReplicated arguments themselves
+    if (!allow_lazy_replicated_captures)
+        captured_column.column = captured_column.column->convertToFullColumnIfReplicated();
+    captured_column.column = captured_column.column->convertToFullColumnIfSparse();
+    captured_columns.push_back(std::move(captured_column));
 }
 
 DataTypePtr ColumnFunction::getResultType() const
 {
+    if (recursively_convert_result_to_full_column_if_low_cardinality)
+        return recursiveRemoveLowCardinality(function->getResultType());
+
     return function->getResultType();
 }
 
-ColumnWithTypeAndName ColumnFunction::reduce() const
+ColumnWithTypeAndName ColumnFunction::reduce(bool dry_run) const
 {
     auto args = function->getArgumentTypes().size();
     auto captured = captured_columns.size();
 
     if (args != captured)
-        throw Exception("Cannot call function " + function->getName() + " because is has " + toString(args) +
-                        "arguments but " + toString(captured) + " columns were captured.", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot call function {} because is has {} "
+                        "arguments but {} columns were captured.",
+                        function->getName(), toString(args), toString(captured));
 
     ColumnsWithTypeAndName columns = captured_columns;
+    /// Arguments of lazy executed function can also be lazy executed.
     if (is_short_circuit_argument)
     {
-        /// Arguments of lazy executed function can also be lazy executed.
-        for (auto & col : columns)
+        IFunction::ShortCircuitSettings settings;
+        /// We shouldn't execute all arguments if this function is short circuit,
+        /// because it will handle lazy executed arguments by itself.
+        /// Execute only arguments with disabled lazy execution.
+        /// A function with commutative arguments can have another argument chosen to be executed first.
+        if (function->isShortCircuit(settings, args))
         {
-            if (const ColumnFunction * arg = checkAndGetShortCircuitArgument(col.column))
-                col = arg->reduce();
+            if (short_circuit_eager_argument)
+                settings.arguments_with_disabled_lazy_execution = {*short_circuit_eager_argument};
+
+            for (size_t i : settings.arguments_with_disabled_lazy_execution)
+            {
+                if (const ColumnFunction * arg = checkAndGetShortCircuitArgument(columns[i].column))
+                    columns[i] = arg->reduce(dry_run);
+            }
+        }
+        else
+        {
+            for (auto & col : columns)
+            {
+                if (const ColumnFunction * arg = checkAndGetShortCircuitArgument(col.column))
+                    col = arg->reduce(dry_run);
+            }
         }
     }
 
@@ -230,14 +549,78 @@ ColumnWithTypeAndName ColumnFunction::reduce() const
     if (is_function_compiled)
         ProfileEvents::increment(ProfileEvents::CompiledFunctionExecute);
 
-    res.column = function->execute(columns, res.type, size_);
+    res.column = function->execute(columns, res.type, elements_size, dry_run);
+    /// The result can be lazily replicated (ColumnReplicated), e.g. when the lambda just returns a captured column. Materialize it here so
+    /// consumers of reduce don't have to handle ColumnReplicated.
+    res.column = res.column->convertToFullColumnIfReplicated();
+    if (!columnMatchesType(*res.column, *res.type))
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Unexpected return type from {}. Expected {}. Got {}",
+            function->getName(),
+            res.type->getName(),
+            res.column->getName());
+    if (recursively_convert_result_to_full_column_if_low_cardinality)
+    {
+        res.column = recursiveRemoveLowCardinality(res.column);
+        res.type = recursiveRemoveLowCardinality(res.type);
+    }
     return res;
+}
+
+ColumnPtr ColumnFunction::recursivelyConvertResultToFullColumnIfLowCardinality() const
+{
+    return ColumnFunction::create(
+        elements_size,
+        function,
+        captured_columns,
+        is_short_circuit_argument,
+        is_function_compiled,
+        /*recursively_convert_result_to_full_column_if_low_cardinality_=*/ true,
+        allow_lazy_replicated_captures,
+        short_circuit_argument_statistics,
+        short_circuit_eager_argument);
+}
+
+void ColumnFunction::forEachMutableSubcolumn(MutableColumnCallback callback)
+{
+    for (auto & column : captured_columns)
+    {
+        WrappedPtr wrapped = column.column;
+        callback(wrapped);
+        column.column = std::move(wrapped).detach();
+    }
+}
+
+void ColumnFunction::forEachMutableSubcolumnRecursively(RecursiveMutableColumnCallback callback)
+{
+    for (auto & column : captured_columns)
+    {
+        auto & mutable_column = column.column->assumeMutableRef();
+        callback(mutable_column);
+        mutable_column.forEachMutableSubcolumnRecursively(callback);
+    }
+}
+
+void ColumnFunction::forEachSubcolumn(ColumnCallback callback) const
+{
+    for (const auto & column : captured_columns)
+        callback(column.column);
+}
+
+void ColumnFunction::forEachSubcolumnRecursively(RecursiveColumnCallback callback) const
+{
+    for (const auto & column : captured_columns)
+    {
+        callback(*column.column);
+        column.column->forEachSubcolumnRecursively(callback);
+    }
 }
 
 const ColumnFunction * checkAndGetShortCircuitArgument(const ColumnPtr & column)
 {
-    const ColumnFunction * column_function;
-    if ((column_function = typeid_cast<const ColumnFunction *>(column.get())) && column_function->isShortCircuitArgument())
+    const auto * column_function = typeid_cast<const ColumnFunction *>(column.get());
+    if (column_function && column_function->isShortCircuitArgument())
         return column_function;
     return nullptr;
 }

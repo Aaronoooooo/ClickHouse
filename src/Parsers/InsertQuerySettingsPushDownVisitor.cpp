@@ -5,7 +5,6 @@
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTSubquery.h>
 
-#include <iterator>
 #include <algorithm>
 
 namespace DB
@@ -55,7 +54,7 @@ void InsertQuerySettingsPushDownMatcher::visit(ASTSelectQuery & select_query, AS
             insert_settings.push_back(setting);
         else
         {
-            /// Do not ovewrite setting that was passed for INSERT
+            /// Do not overwrite setting that was passed for INSERT
             /// by settings that was passed for SELECT
         }
     }

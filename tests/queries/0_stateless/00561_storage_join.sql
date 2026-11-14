@@ -1,7 +1,8 @@
 drop table IF EXISTS joinbug;
 
+set allow_deprecated_syntax_for_merge_tree=1;
 CREATE TABLE joinbug (
-  event_date Date MATERIALIZED toDate(created, 'Europe/Moscow'),
+  event_date Date MATERIALIZED toDate(created, 'Asia/Istanbul'),
   id UInt64,
   id2 UInt64,
   val UInt64,
@@ -34,8 +35,9 @@ SEMI LEFT JOIN joinbug_join using id2;
 -- type conversion
 SELECT * FROM ( SELECT toUInt32(11) AS id2 ) AS js1 SEMI LEFT JOIN joinbug_join USING (id2);
 
--- can't convert right side in case on storage join
-SELECT * FROM ( SELECT toInt64(11) AS id2 ) AS js1 SEMI LEFT JOIN joinbug_join USING (id2); -- { serverError 53 }
+-- the right side of a storage join cannot be converted to a supertype of the key types,
+-- but the analyzer can convert both keys to their common subtype
+SELECT * FROM ( SELECT toInt64(11) AS id2 ) AS js1 SEMI LEFT JOIN joinbug_join USING (id2);
 
 DROP TABLE joinbug;
 DROP TABLE joinbug_join;

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <type_traits>
+#include <vector>
+#include <base/defines.h>
 #include <Common/HashTable/HashTable.h>
 
 
@@ -12,17 +15,20 @@
   * - if you need to merge two hash tables together, then you can easily parallelize it by buckets;
   * - delay during resizes is amortized, since the small hash tables will be resized separately;
   * - in theory, resizes are cache-local in a larger range of sizes.
+  *
+  * With `BITS_FOR_BUCKET = 0` there is a single bucket: routing folds to a constant.
+  * Lookups and inserts compile down to what the single-level table does.
+  *
+  * Buckets share no state.
+  * Threads may fill different buckets at the same time when every bucket is written under its own lock.
   */
 
-template <size_t initial_size_degree = 8>
-struct TwoLevelHashTableGrower : public HashTableGrower<initial_size_degree>
-{
-    /// Increase the size of the hash table.
-    void increaseSize()
-    {
-        this->size_degree += this->size_degree >= 15 ? 1 : 2;
-    }
-};
+/// The buckets grow by 4 times while they are small, and switch to the Robin Hood mode when they become large,
+/// see `HashTableGrowerWithPrecalculationAndRobinHood`.
+template <size_t initial_size_degree = 8, size_t robin_hood_size_degree = 16>
+using TwoLevelHashTableGrower = HashTableGrowerWithPrecalculationAndRobinHood<initial_size_degree, 15, robin_hood_size_degree>;
+
+constexpr size_t DEFAULT_BITS_FOR_BUCKET = 8;
 
 template
 <
@@ -32,12 +38,14 @@ template
     typename Grower,
     typename Allocator,
     typename ImplTable = HashTable<Key, Cell, Hash, Grower, Allocator>,
-    size_t BITS_FOR_BUCKET = 8
+    size_t BITS_FOR_BUCKET = DEFAULT_BITS_FOR_BUCKET
 >
 class TwoLevelHashTable :
     private boost::noncopyable,
     protected Hash            /// empty base optimization
 {
+    static_assert(BITS_FOR_BUCKET < 32, "the bucket is taken from the low 32 bits of the hash");
+
 protected:
     friend class const_iterator;
     friend class iterator;
@@ -47,8 +55,8 @@ protected:
 public:
     using Impl = ImplTable;
 
-    static constexpr size_t NUM_BUCKETS = 1ULL << BITS_FOR_BUCKET;
-    static constexpr size_t MAX_BUCKET = NUM_BUCKETS - 1;
+    static constexpr UInt32 NUM_BUCKETS = 1ULL << BITS_FOR_BUCKET;
+    static constexpr UInt32 MAX_BUCKET = NUM_BUCKETS - 1;
 
     size_t hash(const Key & x) const { return Hash::operator()(x); }
 
@@ -91,12 +99,30 @@ public:
 
     Impl impls[NUM_BUCKETS];
 
+    /// Whether the buckets may switch to the Robin Hood mode when they become large. Call it before inserting.
+    void setRobinHoodAllowed(bool allowed) requires GrowerWithRobinHood<Grower>
+    {
+        for (auto & impl : impls)
+            impl.grower.setRobinHoodAllowed(allowed);
+    }
 
-    TwoLevelHashTable() {}
+    /// `bucket_cells_prefix[b]` is the number of cells in the buckets before `b`. See `computeBucketPrefix`.
+    std::vector<size_t> bucket_cells_prefix;
+
+
+    TwoLevelHashTable() = default;
+
+    explicit TwoLevelHashTable(size_t size_hint)
+    {
+        for (auto & impl : impls)
+            impl.reserve(size_hint / NUM_BUCKETS);
+    }
 
     /// Copy the data from another (normal) hash table. It should have the same hash function.
+    /// The constraint keeps an integer size hint from choosing this overload over the one above.
     template <typename Source>
-    TwoLevelHashTable(const Source & src)
+    requires(!std::is_arithmetic_v<Source>)
+    explicit TwoLevelHashTable(const Source & src)
     {
         typename Source::const_iterator it = src.begin();
 
@@ -117,7 +143,7 @@ public:
     }
 
 
-    class iterator
+    class iterator /// NOLINT
     {
         Self * container{};
         size_t bucket{};
@@ -129,7 +155,7 @@ public:
             : container(container_), bucket(bucket_), current_it(current_it_) {}
 
     public:
-        iterator() {}
+        iterator() = default;
 
         bool operator== (const iterator & rhs) const { return bucket == rhs.bucket && current_it == rhs.current_it; }
         bool operator!= (const iterator & rhs) const { return !(*this == rhs); }
@@ -151,23 +177,26 @@ public:
 
         Cell * getPtr() const { return current_it.getPtr(); }
         size_t getHash() const { return current_it.getHash(); }
+        size_t getBucket() const { return bucket; }
     };
 
 
-    class const_iterator
+    class const_iterator /// NOLINT
     {
-        Self * container{};
+        const Self * container{};
         size_t bucket{};
         typename Impl::const_iterator current_it{};
 
         friend class TwoLevelHashTable;
 
-        const_iterator(Self * container_, size_t bucket_, typename Impl::const_iterator current_it_)
-            : container(container_), bucket(bucket_), current_it(current_it_) {}
+        const_iterator(const Self * container_, size_t bucket_, typename Impl::const_iterator current_it_)
+            : container(container_), bucket(bucket_), current_it(current_it_)
+        {
+        }
 
     public:
-        const_iterator() {}
-        const_iterator(const iterator & rhs) : container(rhs.container), bucket(rhs.bucket), current_it(rhs.current_it) {}
+        const_iterator() = default;
+        const_iterator(const iterator & rhs) : container(rhs.container), bucket(rhs.bucket), current_it(rhs.current_it) {} /// NOLINT
 
         bool operator== (const const_iterator & rhs) const { return bucket == rhs.bucket && current_it == rhs.current_it; }
         bool operator!= (const const_iterator & rhs) const { return !(*this == rhs); }
@@ -185,10 +214,11 @@ public:
         }
 
         const Cell & operator* () const { return *current_it; }
-        const Cell * operator->() const { return current_it->getPtr(); }
+        const Cell * operator->() const { return current_it.getPtr(); }
 
         const Cell * getPtr() const { return current_it.getPtr(); }
         size_t getHash() const { return current_it.getHash(); }
+        size_t getBucket() const { return bucket; }
     };
 
 
@@ -209,6 +239,22 @@ public:
     const_iterator end() const         { return { this, MAX_BUCKET, impls[MAX_BUCKET].end() }; }
     iterator end()                     { return { this, MAX_BUCKET, impls[MAX_BUCKET].end() }; }
 
+    const_iterator iteratorAt(size_t bucket) const
+    {
+        if (bucket >= NUM_BUCKETS)
+            return end();
+        auto impl_it = beginOfNextNonEmptyBucket(bucket);
+        return { this, bucket, impl_it };
+    }
+
+    iterator iteratorAt(size_t bucket)
+    {
+        if (bucket >= NUM_BUCKETS)
+            return end();
+        auto impl_it = beginOfNextNonEmptyBucket(bucket);
+        return { this, bucket, impl_it };
+    }
+
 
     /// Insert a value. In the case of any more complex values, it is better to use the `emplace` function.
     std::pair<LookupResult, bool> ALWAYS_INLINE insert(const value_type & x)
@@ -219,11 +265,45 @@ public:
         emplace(Cell::getKey(x), res.first, res.second, hash_value);
 
         if (res.second)
-            insertSetMapped(res.first->getMapped(), x);
+            res.first->setMapped(x);
 
         return res;
     }
 
+    std::pair<LookupResult, bool> ALWAYS_INLINE insert(const Cell & cell)
+    {
+        auto hash_value = cell.getHash(*this);
+
+        std::pair<LookupResult, bool> res;
+        emplace(cell.getKey(), res.first, res.second, hash_value);
+
+        if (res.second)
+            res.first->setMapped(cell.getValue());
+
+        return res;
+    }
+
+    template <typename KeyHolder>
+    void ALWAYS_INLINE prefetch(KeyHolder && key_holder) const
+    {
+        const auto & key = keyHolderGetKey(key_holder);
+        const auto key_hash = hash(key);
+        prefetchByHash(key_hash);
+        /// Release any temporary key memory held by the holder (e.g. `SerializedKeyHolder` rolls back the Arena allocation).
+        keyHolderDiscardKey(key_holder);
+    }
+
+    void ALWAYS_INLINE prefetchByHash(size_t key_hash) const
+    {
+        const auto bucket = getBucketFromHash(key_hash);
+        impls[bucket].prefetchByHash(key_hash);
+    }
+
+    bool ALWAYS_INLINE isEmptyCell(size_t key_hash) const
+    {
+        const auto bucket = getBucketFromHash(key_hash);
+        return impls[bucket].isEmptyCell(key_hash);
+    }
 
     /** Insert the key,
       * return an iterator to a position that can be used for `placement new` of value,
@@ -272,16 +352,24 @@ public:
 
     ConstLookupResult ALWAYS_INLINE find(Key x) const { return find(x, hash(x)); }
 
+    bool ALWAYS_INLINE erase(Key x, size_t hash_value)
+    {
+        size_t buck = getBucketFromHash(hash_value);
+        return impls[buck].erase(x, hash_value);
+    }
+
+    bool ALWAYS_INLINE erase(Key x) { return erase(x, hash(x)); }
+
 
     void write(DB::WriteBuffer & wb) const
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             impls[i].write(wb);
     }
 
     void writeText(DB::WriteBuffer & wb) const
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
         {
             if (i != 0)
                 DB::writeChar(',', wb);
@@ -291,13 +379,13 @@ public:
 
     void read(DB::ReadBuffer & rb)
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             impls[i].read(rb);
     }
 
     void readText(DB::ReadBuffer & rb)
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
         {
             if (i != 0)
                 DB::assertChar(',', rb);
@@ -309,15 +397,25 @@ public:
     size_t size() const
     {
         size_t res = 0;
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             res += impls[i].size();
 
         return res;
     }
 
+    /// Walk the mapped values of every bucket. `TwoLevelHashMapTable` shadows this with its own; defined
+    /// here so that a two-level table over set buckets - which have no mapped values, so this visits
+    /// nothing - also satisfies generic code that iterates mapped values.
+    template <typename Func>
+    void ALWAYS_INLINE forEachMapped(Func && func)
+    {
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
+            impls[i].forEachMapped(func);
+    }
+
     bool empty() const
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             if (!impls[i].empty())
                 return false;
 
@@ -327,9 +425,45 @@ public:
     size_t getBufferSizeInBytes() const
     {
         size_t res = 0;
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             res += impls[i].getBufferSizeInBytes();
 
         return res;
+    }
+
+    size_t getBufferSizeInCells() const
+    {
+        size_t res = 0;
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
+            res += impls[i].getBufferSizeInCells();
+        return res;
+    }
+
+    /// Prefix sums that `offsetInternal` uses to number cells across all buckets.
+    /// Call it after the last insert and before reading offsets, never while another thread reads them.
+    void computeBucketPrefix()
+    {
+        bucket_cells_prefix.assign(NUM_BUCKETS, 0);
+        size_t run = 0;
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
+        {
+            bucket_cells_prefix[i] = run;
+            run += impls[i].getBufferSizeInCells();
+        }
+    }
+
+    /// Number of the cell over all buckets. The zero cell gets 0. Any other cell gets its position in the
+    /// concatenated bucket buffers plus one. So the number fits an array of `getBufferSizeInCells() + 1`.
+    size_t offsetInternal(ConstLookupResult ptr) const
+    {
+        if constexpr (NUM_BUCKETS == 1)
+            return impls[0].offsetInternal(ptr);
+
+        const size_t buck = getBucketFromHash(ptr->getHash(*this));
+        if (ptr->isZero(impls[buck]))
+            return 0;
+
+        chassert(!bucket_cells_prefix.empty(), "computeBucketPrefix must run before an offset is read");
+        return bucket_cells_prefix[buck] + (ptr - impls[buck].buf) + 1;
     }
 };

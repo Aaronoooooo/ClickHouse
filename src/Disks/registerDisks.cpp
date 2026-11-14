@@ -1,50 +1,44 @@
-#include "registerDisks.h"
+#include <Disks/registerDisks.h>
 
-#include "DiskFactory.h"
+#include <Disks/DiskFactory.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageFactory.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.h>
 
-#include <Common/config.h>
+#include "config.h"
 
 namespace DB
 {
 
-void registerDiskLocal(DiskFactory & factory);
-void registerDiskMemory(DiskFactory & factory);
-
-#if USE_AWS_S3
-void registerDiskS3(DiskFactory & factory);
-#endif
+void registerDiskLocal(DiskFactory & factory, bool global_skip_access_check);
 
 #if USE_SSL
-void registerDiskEncrypted(DiskFactory & factory);
+void registerDiskEncrypted(DiskFactory & factory, bool global_skip_access_check);
 #endif
 
-#if USE_HDFS
-void registerDiskHDFS(DiskFactory & factory);
-#endif
-
-void registerDiskWebServer(DiskFactory & factory);
+void registerDiskCache(DiskFactory & factory, bool global_skip_access_check);
+void registerDiskObjectStorage(DiskFactory & factory, bool global_skip_access_check);
 
 
-void registerDisks()
+void registerDisks(bool global_skip_access_check)
 {
     auto & factory = DiskFactory::instance();
 
-    registerDiskLocal(factory);
-    registerDiskMemory(factory);
-
-#if USE_AWS_S3
-    registerDiskS3(factory);
-#endif
+    registerDiskLocal(factory, global_skip_access_check);
 
 #if USE_SSL
-    registerDiskEncrypted(factory);
+    registerDiskEncrypted(factory, global_skip_access_check);
 #endif
 
-#if USE_HDFS
-    registerDiskHDFS(factory);
-#endif
+    registerDiskCache(factory, global_skip_access_check);
 
-    registerDiskWebServer(factory);
+    registerDiskObjectStorage(factory, global_skip_access_check);
+}
+
+void clearDiskRegistry()
+{
+    DiskFactory::instance().clearRegistry();
+    ObjectStorageFactory::instance().clearRegistry();
+    MetadataStorageFactory::instance().clearRegistry();
 }
 
 }

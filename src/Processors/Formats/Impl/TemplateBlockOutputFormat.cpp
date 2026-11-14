@@ -1,9 +1,12 @@
-#include <Processors/Formats/Impl/TemplateBlockOutputFormat.h>
-#include <Formats/FormatFactory.h>
-#include <Formats/EscapingRuleUtils.h>
-#include <IO/WriteHelpers.h>
+#include <Columns/ColumnConst.h>
+#include <Columns/IColumn.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <Interpreters/Context.h>
+#include <Formats/EscapingRuleUtils.h>
+#include <Formats/FormatFactory.h>
+#include <Formats/FormatSettings.h>
+#include <IO/WriteHelpers.h>
+#include <Processors/Formats/Impl/TemplateBlockOutputFormat.h>
+#include <Processors/Port.h>
 
 
 namespace DB
@@ -12,20 +15,15 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int SYNTAX_ERROR;
+    extern const int INVALID_TEMPLATE_FORMAT;
 }
 
-TemplateBlockOutputFormat::TemplateBlockOutputFormat(const Block & header_, WriteBuffer & out_, const FormatSettings & settings_,
+TemplateBlockOutputFormat::TemplateBlockOutputFormat(SharedHeader header_, WriteBuffer & out_, const FormatSettings & settings_,
                                                      ParsedTemplateFormatString format_, ParsedTemplateFormatString row_format_,
                                                      std::string row_between_delimiter_)
-    : IOutputFormat(header_, out_), settings(settings_), format(std::move(format_))
+    : IOutputFormat(header_, out_), settings(settings_), serializations(header_->getSerializations()), format(std::move(format_))
     , row_format(std::move(row_format_)), row_between_delimiter(std::move(row_between_delimiter_))
 {
-    const auto & sample = getPort(PortKind::Main).getHeader();
-    size_t columns = sample.columns();
-    serializations.resize(columns);
-    for (size_t i = 0; i < columns; ++i)
-        serializations[i] = sample.safeGetByPosition(i).type->getDefaultSerialization();
-
     /// Validate format string for whole output
     size_t data_idx = format.format_idx_to_column_idx.size() + 1;
     for (size_t i = 0; i < format.format_idx_to_column_idx.size(); ++i)
@@ -48,9 +46,11 @@ TemplateBlockOutputFormat::TemplateBlockOutputFormat(const Block & header_, Writ
             case static_cast<size_t>(ResultsetPart::TimeElapsed):
             case static_cast<size_t>(ResultsetPart::RowsRead):
             case static_cast<size_t>(ResultsetPart::BytesRead):
+            case static_cast<size_t>(ResultsetPart::RowsBeforeAggregation):
                 if (format.escaping_rules[i] == EscapingRule::None)
-                    format.throwInvalidFormat("Serialization type for output part rows, rows_before_limit, time, "
-                                              "rows_read or bytes_read is not specified", i);
+                    format.throwInvalidFormat(
+                        "Serialization type for output part rows, rows, time, "
+                        "rows_read or bytes_read is not specified", i);
                 break;
             default:
                 format.throwInvalidFormat("Invalid output part", i);
@@ -66,9 +66,9 @@ TemplateBlockOutputFormat::TemplateBlockOutputFormat(const Block & header_, Writ
     {
         if (!row_format.format_idx_to_column_idx[i])
             row_format.throwInvalidFormat("Cannot skip format field for output, it's a bug.", i);
-        if (header_.columns() <= *row_format.format_idx_to_column_idx[i])
+        if (header_->columns() <= *row_format.format_idx_to_column_idx[i])
             row_format.throwInvalidFormat("Column index " + std::to_string(*row_format.format_idx_to_column_idx[i]) +
-                                          " must be less then number of columns (" + std::to_string(header_.columns()) + ")", i);
+                                          " must be less then number of columns (" + std::to_string(header_->columns()) + ")", i);
         if (row_format.escaping_rules[i] == EscapingRule::None)
             row_format.throwInvalidFormat("Serialization type for file column is not specified", i);
     }
@@ -78,24 +78,25 @@ TemplateBlockOutputFormat::ResultsetPart TemplateBlockOutputFormat::stringToResu
 {
     if (part == "data")
         return ResultsetPart::Data;
-    else if (part == "totals")
+    if (part == "totals")
         return ResultsetPart::Totals;
-    else if (part == "min")
+    if (part == "min")
         return ResultsetPart::ExtremesMin;
-    else if (part == "max")
+    if (part == "max")
         return ResultsetPart::ExtremesMax;
-    else if (part == "rows")
+    if (part == "rows")
         return ResultsetPart::Rows;
-    else if (part == "rows_before_limit")
+    if (part == "rows_before_limit")
         return ResultsetPart::RowsBeforeLimit;
-    else if (part == "time")
+    if (part == "time")
         return ResultsetPart::TimeElapsed;
-    else if (part == "rows_read")
+    if (part == "rows_read")
         return ResultsetPart::RowsRead;
-    else if (part == "bytes_read")
+    if (part == "bytes_read")
         return ResultsetPart::BytesRead;
-    else
-        throw Exception("Unknown output part " + part, ErrorCodes::SYNTAX_ERROR);
+    if (part == "rows_before_aggregation")
+        return ResultsetPart::RowsBeforeAggregation;
+    throw Exception(ErrorCodes::SYNTAX_ERROR, "Unknown output part {}", part);
 }
 
 void TemplateBlockOutputFormat::writeRow(const Chunk & chunk, size_t row_num)
@@ -140,11 +141,7 @@ void TemplateBlockOutputFormat::writePrefix()
 
 void TemplateBlockOutputFormat::finalizeImpl()
 {
-    if (finalized)
-        return;
-
     size_t parts = format.format_idx_to_column_idx.size();
-
     for (size_t i = 0; i < parts; ++i)
     {
         auto type = std::make_shared<DataTypeUInt64>();
@@ -152,59 +149,70 @@ void TemplateBlockOutputFormat::finalizeImpl()
         switch (static_cast<ResultsetPart>(*format.format_idx_to_column_idx[i]))
         {
             case ResultsetPart::Totals:
-                if (!totals || !totals.hasRows())
+                if (!statistics.totals || !statistics.totals.hasRows())
                     format.throwInvalidFormat("Cannot print totals for this request", i);
-                writeRow(totals, 0);
+                writeRow(statistics.totals, 0);
                 break;
             case ResultsetPart::ExtremesMin:
-                if (!extremes)
+                if (!statistics.extremes)
                     format.throwInvalidFormat("Cannot print extremes for this request", i);
-                writeRow(extremes, 0);
+                writeRow(statistics.extremes, 0);
                 break;
             case ResultsetPart::ExtremesMax:
-                if (!extremes)
+                if (!statistics.extremes)
                     format.throwInvalidFormat("Cannot print extremes for this request", i);
-                writeRow(extremes, 1);
+                writeRow(statistics.extremes, 1);
                 break;
             case ResultsetPart::Rows:
                 writeValue<size_t, DataTypeUInt64>(row_count, format.escaping_rules[i]);
                 break;
             case ResultsetPart::RowsBeforeLimit:
-                if (!rows_before_limit_set)
+                if (!statistics.applied_limit)
                     format.throwInvalidFormat("Cannot print rows_before_limit for this request", i);
-                writeValue<size_t, DataTypeUInt64>(rows_before_limit, format.escaping_rules[i]);
+                writeValue<size_t, DataTypeUInt64>(statistics.rows_before_limit, format.escaping_rules[i]);
                 break;
             case ResultsetPart::TimeElapsed:
-                writeValue<double, DataTypeFloat64>(watch.elapsedSeconds(), format.escaping_rules[i]);
+                writeValue<double, DataTypeFloat64>(statistics.watch.elapsedSeconds(), format.escaping_rules[i]);
                 break;
             case ResultsetPart::RowsRead:
-                writeValue<size_t, DataTypeUInt64>(progress.read_rows.load(), format.escaping_rules[i]);
+                writeValue<size_t, DataTypeUInt64>(statistics.progress.read_rows.load(), format.escaping_rules[i]);
                 break;
             case ResultsetPart::BytesRead:
-                writeValue<size_t, DataTypeUInt64>(progress.read_bytes.load(), format.escaping_rules[i]);
+                writeValue<size_t, DataTypeUInt64>(statistics.progress.read_bytes.load(), format.escaping_rules[i]);
+                break;
+            case ResultsetPart::RowsBeforeAggregation:
+                if (!statistics.applied_aggregation)
+                    format.throwInvalidFormat("Cannot print rows_before_aggregation for this request", i);
+                writeValue<size_t, DataTypeUInt64>(statistics.rows_before_aggregation, format.escaping_rules[i]);
                 break;
             default:
                 break;
         }
         writeString(format.delimiters[i + 1], out);
     }
-
-    finalized = true;
 }
 
-
-void registerOutputFormatTemplate(FormatFactory & factory)
+void TemplateBlockOutputFormat::resetFormatterImpl()
 {
-    factory.registerOutputFormat("Template", [](
-            WriteBuffer & buf,
-            const Block & sample,
-            const RowOutputFormatParams &,
-            const FormatSettings & settings)
+    row_count = 0;
+    statistics = Statistics();
+}
+
+namespace
+{
+
+ParsedTemplateFormatString getResultsetFormat(const FormatSettings & settings)
+{
+    auto idx_resultset_by_name = [](const String & partName)
     {
-        ParsedTemplateFormatString resultset_format;
-        if (settings.template_settings.resultset_format.empty())
+        return static_cast<size_t>(TemplateBlockOutputFormat::stringToResultsetPart(partName));
+    };
+    ParsedTemplateFormatString resultset_format;
+    if (settings.template_settings.resultset_format.empty())
+    {
+        /// Default format string: "${data}"
+        if (settings.template_settings.resultset_format_template.empty())
         {
-            /// Default format string: "${data}"
             resultset_format.delimiters.resize(2);
             resultset_format.escaping_rules.emplace_back(ParsedTemplateFormatString::EscapingRule::None);
             resultset_format.format_idx_to_column_idx.emplace_back(0);
@@ -212,25 +220,80 @@ void registerOutputFormatTemplate(FormatFactory & factory)
         }
         else
         {
-            /// Read format string from file
-            resultset_format = ParsedTemplateFormatString(
-                    FormatSchemaInfo(settings.template_settings.resultset_format, "Template", false,
-                            settings.schema.is_server, settings.schema.format_schema_path),
-                    [&](const String & partName)
-                    {
-                        return static_cast<size_t>(TemplateBlockOutputFormat::stringToResultsetPart(partName));
-                    });
+            resultset_format.parse(settings.template_settings.resultset_format_template, idx_resultset_by_name);
         }
+    }
+    else
+    {
+        /// Read format string from file
+        resultset_format = ParsedTemplateFormatString(
+            FormatSchemaInfo(
+                /*format_schema_source=*/FormatSettings::FORMAT_SCHEMA_SOURCE_FILE,
+                /*format_schema=*/settings.template_settings.resultset_format,
+                /*format_schema_message_name=*/"",
+                /*format=*/"Template",
+                /*require_message=*/false,
+                /*is_server=*/settings.schema.is_server,
+                /*format_schema_path=*/settings.schema.format_schema_path),
+            idx_resultset_by_name);
+        if (!settings.template_settings.resultset_format_template.empty())
+        {
+            throw Exception(DB::ErrorCodes::INVALID_TEMPLATE_FORMAT, "Expected either format_template_resultset or format_template_resultset_format, but not both");
+        }
+    }
+    return resultset_format;
+}
 
-        ParsedTemplateFormatString row_format = ParsedTemplateFormatString(
-                FormatSchemaInfo(settings.template_settings.row_format, "Template", false,
-                        settings.schema.is_server, settings.schema.format_schema_path),
-                [&](const String & colName)
-                {
-                    return sample.getPositionByName(colName);
-                });
+}
 
-        return std::make_shared<TemplateBlockOutputFormat>(sample, buf, settings, resultset_format, row_format, settings.template_settings.row_between_delimiter);
+void registerOutputFormatTemplate(FormatFactory & factory);
+void registerOutputFormatTemplate(FormatFactory & factory)
+{
+    factory.registerOutputFormat("Template", [](
+            WriteBuffer & buf,
+            const Block & sample,
+            const FormatSettings & settings,
+            FormatFilterInfoPtr /*format_filter_info*/)
+    {
+        ParsedTemplateFormatString resultset_format = getResultsetFormat(settings);
+
+        ParsedTemplateFormatString row_format;
+        auto idx_row_by_name = [&](const String & colName)
+        {
+            return sample.getPositionByName(colName);
+        };
+        if (settings.template_settings.row_format.empty())
+        {
+            row_format = ParsedTemplateFormatString();
+            row_format.parse(settings.template_settings.row_format_template, idx_row_by_name);
+        }
+        else
+        {
+            row_format = ParsedTemplateFormatString(
+                FormatSchemaInfo(
+                    /*format_schema_source=*/FormatSettings::FORMAT_SCHEMA_SOURCE_FILE,
+                    /*format_schema=*/settings.template_settings.row_format,
+                    /*format_schema_message_name=*/"",
+                    /*format=*/"Template",
+                    /*require_message=*/false,
+                    /*is_server=*/settings.schema.is_server,
+                    /*format_schema_path=*/settings.schema.format_schema_path),
+                idx_row_by_name);
+            if (!settings.template_settings.row_format_template.empty())
+            {
+                throw Exception(DB::ErrorCodes::INVALID_TEMPLATE_FORMAT, "Expected either format_template_row or format_template_row_format, but not both");
+            }
+        }
+        return std::make_shared<TemplateBlockOutputFormat>(std::make_shared<const Block>(sample), buf, settings, resultset_format, row_format, settings.template_settings.row_between_delimiter);
+    });
+
+    factory.registerAppendSupportChecker("Template", [](const FormatSettings & settings)
+    {
+        if (!settings.template_settings.row_between_delimiter.empty())
+            return false;
+        ParsedTemplateFormatString resultset_format = getResultsetFormat(settings);
+        /// Only ${data} with nothing after it: the text before it is not written again when appending.
+        return resultset_format.columnsCount() == 1 && resultset_format.delimiters.back().empty();
     });
 }
 }

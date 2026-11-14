@@ -5,7 +5,7 @@
 #include <boost/geometry/geometries/point_xy.hpp>
 #include <boost/geometry/geometries/polygon.hpp>
 
-#include <base/logger_useful.h>
+#include <Common/logger_useful.h>
 
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnTuple.h>
@@ -19,15 +19,20 @@
 #include <memory>
 #include <utility>
 
+
 namespace DB
 {
+
 namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
 }
 
+namespace
+{
+
 template <typename Point>
-class FunctionPolygonsEquals : public IFunction
+class FunctionPolygonsEquals final : public IFunction
 {
 public:
     static const char * name;
@@ -54,7 +59,12 @@ public:
         return 2;
     }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes &) const override
+    String getSignatureString() const override
+    {
+        return "(Any, Any) -> UInt8";
+    }
+
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
     {
         return std::make_shared<DataTypeUInt8>();
     }
@@ -76,19 +86,16 @@ public:
             using RightConverter = typename RightConverterType::Type;
 
             if constexpr (std::is_same_v<ColumnToPointsConverter<Point>, LeftConverter> || std::is_same_v<ColumnToPointsConverter<Point>, RightConverter>)
-                throw Exception(fmt::format("Any argument of function {} must not be Point", getName()), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Any argument of function {} must not be Point", getName());
             else
             {
-                auto first = LeftConverter::convert(arguments[0].column->convertToFullColumnIfConst());
-                auto second = RightConverter::convert(arguments[1].column->convertToFullColumnIfConst());
+                CorrectedGeometries<LeftConverter> first(arguments[0].column);
+                CorrectedGeometries<RightConverter> second(arguments[1].column);
 
-                for (size_t i = 0; i < input_rows_count; i++)
+                for (size_t i = 0; i < input_rows_count; ++i)
                 {
-                    boost::geometry::correct(first[i]);
-                    boost::geometry::correct(second[i]);
-
                     /// Main work here.
-                    res_data.emplace_back(boost::geometry::equals(first[i], second[i]));
+                    res_data.emplace_back(boost::geometry::equals(first.get(i), second.get(i)));
                 }
             }
         }
@@ -103,14 +110,39 @@ public:
     }
 };
 
-
 template <>
 const char * FunctionPolygonsEquals<CartesianPoint>::name = "polygonsEqualsCartesian";
 
+}
 
-void registerFunctionPolygonsEquals(FunctionFactory & factory)
+REGISTER_FUNCTION(PolygonsEquals)
 {
-    factory.registerFunction<FunctionPolygonsEquals<CartesianPoint>>();
+    FunctionDocumentation::Description description = R"(
+Returns true if two polygons are equal.
+    )";
+    FunctionDocumentation::Syntax syntax = "polygonsEqualsCartesian(polygon1, polygon2)";
+    FunctionDocumentation::Arguments arguments = {
+        {"polygon1", "The first Polygon.", {"Polygon"}},
+        {"polygon2", "The second Polygon.", {"Polygon"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns `1` if equal, otherwise `0`.", {"UInt8"}};
+    FunctionDocumentation::Examples examples =
+    {
+    {
+        "Equality check example",
+        R"(
+SELECT polygonsEqualsCartesian([[[(1., 1.), (1., 4.), (4., 4.), (4., 1.)]]], [[[(1., 1.), (1., 4.), (4., 4.), (4., 1.), (1., 1.)]]])
+        )",
+        R"(
+1
+    )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {21, 4};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::GeoPolygon;
+    FunctionDocumentation function_documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionPolygonsEquals<CartesianPoint>>(function_documentation);
 }
 
 }

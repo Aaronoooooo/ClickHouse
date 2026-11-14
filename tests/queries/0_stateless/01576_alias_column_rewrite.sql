@@ -1,3 +1,7 @@
+SET explain_query_plan_default = 'legacy';
+SET use_skip_indexes_for_top_k = 0;
+SET use_top_k_dynamic_filtering = 0;
+
 DROP TABLE IF EXISTS test_table;
 CREATE TABLE test_table
 (
@@ -24,8 +28,6 @@ SELECT COUNT() = 10 FROM test_table WHERE day = '2020-01-01' SETTINGS max_rows_t
 SELECT t = '2020-01-03' FROM (SELECT day AS t FROM test_table WHERE t = '2020-01-03' GROUP BY t SETTINGS max_rows_to_read = 10);
 SELECT COUNT() = 10 FROM test_table WHERE day = '2020-01-01' UNION ALL SELECT 1 FROM numbers(1) SETTINGS max_rows_to_read = 11;
 SELECT  COUNT() = 0 FROM (SELECT  toDate('2019-01-01') AS  day, day AS t   FROM test_table PREWHERE t = '2020-01-03'  WHERE t  = '2020-01-03' GROUP BY t );
-
-
 
 SELECT 'test-join';
 SELECT day = '2020-01-03'
@@ -62,7 +64,7 @@ SELECT COUNT() = 10 FROM test_table WHERE day1 = '2020-01-02' SETTINGS max_rows_
 SELECT t = '2020-01-03' FROM (SELECT day1 AS t FROM test_table WHERE t = '2020-01-03' GROUP BY t SETTINGS max_rows_to_read = 10);
 SELECT t = '2020-01-03' FROM (SELECT day2 AS t FROM test_table WHERE t = '2020-01-03' GROUP BY t SETTINGS max_rows_to_read = 10);
 SELECT COUNT() = 10 FROM test_table WHERE day1 = '2020-01-03' UNION ALL SELECT 1 FROM numbers(1) SETTINGS max_rows_to_read = 11;
-SELECT  COUNT() = 0 FROM (SELECT  toDate('2019-01-01') AS  day1, day1 AS t   FROM test_table PREWHERE t = '2020-01-03'  WHERE t  = '2020-01-03' GROUP BY t );
+SELECT COUNT() = 0 FROM (SELECT  toDate('2019-01-01') AS  day1, day1 AS t   FROM test_table PREWHERE t = '2020-01-03'  WHERE t  = '2020-01-03' GROUP BY t );
 SELECT day1 = '2020-01-04' FROM test_table PREWHERE day1 = '2020-01-04'  WHERE day1 = '2020-01-04' GROUP BY day1 SETTINGS max_rows_to_read = 10;
 
 
@@ -83,15 +85,15 @@ SELECT count() == 10 FROM test_table WHERE  arrayMap((day) -> day + 1, [1,2,3]) 
 set max_rows_to_read = 0;
 
 SELECT 'optimize_read_in_order';
-EXPLAIN SELECT day AS s FROM test_table ORDER BY s LIMIT 1 SETTINGS optimize_read_in_order = 0;
-EXPLAIN SELECT day AS s FROM test_table ORDER BY s LIMIT 1 SETTINGS optimize_read_in_order = 1;
-EXPLAIN SELECT toDate(timestamp) AS s FROM test_table ORDER BY toDate(timestamp) LIMIT 1 SETTINGS optimize_read_in_order = 1;
+EXPLAIN description = 0 SELECT day AS s FROM test_table ORDER BY s LIMIT 1 SETTINGS optimize_read_in_order = 0, enable_parallel_replicas = 0;
+EXPLAIN description = 0 SELECT day AS s FROM test_table ORDER BY s LIMIT 1 SETTINGS optimize_read_in_order = 1, enable_parallel_replicas = 0;
+EXPLAIN description = 0 SELECT toDate(timestamp) AS s FROM test_table ORDER BY toDate(timestamp) LIMIT 1 SETTINGS optimize_read_in_order = 1, enable_parallel_replicas = 0;
 
 
 SELECT 'optimize_aggregation_in_order';
-EXPLAIN SELECT day, count() AS s FROM test_table GROUP BY day SETTINGS optimize_aggregation_in_order = 0;
-EXPLAIN SELECT day, count() AS s FROM test_table GROUP BY day SETTINGS optimize_aggregation_in_order = 1;
-EXPLAIN SELECT toDate(timestamp), count() AS s FROM test_table GROUP BY toDate(timestamp) SETTINGS optimize_aggregation_in_order = 1;
+EXPLAIN description = 0 SELECT day, count() AS s FROM test_table GROUP BY day SETTINGS optimize_aggregation_in_order = 0, enable_parallel_replicas = 0;
+EXPLAIN description = 0 SELECT day, count() AS s FROM test_table GROUP BY day SETTINGS optimize_aggregation_in_order = 1, enable_parallel_replicas = 0;
+EXPLAIN description = 0 SELECT toDate(timestamp), count() AS s FROM test_table GROUP BY toDate(timestamp) SETTINGS optimize_aggregation_in_order = 1, enable_parallel_replicas = 0;
 
 DROP TABLE test_table;
 
@@ -117,13 +119,15 @@ DROP TABLE IF EXISTS test_index;
 
 
 -- check alias column can be used to match projections
-drop table if exists p;
+drop table if exists pd;
+drop table if exists pl;
 create table pd (dt DateTime, i int, dt_m DateTime alias toStartOfMinute(dt)) engine Distributed(test_shard_localhost, currentDatabase(), 'pl');
 create table pl (dt DateTime, i int, projection p (select sum(i) group by toStartOfMinute(dt))) engine MergeTree order by dt;
 
 insert into pl values ('2020-10-24', 1);
 
-select sum(i) from pd group by dt_m settings allow_experimental_projection_optimization = 1, force_optimize_projection = 1;
+set max_rows_to_read = 2;
+select sum(i) from pd group by dt_m settings optimize_use_projections = 1, force_optimize_projection = 1;
 
 drop table pd;
 drop table pl;

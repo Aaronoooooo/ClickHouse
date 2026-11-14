@@ -1,4 +1,4 @@
-#include "config_functions.h"
+#include "config.h"
 
 #if USE_S2_GEOMETRY
 
@@ -10,22 +10,22 @@
 #include <Common/typeid_cast.h>
 #include <base/range.h>
 
-#include "s2_fwd.h"
+#include <Functions/s2_fwd.h>
 
 namespace DB
 {
 
 namespace ErrorCodes
 {
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int BAD_ARGUMENTS;
+    extern const int ILLEGAL_COLUMN;
 }
 
 namespace
 {
 
 
-class FunctionS2RectUnion : public IFunction
+class FunctionS2RectUnion final : public IFunction
 {
 public:
     static constexpr auto name = "s2RectUnion";
@@ -46,29 +46,56 @@ public:
 
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    String getSignatureString() const override
     {
-        for (size_t i = 0; i < getNumberOfArguments(); ++i)
-        {
-            const auto * arg = arguments[i].get();
-            if (!WhichDataType(arg).isUInt64())
-                throw Exception(
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                    "Illegal type {} of argument {} of function {}. Must be UInt64",
-                    arg->getName(), i + 1, getName());
-        }
-
-        DataTypePtr element = std::make_shared<DataTypeUInt64>();
-
-        return std::make_shared<DataTypeTuple>(DataTypes{element, element});
+        return "(UInt64, UInt64, UInt64, UInt64) -> Tuple(UInt64, UInt64)";
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
-        const auto * col_lo1 = arguments[0].column.get();
-        const auto * col_hi1 = arguments[1].column.get();
-        const auto * col_lo2 = arguments[2].column.get();
-        const auto * col_hi2 = arguments[3].column.get();
+        auto non_const_arguments = arguments;
+        for (auto & argument : non_const_arguments)
+            argument.column = argument.column->convertToFullColumnIfConst();
+
+        const auto * col_lo1 = checkAndGetColumn<ColumnUInt64>(non_const_arguments[0].column.get());
+        if (!col_lo1)
+            throw Exception(
+                ErrorCodes::ILLEGAL_COLUMN,
+                "Illegal type {} of argument {} of function {}. Must be UInt64",
+                arguments[0].type->getName(),
+                1,
+                getName());
+        const auto & data_lo1 = col_lo1->getData();
+
+        const auto * col_hi1 = checkAndGetColumn<ColumnUInt64>(non_const_arguments[1].column.get());
+        if (!col_hi1)
+            throw Exception(
+                ErrorCodes::ILLEGAL_COLUMN,
+                "Illegal type {} of argument {} of function {}. Must be UInt64",
+                arguments[1].type->getName(),
+                2,
+                getName());
+        const auto & data_hi1 = col_hi1->getData();
+
+        const auto * col_lo2 = checkAndGetColumn<ColumnUInt64>(non_const_arguments[2].column.get());
+        if (!col_lo2)
+            throw Exception(
+                ErrorCodes::ILLEGAL_COLUMN,
+                "Illegal type {} of argument {} of function {}. Must be UInt64",
+                arguments[2].type->getName(),
+                3,
+                getName());
+        const auto & data_lo2 = col_lo2->getData();
+
+        const auto * col_hi2 = checkAndGetColumn<ColumnUInt64>(non_const_arguments[3].column.get());
+        if (!col_hi2)
+            throw Exception(
+                ErrorCodes::ILLEGAL_COLUMN,
+                "Illegal type {} of argument {} of function {}. Must be UInt64",
+                arguments[3].type->getName(),
+                4,
+                getName());
+        const auto & data_hi2 = col_hi2->getData();
 
         auto col_res_first = ColumnUInt64::create();
         auto col_res_second = ColumnUInt64::create();
@@ -79,21 +106,21 @@ public:
         auto & vec_res_second = col_res_second->getData();
         vec_res_second.reserve(input_rows_count);
 
-        for (const auto row : collections::range(0, input_rows_count))
+        for (size_t row = 0; row < input_rows_count; ++row)
         {
-            const auto lo1 = S2CellId(col_lo1->getUInt(row));
-            const auto hi1 = S2CellId(col_hi1->getUInt(row));
-            const auto lo2 = S2CellId(col_lo2->getUInt(row));
-            const auto hi2 = S2CellId(col_hi2->getUInt(row));
-
-            if (!lo1.is_valid() || !hi1.is_valid())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "First rectangle is not valid");
-
-            if (!lo2.is_valid() || !hi2.is_valid())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Second rectangle is not valid");
+            const auto lo1 = S2CellId(data_lo1[row]);
+            const auto hi1 = S2CellId(data_hi1[row]);
+            const auto lo2 = S2CellId(data_lo2[row]);
+            const auto hi2 = S2CellId(data_hi2[row]);
 
             S2LatLngRect rect1(lo1.ToLatLng(), hi1.ToLatLng());
             S2LatLngRect rect2(lo2.ToLatLng(), hi2.ToLatLng());
+
+            if (!rect1.is_valid() || !rect2.is_valid())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Rectangle is invalid. For valid rectangles the latitude bounds do not exceed "
+                    "Pi/2 in absolute value and the longitude bounds do not exceed Pi in absolute value. "
+                    "Also, if either the latitude or longitude bound is empty then both must be. ");
 
             S2LatLngRect rect_union = rect1.Union(rect2);
 
@@ -108,9 +135,26 @@ public:
 
 }
 
-void registerFunctionS2RectUnion(FunctionFactory & factory)
+REGISTER_FUNCTION(S2RectUnion)
 {
-    factory.registerFunction<FunctionS2RectUnion>();
+    FunctionDocumentation::Description description = R"(
+Returns the smallest S2 latitude-longitude rectangle that contains the union of two input rectangles. Each rectangle is represented by a pair of S2 cell identifiers for its low and high corners.
+    )";
+    FunctionDocumentation::Syntax syntax = "s2RectUnion(s2Rect1Low, s2Rect1High, s2Rect2Low, s2Rect2High)";
+    FunctionDocumentation::Arguments arguments = {
+        {"s2Rect1Low", "S2 cell identifier of the low vertex of the first rectangle.", {"UInt64"}},
+        {"s2Rect1High", "S2 cell identifier of the high vertex of the first rectangle.", {"UInt64"}},
+        {"s2Rect2Low", "S2 cell identifier of the low vertex of the second rectangle.", {"UInt64"}},
+        {"s2Rect2High", "S2 cell identifier of the high vertex of the second rectangle.", {"UInt64"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns a tuple (s2RectLow, s2RectHigh) representing the union rectangle.", {"Tuple(UInt64, UInt64)"}};
+    FunctionDocumentation::Examples examples = {{"Basic usage", "SELECT s2RectUnion(5178914411069187297, 5177056748191934217, 5179062030687166815, 5177056748191934217)",
+     "(5179062030687166815,5177056748191934217)"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {21, 9};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Geo;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionS2RectUnion>(documentation);
 }
 
 

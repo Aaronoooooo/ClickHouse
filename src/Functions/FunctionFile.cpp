@@ -1,11 +1,20 @@
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnConst.h>
 #include <Columns/IColumn.h>
 #include <Functions/FunctionFactory.h>
+#include <Access/Common/AccessFlags.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <IO/ReadBufferFromFile.h>
+#include <IO/WriteBufferFromVector.h>
+#include <IO/copyData.h>
 #include <Interpreters/Context.h>
-#include <unistd.h>
+#include <Common/filesystemHelpers.h>
 #include <filesystem>
+#include <Functions/FunctionHelpers.h>
+#include <Core/ColumnWithTypeAndName.h>
+
 
 namespace fs = std::filesystem;
 
@@ -15,48 +24,78 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
-    extern const int NOT_IMPLEMENTED;
-    extern const int INCORRECT_FILE_NAME;
     extern const int DATABASE_ACCESS_DENIED;
-    extern const int FILE_DOESNT_EXIST;
 }
 
+
 /// A function to read file as a string.
-class FunctionFile : public IFunction, WithContext
+class FunctionFile final : public IFunction
 {
 public:
     static constexpr auto name = "file";
-    static FunctionPtr create(ContextPtr context_) { return std::make_shared<FunctionFile>(context_); }
-    explicit FunctionFile(ContextPtr context_) : WithContext(context_) {}
-
-    String getName() const override { return name; }
-
-    size_t getNumberOfArguments() const override { return 1; }
-    bool isInjective(const ColumnsWithTypeAndName &) const override { return true; }
-    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
-
-    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
+    static FunctionPtr create(ContextPtr context)
     {
-        if (!isString(arguments[0].type))
-            throw Exception(getName() + " is only implemented for types String", ErrorCodes::NOT_IMPLEMENTED);
+        if (context && context->getApplicationType() != Context::ApplicationType::LOCAL)
+            context->checkAccess(AccessType::READ, toStringSource(AccessTypeObjects::Source::FILE));
+
+        return std::make_shared<FunctionFile>();
+    }
+
+    bool isVariadic() const override { return true; }
+    String getName() const override { return name; }
+    size_t getNumberOfArguments() const override { return 0; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+    bool isDeterministic() const override { return false; }
+    bool isDeterministicInScopeOfQuery() const override { return false; }
+
+    String getSignatureString() const override
+    {
+        return "(String, NULL) -> Nullable(String) OR (String, [const String]) -> String";
+    }
+
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
         return std::make_shared<DataTypeString>();
     }
 
+    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
+
+    bool useDefaultImplementationForNulls() const override { return false; }
+
     bool useDefaultImplementationForConstants() const override { return true; }
 
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
         const ColumnPtr column = arguments[0].column;
-        const ColumnString * expected = checkAndGetColumn<ColumnString>(column.get());
-        if (!expected)
-            throw Exception(
-                fmt::format("Illegal column {} of argument of function {}", arguments[0].column->getName(), getName()),
-                ErrorCodes::ILLEGAL_COLUMN);
+        const ColumnString * column_src = checkAndGetColumn<ColumnString>(column.get());
+        if (!column_src)
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN,
+                "Illegal column {} of argument of function {}", arguments[0].column->getName(), getName());
 
-        const ColumnString::Chars & chars = expected->getChars();
-        const ColumnString::Offsets & offsets = expected->getOffsets();
+        String default_result;
 
-        std::vector<String> checked_filenames(input_rows_count);
+        ColumnUInt8::MutablePtr col_null_map_to;
+        ColumnUInt8::Container * vec_null_map_to [[maybe_unused]] = nullptr;
+
+        if (arguments.size() == 2)
+        {
+            if (result_type->isNullable())
+            {
+                col_null_map_to = ColumnUInt8::create(input_rows_count, false);
+                vec_null_map_to = &col_null_map_to->getData();
+            }
+            else
+            {
+                const auto & default_column = arguments[1].column;
+                const ColumnConst * default_col = checkAndGetColumn<ColumnConst>(default_column.get());
+
+                if (!default_col)
+                    throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}",
+                        arguments[1].column->getName(), getName());
+
+                default_result = default_col->getValue<String>();
+            }
+        }
 
         auto result = ColumnString::create();
         auto & res_chars = result->getChars();
@@ -64,69 +103,94 @@ public:
 
         res_offsets.resize(input_rows_count);
 
-        size_t source_offset = 0;
-        size_t result_offset = 0;
+        const auto & context = Context::getGlobalContextInstance();
+        fs::path user_files_absolute_path = fs::canonical(fs::path(context->getUserFilesPath()));
+        std::string user_files_absolute_path_string = user_files_absolute_path.string();
+
+        // If run in Local mode, no need for path checking.
+        bool need_check = context->getApplicationType() != Context::ApplicationType::LOCAL;
+
         for (size_t row = 0; row < input_rows_count; ++row)
         {
-            const char * filename = reinterpret_cast<const char *>(&chars[source_offset]);
+            std::string_view filename = column_src->getDataAt(row);
+            fs::path file_path(filename.data(), filename.data() + filename.size());
 
-            fs::path user_files_absolute_path = fs::canonical(fs::path(getContext()->getUserFilesPath()));
-            fs::path file_path(filename);
             if (file_path.is_relative())
                 file_path = user_files_absolute_path / file_path;
-            fs::path file_absolute_path = fs::canonical(file_path);
-            checkReadIsAllowedOrThrow(user_files_absolute_path.string(), file_absolute_path);
 
-            checked_filenames[row] = file_absolute_path.string();
+            /// Do not use fs::canonical or fs::weakly_canonical.
+            /// Otherwise it will not allow to work with symlinks in `user_files_path` directory.
+            file_path = fs::absolute(file_path).lexically_normal();
 
-            if (!fs::exists(file_absolute_path))
-                throw Exception(fmt::format("File {} doesn't exist.", file_absolute_path.string()), ErrorCodes::FILE_DOESNT_EXIST);
+            try
+            {
+                if (need_check && !fileOrSymlinkPathStartsWith(file_path.string(), user_files_absolute_path_string))
+                    throw Exception(ErrorCodes::DATABASE_ACCESS_DENIED, "File is not inside {}", user_files_absolute_path.string());
 
-            const auto current_file_size = fs::file_size(file_absolute_path);
+                ReadBufferFromFile in(file_path);
+                auto out = WriteBufferFromVector<ColumnString::Chars>(res_chars, AppendModeTag{});
+                copyData(in, out);
+            }
+            catch (...)
+            {
+                if (arguments.size() == 1)
+                    throw;
 
-            result_offset += current_file_size + 1;
-            res_offsets[row] = result_offset;
-            source_offset = offsets[row];
+                if (vec_null_map_to)
+                    (*vec_null_map_to)[row] = true;
+                else
+                    res_chars.insert(default_result.data(), default_result.data() + default_result.size());
+            }
+
+            res_offsets[row] = res_chars.size();
         }
 
-        res_chars.resize(result_offset);
-
-        size_t prev_offset = 0;
-
-        for (size_t row = 0; row < input_rows_count; ++row)
-        {
-            auto file_absolute_path = checked_filenames[row];
-            ReadBufferFromFile in(file_absolute_path);
-            char * res_buf = reinterpret_cast<char *>(&res_chars[prev_offset]);
-
-            const size_t file_lenght = res_offsets[row] - prev_offset - 1;
-            prev_offset = res_offsets[row];
-            in.readStrict(res_buf, file_lenght);
-            res_buf[file_lenght] = '\0';
-        }
+        if (vec_null_map_to)
+            return ColumnNullable::create(std::move(result), std::move(col_null_map_to));
 
         return result;
-    }
-
-private:
-
-    void checkReadIsAllowedOrThrow(const std::string & user_files_absolute_path, const std::string & file_absolute_path) const
-    {
-        // If run in Local mode, no need for path checking.
-        if (getContext()->getApplicationType() != Context::ApplicationType::LOCAL)
-            if (file_absolute_path.find(user_files_absolute_path) != 0)
-                throw Exception("File is not inside " + user_files_absolute_path, ErrorCodes::DATABASE_ACCESS_DENIED);
-
-        fs::path fs_path(file_absolute_path);
-        if (fs::exists(fs_path) && fs::is_directory(fs_path))
-            throw Exception("File can't be a directory", ErrorCodes::INCORRECT_FILE_NAME);
     }
 };
 
 
-void registerFunctionFile(FunctionFactory & factory)
+REGISTER_FUNCTION(File)
 {
-    factory.registerFunction<FunctionFile>();
+    FunctionDocumentation::Description description = R"(
+Reads a file as a string and loads the data into the specified column.
+The file content is not interpreted.
+
+Also see the [`file`](/reference/functions/table-functions/file) table function.
+        )";
+    FunctionDocumentation::Syntax syntax = "file(path[, default])";
+    FunctionDocumentation::Arguments arguments = {
+        {"path", "The path of the file relative to the `user_files_path`. Supports wildcards `*`, `**`, `?`, `{abc,def}` and `{N..M}` where `N`, `M` are numbers and `'abc', 'def'` are strings.", {"String"}},
+        {"default", "The value returned if the file does not exist or cannot be accessed.", {"String", "NULL"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the file content as a string.", {"String"}};
+    FunctionDocumentation::Examples examples = {
+        {
+            "Insert files into a table",
+            R"(
+INSERT INTO FUNCTION file('a.txt', 'RawBLOB') SELECT 'Hello' SETTINGS engine_file_truncate_on_insert = 1;
+INSERT INTO FUNCTION file('b.txt', 'RawBLOB') SELECT 'World!' SETTINGS engine_file_truncate_on_insert = 1;
+
+CREATE TABLE data (a String, b String) ENGINE = Memory;
+INSERT INTO data SELECT file('a.txt'), file('b.txt');
+
+SELECT * FROM data;
+            )",
+            R"(
+┌─a─────┬─b──────┐
+│ Hello │ World! │
+└───────┴────────┘
+            )"
+        }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {21, 3};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionFile>(documentation);
 }
 
 }

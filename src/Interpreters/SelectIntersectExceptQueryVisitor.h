@@ -2,22 +2,27 @@
 
 #include <unordered_set>
 
-#include <Parsers/IAST.h>
+#include <Parsers/IAST_fwd.h>
 #include <Interpreters/InDepthNodeVisitor.h>
 
 #include <Parsers/ASTSelectIntersectExceptQuery.h>
-#include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Core/SettingsEnums.h>
 
 
 namespace DB
 {
 
 class ASTFunction;
+class ASTSelectWithUnionQuery;
 
 class SelectIntersectExceptQueryMatcher
 {
 public:
-    struct Data {};
+    struct Data
+    {
+        const SetOperationMode intersect_default_mode;
+        const SetOperationMode except_default_mode;
+    };
 
     static bool needChildVisit(const ASTPtr &, const ASTPtr &) { return true; }
 

@@ -1,21 +1,29 @@
-#include <signal.h>
+// NOLINTBEGIN(readability-inconsistent-declaration-parameter-name,readability-else-after-return)
+
+#include <csignal>
 #include <sys/time.h>
 #if defined(OS_LINUX)
 #   include <sys/sysinfo.h>
 #endif
 #include <sched.h>
 
+#include <mutex>
 #include <random>
 
 #include <base/sleep.h>
 
 #include <IO/ReadHelpers.h>
-#include <base/logger_useful.h>
 
+#include <Common/CurrentMemoryTracker.h>
 #include <Common/Exception.h>
+#include <Common/ErrnoException.h>
+#include <Common/MemoryTracker.h>
+#include <Common/Silk/FiberScheduler.h>
+#include <Common/ThreadFuzzer.h>
+#include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
 
-#include <Common/ThreadFuzzer.h>
+#include "config.h" // USE_JEMALLOC
 
 
 /// We will also wrap some thread synchronization functions to inject sleep/migration before or after.
@@ -31,12 +39,20 @@
         M(int, pthread_mutex_unlock, pthread_mutex_t * arg)
 #endif
 
-#ifdef HAS_RESERVED_IDENTIFIER
+#pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wreserved-identifier"
-#endif
+#pragma clang diagnostic ignored "-Wdisabled-macro-expansion"
 
 namespace DB
 {
+
+ThreadFuzzer & ThreadFuzzer::instance()
+{
+    static ThreadFuzzer res;
+    return res;
+}
+
+std::atomic<bool> ThreadFuzzer::started{false};
 
 namespace ErrorCodes
 {
@@ -49,16 +65,14 @@ namespace ErrorCodes
 ThreadFuzzer::ThreadFuzzer()
 {
     initConfiguration();
-    if (!isEffective())
-        return;
-    setup();
+    if (isEffective())
+        started.store(true, std::memory_order_relaxed);
 }
-
 
 template <typename T>
 static void initFromEnv(T & what, const char * name)
 {
-    const char * env = getenv(name);
+    const char * env = getenv(name); // NOLINT(concurrency-mt-unsafe)
     if (!env)
         return;
     what = parse<T>(env);
@@ -67,7 +81,7 @@ static void initFromEnv(T & what, const char * name)
 template <typename T>
 static void initFromEnv(std::atomic<T> & what, const char * name)
 {
-    const char * env = getenv(name);
+    const char * env = getenv(name); // NOLINT(concurrency-mt-unsafe)
     if (!env)
         return;
     what.store(parse<T>(env), std::memory_order_relaxed);
@@ -81,12 +95,12 @@ static std::atomic<int> num_cpus = 0;
         static std::atomic<double> NAME##_before_yield_probability = 0; \
         static std::atomic<double> NAME##_before_migrate_probability = 0; \
         static std::atomic<double> NAME##_before_sleep_probability = 0; \
-        static std::atomic<double> NAME##_before_sleep_time_us = 0; \
+        static std::atomic<double> NAME##_before_sleep_time_us_max = 0; \
 \
         static std::atomic<double> NAME##_after_yield_probability = 0; \
         static std::atomic<double> NAME##_after_migrate_probability = 0; \
         static std::atomic<double> NAME##_after_sleep_probability = 0; \
-        static std::atomic<double> NAME##_after_sleep_time_us = 0;
+        static std::atomic<double> NAME##_after_sleep_time_us_max = 0;
 
 FOR_EACH_WRAPPED_FUNCTION(DEFINE_WRAPPER_PARAMS)
 
@@ -105,20 +119,21 @@ void ThreadFuzzer::initConfiguration()
     initFromEnv(yield_probability, "THREAD_FUZZER_YIELD_PROBABILITY");
     initFromEnv(migrate_probability, "THREAD_FUZZER_MIGRATE_PROBABILITY");
     initFromEnv(sleep_probability, "THREAD_FUZZER_SLEEP_PROBABILITY");
-    initFromEnv(sleep_time_us, "THREAD_FUZZER_SLEEP_TIME_US");
+    initFromEnv(sleep_time_us_max, "THREAD_FUZZER_SLEEP_TIME_US_MAX");
+    initFromEnv(explicit_sleep_probability, "THREAD_FUZZER_EXPLICIT_SLEEP_PROBABILITY");
+    initFromEnv(explicit_memory_exception_probability, "THREAD_FUZZER_EXPLICIT_MEMORY_EXCEPTION_PROBABILITY");
 
 #if THREAD_FUZZER_WRAP_PTHREAD
 #    define INIT_WRAPPER_PARAMS(RET, NAME, ...) \
         initFromEnv(NAME##_before_yield_probability, "THREAD_FUZZER_" #NAME "_BEFORE_YIELD_PROBABILITY"); \
         initFromEnv(NAME##_before_migrate_probability, "THREAD_FUZZER_" #NAME "_BEFORE_MIGRATE_PROBABILITY"); \
         initFromEnv(NAME##_before_sleep_probability, "THREAD_FUZZER_" #NAME "_BEFORE_SLEEP_PROBABILITY"); \
-        initFromEnv(NAME##_before_sleep_time_us, "THREAD_FUZZER_" #NAME "_BEFORE_SLEEP_TIME_US"); \
+        initFromEnv(NAME##_before_sleep_time_us_max, "THREAD_FUZZER_" #NAME "_BEFORE_SLEEP_TIME_US_MAX"); \
 \
         initFromEnv(NAME##_after_yield_probability, "THREAD_FUZZER_" #NAME "_AFTER_YIELD_PROBABILITY"); \
         initFromEnv(NAME##_after_migrate_probability, "THREAD_FUZZER_" #NAME "_AFTER_MIGRATE_PROBABILITY"); \
         initFromEnv(NAME##_after_sleep_probability, "THREAD_FUZZER_" #NAME "_AFTER_SLEEP_PROBABILITY"); \
-        initFromEnv(NAME##_after_sleep_time_us, "THREAD_FUZZER_" #NAME "_AFTER_SLEEP_TIME_US");
-
+        initFromEnv(NAME##_after_sleep_time_us_max, "THREAD_FUZZER_" #NAME "_AFTER_SLEEP_TIME_US_MAX");
     FOR_EACH_WRAPPED_FUNCTION(INIT_WRAPPER_PARAMS)
 
 #    undef INIT_WRAPPER_PARAMS
@@ -126,29 +141,35 @@ void ThreadFuzzer::initConfiguration()
 }
 
 
+bool ThreadFuzzer::needsSetup() const
+{
+    return cpu_time_period_us != 0
+        && (yield_probability > 0 || migrate_probability > 0 || (sleep_probability > 0 && sleep_time_us_max > 0));
+}
+
 bool ThreadFuzzer::isEffective() const
 {
-    if (!isStarted())
-        return false;
+    if (needsSetup())
+        return true;
 
 #if THREAD_FUZZER_WRAP_PTHREAD
 #    define CHECK_WRAPPER_PARAMS(RET, NAME, ...) \
-        if (NAME##_before_yield_probability.load(std::memory_order_relaxed)) \
+        if (NAME##_before_yield_probability.load(std::memory_order_relaxed) > 0.0) \
             return true; \
-        if (NAME##_before_migrate_probability.load(std::memory_order_relaxed)) \
+        if (NAME##_before_migrate_probability.load(std::memory_order_relaxed) > 0.0) \
             return true; \
-        if (NAME##_before_sleep_probability.load(std::memory_order_relaxed)) \
+        if (NAME##_before_sleep_probability.load(std::memory_order_relaxed) > 0.0) \
             return true; \
-        if (NAME##_before_sleep_time_us.load(std::memory_order_relaxed)) \
+        if (NAME##_before_sleep_time_us_max.load(std::memory_order_relaxed) > 0.0) \
             return true; \
 \
-        if (NAME##_after_yield_probability.load(std::memory_order_relaxed)) \
+        if (NAME##_after_yield_probability.load(std::memory_order_relaxed) > 0.0) \
             return true; \
-        if (NAME##_after_migrate_probability.load(std::memory_order_relaxed)) \
+        if (NAME##_after_migrate_probability.load(std::memory_order_relaxed) > 0.0) \
             return true; \
-        if (NAME##_after_sleep_probability.load(std::memory_order_relaxed)) \
+        if (NAME##_after_sleep_probability.load(std::memory_order_relaxed) > 0.0) \
             return true; \
-        if (NAME##_after_sleep_time_us.load(std::memory_order_relaxed)) \
+        if (NAME##_after_sleep_time_us_max.load(std::memory_order_relaxed) > 0.0) \
             return true;
 
     FOR_EACH_WRAPPED_FUNCTION(CHECK_WRAPPER_PARAMS)
@@ -156,19 +177,48 @@ bool ThreadFuzzer::isEffective() const
 #    undef INIT_WRAPPER_PARAMS
 #endif
 
-    return cpu_time_period_us != 0
-        && (yield_probability > 0
-            || migrate_probability > 0
-            || (sleep_probability > 0 && sleep_time_us > 0));
+    if (explicit_sleep_probability > 0 && sleep_time_us_max > 0)
+        return true;
+
+    if (explicit_memory_exception_probability > 0)
+        return true;
+
+    return false;
 }
+
+/// A period of 0 disarms the timer.
+static void setPerturbationTimer(uint64_t cpu_time_period_us)
+{
+    static constexpr UInt32 timer_precision = 1000000;
+
+    struct timeval interval{};
+    interval.tv_sec = cpu_time_period_us / timer_precision;
+    interval.tv_usec = cpu_time_period_us % timer_precision;
+
+    struct itimerval timer = {.it_interval = interval, .it_value = interval};
+
+    if (0 != setitimer(ITIMER_PROF, &timer, nullptr))
+        throw ErrnoException(ErrorCodes::CANNOT_CREATE_TIMER, "Failed to set profiling timer for thread fuzzer");
+}
+
+/// Keeps `started` consistent with `ITIMER_PROF` under concurrent `start`/`stop`. Never lock it in `signalHandler`.
+static std::mutex perturbation_state_mutex;
 
 void ThreadFuzzer::stop()
 {
+    std::lock_guard lock(perturbation_state_mutex);
     started.store(false, std::memory_order_relaxed);
+    if (instance().needsSetup())
+        setPerturbationTimer(0);
 }
 
 void ThreadFuzzer::start()
 {
+    std::lock_guard lock(perturbation_state_mutex);
+    if (!instance().isEffective())
+        return;
+    if (instance().needsSetup())
+        setPerturbationTimer(instance().cpu_time_period_us);
     started.store(true, std::memory_order_relaxed);
 }
 
@@ -177,14 +227,14 @@ bool ThreadFuzzer::isStarted()
     return started.load(std::memory_order_relaxed);
 }
 
-static void injection(
+static void injectionImpl(
     double yield_probability,
     double migrate_probability,
     double sleep_probability,
-    double sleep_time_us [[maybe_unused]])
+    double sleep_time_us_max)
 {
     DENY_ALLOCATIONS_IN_SCOPE;
-    if (!ThreadFuzzer::isStarted())
+    if (!ThreadFuzzer::isStarted() || Silk::isInsideFiber())
         return;
 
     if (yield_probability > 0
@@ -211,38 +261,73 @@ static void injection(
     UNUSED(migrate_probability);
 #endif
 
-    if (sleep_probability > 0
-        && sleep_time_us > 0
-        && std::bernoulli_distribution(sleep_probability)(thread_local_rng))
+    if (sleep_probability > 0 && sleep_time_us_max > 0.001 && std::bernoulli_distribution(sleep_probability)(thread_local_rng))
     {
-        sleepForNanoseconds(sleep_time_us * 1000);
+        sleepForNanoseconds((thread_local_rng() % static_cast<uint64_t>(sleep_time_us_max * 1000)));
     }
 }
 
+static ALWAYS_INLINE void injection(
+    double yield_probability,
+    double migrate_probability,
+    double sleep_probability,
+    double sleep_time_us_max)
+{
+    DENY_ALLOCATIONS_IN_SCOPE;
+    if (!ThreadFuzzer::isStarted())
+        return;
+
+    injectionImpl(yield_probability, migrate_probability, sleep_probability, sleep_time_us_max);
+}
+
+void ThreadFuzzer::maybeInjectSleep()
+{
+    auto & fuzzer = ThreadFuzzer::instance();
+    injection(fuzzer.yield_probability, fuzzer.migrate_probability, fuzzer.explicit_sleep_probability, fuzzer.sleep_time_us_max);
+}
+
+/// Sometimes maybeInjectSleep() is not enough and we need to inject an exception.
+/// The most suitable exception for this purpose is MEMORY_LIMIT_EXCEEDED: it can be thrown almost from everywhere.
+/// NOTE We also have a query setting fault_probability, but it does not work for background operations (maybe we should fix it).
+void ThreadFuzzer::maybeInjectMemoryLimitException()
+{
+    if (!isStarted())
+        return;
+
+    auto & fuzzer = ThreadFuzzer::instance();
+    if (fuzzer.explicit_memory_exception_probability <= 0.0)
+        return;
+    std::bernoulli_distribution fault(fuzzer.explicit_memory_exception_probability);
+    if (fault(thread_local_rng))
+        CurrentMemoryTracker::injectFault();
+}
 
 void ThreadFuzzer::signalHandler(int)
 {
     DENY_ALLOCATIONS_IN_SCOPE;
     auto saved_errno = errno;
-
     auto & fuzzer = ThreadFuzzer::instance();
-    injection(fuzzer.yield_probability, fuzzer.migrate_probability, fuzzer.sleep_probability, fuzzer.sleep_time_us);
-
+    injection(fuzzer.yield_probability, fuzzer.migrate_probability, fuzzer.sleep_probability, fuzzer.sleep_time_us_max);
     errno = saved_errno;
 }
 
 void ThreadFuzzer::setup() const
 {
+    if (!needsSetup())
+        return;
+
+    std::lock_guard lock(perturbation_state_mutex);
+
     struct sigaction sa{};
     sa.sa_handler = signalHandler;
     sa.sa_flags = SA_RESTART;
 
 #if defined(OS_LINUX)
     if (sigemptyset(&sa.sa_mask))
-        throwFromErrno("Failed to clean signal mask for thread fuzzer", ErrorCodes::CANNOT_MANIPULATE_SIGSET);
+        throw ErrnoException(ErrorCodes::CANNOT_MANIPULATE_SIGSET, "Failed to clean signal mask for thread fuzzer");
 
     if (sigaddset(&sa.sa_mask, SIGPROF))
-        throwFromErrno("Failed to add signal to mask for thread fuzzer", ErrorCodes::CANNOT_MANIPULATE_SIGSET);
+        throw ErrnoException(ErrorCodes::CANNOT_MANIPULATE_SIGSET, "Failed to add signal to mask for thread fuzzer");
 #else
     // the two following functions always return 0 under mac
     sigemptyset(&sa.sa_mask);
@@ -250,48 +335,152 @@ void ThreadFuzzer::setup() const
 #endif
 
     if (sigaction(SIGPROF, &sa, nullptr))
-        throwFromErrno("Failed to setup signal handler for thread fuzzer", ErrorCodes::CANNOT_SET_SIGNAL_HANDLER);
+        throw ErrnoException(ErrorCodes::CANNOT_SET_SIGNAL_HANDLER, "Failed to setup signal handler for thread fuzzer");
 
-    static constexpr UInt32 timer_precision = 1000000;
-
-    struct timeval interval;
-    interval.tv_sec = cpu_time_period_us / timer_precision;
-    interval.tv_usec = cpu_time_period_us % timer_precision;
-
-    struct itimerval timer = {.it_interval = interval, .it_value = interval};
-
-    if (0 != setitimer(ITIMER_PROF, &timer, nullptr))
-        throwFromErrno("Failed to create profiling timer", ErrorCodes::CANNOT_CREATE_TIMER);
+    setPerturbationTimer(cpu_time_period_us);
 }
 
-
-/// We expect that for every function like pthread_mutex_lock there is the same function with two underscores prefix.
-/// NOTE We cannot use dlsym(... RTLD_NEXT), because it will call pthread_mutex_lock and it will lead to infinite recursion.
 
 #if THREAD_FUZZER_WRAP_PTHREAD
-#    define MAKE_WRAPPER(RET, NAME, ...) \
-        extern "C" RET __##NAME(__VA_ARGS__); /* NOLINT */ \
-        extern "C" RET NAME(__VA_ARGS__) /* NOLINT */ \
-        { \
-            injection( \
-                NAME##_before_yield_probability.load(std::memory_order_relaxed), \
-                NAME##_before_migrate_probability.load(std::memory_order_relaxed), \
-                NAME##_before_sleep_probability.load(std::memory_order_relaxed), \
-                NAME##_before_sleep_time_us.load(std::memory_order_relaxed)); \
-\
-            auto && ret{__##NAME(arg)}; \
-\
-            injection( \
-                NAME##_after_yield_probability.load(std::memory_order_relaxed), \
-                NAME##_after_migrate_probability.load(std::memory_order_relaxed), \
-                NAME##_after_sleep_probability.load(std::memory_order_relaxed), \
-                NAME##_after_sleep_time_us.load(std::memory_order_relaxed)); \
-\
-            return ret; \
-        }
+#define INJECTION_BEFORE(NAME) \
+    injectionImpl(                                                         \
+        NAME##_before_yield_probability.load(std::memory_order_relaxed),   \
+        NAME##_before_migrate_probability.load(std::memory_order_relaxed), \
+        NAME##_before_sleep_probability.load(std::memory_order_relaxed),   \
+        NAME##_before_sleep_time_us_max.load(std::memory_order_relaxed));
+#define INJECTION_AFTER(NAME) \
+    injectionImpl(                                                         \
+        NAME##_after_yield_probability.load(std::memory_order_relaxed),    \
+        NAME##_after_migrate_probability.load(std::memory_order_relaxed),  \
+        NAME##_after_sleep_probability.load(std::memory_order_relaxed),    \
+        NAME##_after_sleep_time_us_max.load(std::memory_order_relaxed));
 
-FOR_EACH_WRAPPED_FUNCTION(MAKE_WRAPPER)
+/// ThreadFuzzer intercepts pthread_mutex_lock()/pthread_mutex_unlock().
+///
+/// glibc/musl exports internal symbol
+/// (__pthread_mutex_lock/__pthread_mutex_unlock) that can be used instead of
+/// obtaining real symbol with dlsym(RTLD_NEXT).
+///
+/// But, starting from glibc 2.34 there are no internal symbols without
+/// version, so not __pthread_mutex_lock but __pthread_mutex_lock@2.2.5 (see
+/// GLIBC_COMPAT_SYMBOL macro).
+///
+/// While ASan intercepts those symbols too (using RTLD_NEXT), and not only
+/// public (pthread_mutex_{un,lock}, but also internal
+/// (__pthread_mutex_{un,}lock).
+///
+/// However, since glibc 2.36, dlsym(RTLD_NEXT, "__pthread_mutex_lock") returns
+/// NULL, because starting from 2.36 it does not return internal symbols with
+/// RTLD_NEXT (see [1] and [2]).
+///
+///   [1]: https://sourceware.org/git/?p=glibc.git;a=commit;h=efa7936e4c91b1c260d03614bb26858fbb8a0204
+///   [2]: https://gist.github.com/azat/3b5f2ae6011bef2ae86392cea7789eb7
+///
+/// And this, creates a problem for ThreadFuzzer, since it cannot use internal
+/// symbol anymore (__pthread_mutex_lock), because it is intercepted by ASan,
+/// which will call NULL.
+///
+/// This issue had been fixed for clang 16 [3], but it hadn't been released yet.
+///
+///   [3]: https://reviews.llvm.org/D140957
+///
+/// So to fix this, we will use dlsym(RTLD_NEXT) for the ASan build.
+///
+/// Note, that we cannot use it for release builds, since:
+/// - glibc < 2.36 has allocation in dlsym()
+/// - release build uses jemalloc
+/// - jemalloc has mutexes for allocations
+/// And all of this will lead to endless recursion here (note, that it wasn't
+/// be a problem if only one of functions had been intercepted, since jemalloc
+/// has a guard to not initialize multiple times, but because both intercepted,
+/// the endless recursion takes place, you can find an example in [4]).
+///
+///   [4]: https://gist.github.com/azat/588d9c72c1e70fc13ebe113197883aa2
 
-#    undef MAKE_WRAPPER
+/// Starting from glibc 2.34 there are no internal symbols without version,
+/// so not __pthread_mutex_lock but __pthread_mutex_lock@2.2.5
+#if defined(OS_LINUX) and !defined(USE_MUSL) and !defined(__loongarch64)
+    /// You can get version from glibc/sysdeps/unix/sysv/linux/$ARCH/$BITS_OR_BYTE_ORDER/libc.abilist
+    #if defined(__amd64__)
+    #    define GLIBC_SYMVER "GLIBC_2.2.5"
+    #elif defined(__aarch64__)
+    #    define GLIBC_SYMVER "GLIBC_2.17"
+    #elif defined(__riscv) && (__riscv_xlen == 64)
+    #    define GLIBC_SYMVER "GLIBC_2.27"
+    #elif (defined(__PPC64__) || defined(__powerpc64__)) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    #    define GLIBC_SYMVER "GLIBC_2.17"
+    #elif (defined(__S390X__) || defined(__s390x__))
+    #    define GLIBC_SYMVER "GLIBC_2.2"
+    #elif defined(__e2k__)
+    #    define GLIBC_SYMVER "GLIBC_2.0"
+    #else
+    #    error Your platform is not supported.
+    #endif
+
+    #define GLIBC_COMPAT_SYMBOL(func) __asm__(".symver " #func "," #func "@" GLIBC_SYMVER);
+
+    GLIBC_COMPAT_SYMBOL(__pthread_mutex_unlock)
+    GLIBC_COMPAT_SYMBOL(__pthread_mutex_lock)
+#endif
+
+/// The loongarch64's glibc_version is 2.36
+/// musl always uses the internal symbols: __pthread_mutex_lock is an ordinary
+/// strong symbol there (not versioned, not intercepted by ASan), while dlsym
+/// cannot look up symbols in a statically linked binary.
+#if (defined(ADDRESS_SANITIZER) && !defined(USE_MUSL)) || defined(__loongarch64)
+#if USE_JEMALLOC
+#error "ASan cannot be used with jemalloc"
+#endif
+#include <dlfcn.h>
+
+static void * getFunctionAddress(const char * name)
+{
+    void * address = dlsym(RTLD_NEXT, name);
+    chassert(address && "Cannot obtain function address");
+    return address;
+}
+#define MAKE_WRAPPER_USING_DLSYM(RET, NAME, ...)                                  \
+    static constinit RET(*real_##NAME)(__VA_ARGS__) = nullptr;                    \
+    extern "C" RET NAME(__VA_ARGS__)                                              \
+    {                                                                             \
+        bool thread_fuzzer_enabled = ThreadFuzzer::isStarted();                   \
+        if (thread_fuzzer_enabled)                                                \
+            INJECTION_BEFORE(NAME);                                               \
+        if (unlikely(!real_##NAME)) {                                             \
+            real_##NAME =                                                         \
+                reinterpret_cast<RET(*)(__VA_ARGS__)>(getFunctionAddress(#NAME)); \
+        }                                                                         \
+        auto && ret{real_##NAME(arg)};                                            \
+        if (thread_fuzzer_enabled)                                                \
+            INJECTION_AFTER(NAME);                                                \
+        return ret;                                                               \
+    }
+FOR_EACH_WRAPPED_FUNCTION(MAKE_WRAPPER_USING_DLSYM)
+#undef MAKE_WRAPPER_USING_DLSYM
+#else
+#define MAKE_WRAPPER_USING_INTERNAL_SYMBOLS(RET, NAME, ...) \
+    extern "C" RET __##NAME(__VA_ARGS__);                   \
+    extern "C" RET NAME(__VA_ARGS__)                        \
+    {                                                       \
+        if (!ThreadFuzzer::isStarted())                     \
+        {                                                   \
+            return __##NAME(arg);                           \
+        }                                                   \
+        else                                                \
+        {                                                   \
+            INJECTION_BEFORE(NAME);                         \
+            auto && ret{__##NAME(arg)};                     \
+            INJECTION_AFTER(NAME);                          \
+            return ret;                                     \
+        }                                                   \
+    }
+FOR_EACH_WRAPPED_FUNCTION(MAKE_WRAPPER_USING_INTERNAL_SYMBOLS)
+#undef MAKE_WRAPPER_USING_INTERNAL_SYMBOLS
+#endif
+
 #endif
 }
+
+#pragma clang diagnostic pop
+
+// NOLINTEND(readability-inconsistent-declaration-parameter-name,readability-else-after-return)

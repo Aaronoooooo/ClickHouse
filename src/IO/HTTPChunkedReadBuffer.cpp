@@ -1,43 +1,51 @@
 #include <IO/HTTPChunkedReadBuffer.h>
 
 #include <IO/ReadHelpers.h>
-#include <Common/StringUtils/StringUtils.h>
-#include <Common/hex.h>
+#include <Common/StringUtils.h>
+#include <Common/Hex.h>
 #include <base/arithmeticOverflow.h>
 
 
 namespace DB
 {
 
+namespace
+{
+    constexpr size_t chunk_footer_size = 2;
+}
+
 namespace ErrorCodes
 {
     extern const int ARGUMENT_OUT_OF_BOUND;
     extern const int UNEXPECTED_END_OF_FILE;
-    extern const int CORRUPTED_DATA;
+    extern const int BAD_REQUEST_PARAMETER;
 }
 
 size_t HTTPChunkedReadBuffer::readChunkHeader()
 {
     if (in->eof())
-        throw Exception("Unexpected end of file while reading chunk header of HTTP chunked data", ErrorCodes::UNEXPECTED_END_OF_FILE);
+        throw Exception(ErrorCodes::UNEXPECTED_END_OF_FILE, "Unexpected end of file while reading chunk header of HTTP chunked data");
 
     if (!isHexDigit(*in->position()))
-        throw Exception("Unexpected data instead of HTTP chunk header", ErrorCodes::CORRUPTED_DATA);
+        throw Exception(ErrorCodes::BAD_REQUEST_PARAMETER, "Unexpected data instead of HTTP chunk header");
 
     size_t res = 0;
     do
     {
         if (common::mulOverflow(res, 16ul, res) || common::addOverflow<size_t>(res, unhex(*in->position()), res))
-            throw Exception("Chunk size is out of bounds", ErrorCodes::ARGUMENT_OUT_OF_BOUND);
+            throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "Chunk size is out of bounds");
         ++in->position();
     } while (!in->eof() && isHexDigit(*in->position()));
+
+    if (res > max_chunk_size)
+        throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "Chunk size exceeded the limit (max size: {})", max_chunk_size);
 
     /// NOTE: If we want to read any chunk extensions, it should be done here.
 
     skipToCarriageReturnOrEOF(*in);
 
     if (in->eof())
-        throw Exception("Unexpected end of file while reading chunk header of HTTP chunked data", ErrorCodes::UNEXPECTED_END_OF_FILE);
+        throw Exception(ErrorCodes::UNEXPECTED_END_OF_FILE, "Unexpected end of file while reading chunk header of HTTP chunked data");
 
     assertString("\n", *in);
     return res;
@@ -53,9 +61,11 @@ bool HTTPChunkedReadBuffer::nextImpl()
     if (!in)
         return false;
 
-    /// The footer of previous chunk.
-    if (count())
+    if (need_read_chunk_footer)
+    {
         readChunkFooter();
+        need_read_chunk_footer = false;
+    }
 
     size_t chunk_size = readChunkHeader();
     if (0 == chunk_size)
@@ -68,7 +78,7 @@ bool HTTPChunkedReadBuffer::nextImpl()
     if (in->available() >= chunk_size)
     {
         /// Zero-copy read from input.
-        working_buffer = Buffer(in->position(), in->position() + chunk_size);
+        working_buffer = in->buffer().subrange(in->position(), in->position() + chunk_size);
         in->position() += chunk_size;
     }
     else
@@ -76,13 +86,43 @@ bool HTTPChunkedReadBuffer::nextImpl()
         /// Chunk is not completely in buffer, copy it to scratch space.
         memory.resize(chunk_size);
         in->readStrict(memory.data(), chunk_size);
-        working_buffer = Buffer(memory.data(), memory.data() + chunk_size);
+        working_buffer = WorkingBuffer::fromPaddedStorage(memory, 0, chunk_size);
     }
 
-    /// NOTE: We postpone reading the footer to the next iteration, because it may not be completely in buffer,
-    ///       but we need to keep the current data in buffer available.
+    /// Avoid leaving only the current chunk footer buffered. Otherwise a readiness check would see the footer
+    /// and the following read could still block while waiting for the next chunk header.
+    if (in->available() >= chunk_footer_size)
+        readChunkFooter();
+    else
+        need_read_chunk_footer = true;
 
     return true;
+}
+
+bool HTTPChunkedReadBuffer::poll(size_t timeout_microseconds)
+{
+    if (hasPendingData())
+        return true;
+
+    if (!in)
+        return true;
+
+    if (need_read_chunk_footer)
+    {
+        if (in->available() < chunk_footer_size)
+        {
+            if (in->available() == 0 && !in->poll(timeout_microseconds))
+                return false;
+
+            if (in->available() < chunk_footer_size)
+                return false;
+        }
+
+        readChunkFooter();
+        need_read_chunk_footer = false;
+    }
+
+    return in->poll(timeout_microseconds);
 }
 
 }

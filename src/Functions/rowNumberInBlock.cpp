@@ -9,7 +9,7 @@ namespace DB
 namespace
 {
 
-class FunctionRowNumberInBlock : public IFunction
+class FunctionRowNumberInBlock final : public IFunction
 {
 public:
     static constexpr auto name = "rowNumberInBlock";
@@ -34,7 +34,10 @@ public:
         return 0;
     }
 
-    bool isDeterministic() const override { return false; }
+    bool isDeterministic() const override
+    {
+        return false;
+    }
 
     bool isDeterministicInScopeOfQuery() const override
     {
@@ -43,9 +46,9 @@ public:
 
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & /*arguments*/) const override
+    String getSignatureString() const override
     {
-        return std::make_shared<DataTypeUInt64>();
+        return "() -> UInt64";
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName &, const DataTypePtr &, size_t input_rows_count) const override
@@ -53,8 +56,7 @@ public:
         auto column = ColumnUInt64::create();
         auto & data = column->getData();
         data.resize(input_rows_count);
-        for (size_t i = 0; i < input_rows_count; ++i)
-            data[i] = i;
+        iota(data.data(), input_rows_count, UInt64(0));
 
         return column;
     }
@@ -62,9 +64,49 @@ public:
 
 }
 
-void registerFunctionRowNumberInBlock(FunctionFactory & factory)
+REGISTER_FUNCTION(RowNumberInBlock)
 {
-    factory.registerFunction<FunctionRowNumberInBlock>();
+    FunctionDocumentation::Description description = R"(
+For each [block](/resources/develop-contribute/introduction/architecture#block) processed by `rowNumberInBlock`, returns the number of the current row.
+
+The returned number starts from 0 for each block.
+    )";
+    FunctionDocumentation::Syntax syntax = "rowNumberInBlock()";
+    FunctionDocumentation::Arguments arguments = {};
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the ordinal number of the row in the data block starting from `0`.", {"UInt64"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        R"(
+SELECT rowNumberInBlock()
+FROM
+(
+    SELECT *
+    FROM system.numbers_mt
+    LIMIT 10
+) SETTINGS max_block_size = 2
+        )",
+        R"(
+┌─rowNumberInBlock()─┐
+│                  0 │
+│                  1 │
+│                  0 │
+│                  1 │
+│                  0 │
+│                  1 │
+│                  0 │
+│                  1 │
+│                  0 │
+│                  1 │
+└────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionRowNumberInBlock>(documentation);
 }
 
 }

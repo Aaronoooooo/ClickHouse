@@ -1,2 +1,2 @@
-add_executable (quantile-t-digest quantile-t-digest.cpp)
-target_link_libraries (quantile-t-digest PRIVATE dbms clickhouse_aggregate_functions)
+# Examples are built as part of the clickhouse-examples multi-call binary.
+# See src/Examples/CMakeLists.txt

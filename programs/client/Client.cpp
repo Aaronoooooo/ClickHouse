@@ -1,91 +1,119 @@
-#include <stdlib.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <map>
-#include <iostream>
-#include <fstream>
-#include <iomanip>
-#include <unordered_set>
-#include <algorithm>
-#include <optional>
-#include <base/scope_guard_safe.h>
-#include <boost/program_options.hpp>
+#include <Client.h>
+#include <base/defines.h>
+#include <Client/ConnectionString.h>
+#include <Core/Protocol.h>
+#include <Core/Settings.h>
+
+/// musl defines stderr as (stderr) which is a self-referential macro
+#pragma clang diagnostic ignored "-Wdisabled-macro-expansion"
 #include <boost/algorithm/string/replace.hpp>
-#include <Poco/String.h>
-#include <filesystem>
-#include <string>
-#include "Client.h"
-#include "Core/Protocol.h"
+#include <boost/program_options.hpp>
+#include <Common/Config/parseConnectionCredentials.h>
+#include <Common/ThreadPool.h>
+#include <Common/ThreadStatus.h>
+#include <Common/scope_guard_safe.h>
 
-#include <base/argsToConfig.h>
-#include <base/find_symbols.h>
+#include <Access/AccessControl.h>
 
-#if !defined(ARCADIA_BUILD)
-#    include <Common/config_version.h>
-#endif
-#include <Common/Exception.h>
-#include <Common/formatReadable.h>
-#include <Common/TerminalSize.h>
-#include <Common/Config/configReadClient.h>
-#include "Common/MemoryTracker.h"
-
-#include <Core/QueryProcessingStage.h>
-#include <Client/TestHint.h>
 #include <Columns/ColumnString.h>
-#include <Poco/Util/Application.h>
+#include <Common/Config/ConfigHelper.h>
+#include <Common/Config/ConfigProcessor.h>
+#include <Common/Config/getClientConfigPath.h>
+#include <Common/CurrentThread.h>
+#include <Common/DateLUT.h>
+#include <Common/DateLUTImpl.h>
+#include <Common/DNSResolver.h>
+#include <Common/QueryScope.h>
+#include <Common/Exception.h>
+#include <Common/TerminalSize.h>
+#include <Common/config_version.h>
+#include <Common/formatReadable.h>
 
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
+#include <IO/SharedThreadPools.h>
 #include <IO/WriteBufferFromOStream.h>
-#include <IO/UseSSL.h>
+#include <IO/WriteHelpers.h>
+#include <Interpreters/Context.h>
+#include <Parsers/SecretArguments.h>
 
-#include <Parsers/ASTCreateQuery.h>
-#include <Parsers/ASTDropQuery.h>
-#include <Parsers/ASTSetQuery.h>
-#include <Parsers/ASTUseQuery.h>
-#include <Parsers/ASTInsertQuery.h>
-#include <Parsers/ASTSelectQuery.h>
+#include <Client/JWTProvider.h>
+#include <Client/ClientBaseHelpers.h>
+#include <Client/PortsProbe.h>
+#include <Common/NetException.h>
+#include <Core/Defines.h>
 
-#include <Interpreters/InterpreterSetQuery.h>
-
-#include <Functions/registerFunctions.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
+#include <Formats/FormatFactory.h>
 #include <Formats/registerFormats.h>
-#include "TestTags.h"
+#include <Functions/registerFunctions.h>
 
-#ifndef __clang__
-#pragma GCC optimize("-fno-var-tracking-assignments")
+#include <Storages/MergeTree/MergeTreeSettings.h>
+
+#include <Poco/Util/Application.h>
+#include <Poco/URI.h>
+
+#include <filesystem>
+
+#include "config.h"
+
+#if USE_BUZZHOUSE
+#   include <Client/BuzzHouse/Generator/ExternalIntegrations.h>
+#   include <Client/BuzzHouse/Generator/FuzzConfig.h>
 #endif
 
-namespace CurrentMetrics
-{
-    extern const Metric MemoryTracking;
-}
-
 namespace fs = std::filesystem;
+using namespace std::literals;
 
 
 namespace DB
 {
+namespace Setting
+{
+extern const SettingsBool use_client_time_zone;
+}
+
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int UNKNOWN_PACKET_FROM_SERVER;
-    extern const int SYNTAX_ERROR;
-    extern const int TOO_DEEP_RECURSION;
+    extern const int UNEXPECTED_PACKET_FROM_SERVER;
     extern const int NETWORK_ERROR;
+    extern const int SOCKET_TIMEOUT;
+    extern const int ATTEMPT_TO_READ_AFTER_EOF;
     extern const int AUTHENTICATION_FAILED;
+    extern const int REQUIRED_SECOND_FACTOR;
+    extern const int REQUIRED_PASSWORD;
+    extern const int USER_EXPIRED;
+}
+
+Client::Client()
+{
+    fuzzer = QueryFuzzer(randomSeed(), &std::cout, &std::cerr);
 }
 
 
-void Client::processError(const String & query) const
+Client::~Client() = default;
+
+void Client::processError(std::string_view query) const
 {
+    /// The reader of the output went away, e.g. `clickhouse-client -q '...' | head -1`: stop quietly.
+    if (stdout_is_broken)
+        return;
+
     if (server_exception)
     {
-        fmt::print(stderr, "Received exception from server (version {}):\n{}\n",
-                server_version,
-                getExceptionMessage(*server_exception, print_stack_trace, true));
+        fmt::print(
+            stderr,
+            "Received exception from server (version {}):\n{}\n",
+            server_version,
+            getExceptionMessageForLogging(*server_exception, print_stack_trace, true));
+
+        if (server_exception->code() == ErrorCodes::USER_EXPIRED)
+        {
+            server_exception->rethrow();
+        }
+
         if (is_interactive)
         {
             fmt::print(stderr, "\n");
@@ -112,248 +140,86 @@ void Client::processError(const String & query) const
 
     // A debug check -- at least some exception must be set, if the error
     // flag is set, and vice versa.
-    assert(have_error == (client_exception || server_exception));
+    chassert(have_error == (client_exception || server_exception));
 }
 
 
-bool Client::executeMultiQuery(const String & all_queries_text)
+void Client::showWarnings()
 {
-    // It makes sense not to base any control flow on this, so that it is
-    // the same in tests and in normal usage. The only difference is that in
-    // normal mode we ignore the test hints.
-    const bool test_mode = config().has("testmode");
-    if (test_mode)
+    try
     {
-        /// disable logs if expects errors
-        TestHint test_hint(test_mode, all_queries_text);
-        if (test_hint.clientError() || test_hint.serverError())
-            processTextAsSingleQuery("SET send_logs_level = 'fatal'");
-    }
-
-    bool echo_query = echo_queries;
-
-    /// Test tags are started with "--" so they are interpreted as comments anyway.
-    /// But if the echo is enabled we have to remove the test tags from `all_queries_text`
-    /// because we don't want test tags to be echoed.
-    size_t test_tags_length = test_mode ? getTestTagsLength(all_queries_text) : 0;
-
-    /// Several queries separated by ';'.
-    /// INSERT data is ended by the end of line, not ';'.
-    /// An exception is VALUES format where we also support semicolon in
-    /// addition to end of line.
-    const char * this_query_begin = all_queries_text.data() + test_tags_length;
-    const char * this_query_end;
-    const char * all_queries_end = all_queries_text.data() + all_queries_text.size();
-
-    String full_query; // full_query is the query + inline INSERT data + trailing comments (the latter is our best guess for now).
-    String query_to_execute;
-    ASTPtr parsed_query;
-    std::optional<Exception> current_exception;
-
-    while (true)
-    {
-        auto stage = analyzeMultiQueryText(this_query_begin, this_query_end, all_queries_end,
-                                           query_to_execute, parsed_query, all_queries_text, current_exception);
-        switch (stage)
+        std::vector<String> messages = loadWarningMessages();
+        if (!messages.empty())
         {
-            case MultiQueryProcessingStage::QUERIES_END:
-            case MultiQueryProcessingStage::PARSING_FAILED:
-            {
-                return true;
-            }
-            case MultiQueryProcessingStage::CONTINUE_PARSING:
-            {
-                continue;
-            }
-            case MultiQueryProcessingStage::PARSING_EXCEPTION:
-            {
-                this_query_end = find_first_symbols<'\n'>(this_query_end, all_queries_end);
-
-                // Try to find test hint for syntax error. We don't know where
-                // the query ends because we failed to parse it, so we consume
-                // the entire line.
-                TestHint hint(test_mode, String(this_query_begin, this_query_end - this_query_begin));
-                if (hint.serverError())
-                {
-                    // Syntax errors are considered as client errors
-                    current_exception->addMessage("\nExpected server error '{}'.", hint.serverError());
-                    current_exception->rethrow();
-                }
-
-                if (hint.clientError() != current_exception->code())
-                {
-                    if (hint.clientError())
-                        current_exception->addMessage("\nExpected client error: " + std::to_string(hint.clientError()));
-                    current_exception->rethrow();
-                }
-
-                /// It's expected syntax error, skip the line
-                this_query_begin = this_query_end;
-                current_exception.reset();
-
-                continue;
-            }
-            case MultiQueryProcessingStage::EXECUTE_QUERY:
-            {
-                full_query = all_queries_text.substr(this_query_begin - all_queries_text.data(), this_query_end - this_query_begin);
-                if (query_fuzzer_runs)
-                {
-                    if (!processWithFuzzing(full_query))
-                        return false;
-                    this_query_begin = this_query_end;
-                    continue;
-                }
-
-                // Now we know for sure where the query ends.
-                // Look for the hint in the text of query + insert data + trailing
-                // comments,
-                // e.g. insert into t format CSV 'a' -- { serverError 123 }.
-                // Use the updated query boundaries we just calculated.
-                TestHint test_hint(test_mode, full_query);
-                // Echo all queries if asked; makes for a more readable reference
-                // file.
-                echo_query = test_hint.echoQueries().value_or(echo_query);
-                try
-                {
-                    processParsedSingleQuery(full_query, query_to_execute, parsed_query, echo_query, false);
-                }
-                catch (...)
-                {
-                    // Surprisingly, this is a client error. A server error would
-                    // have been reported w/o throwing (see onReceiveSeverException()).
-                    client_exception = std::make_unique<Exception>(getCurrentExceptionMessage(print_stack_trace), getCurrentExceptionCode());
-                    have_error = true;
-                }
-                // Check whether the error (or its absence) matches the test hints
-                // (or their absence).
-                bool error_matches_hint = true;
-                if (have_error)
-                {
-                    if (test_hint.serverError())
-                    {
-                        if (!server_exception)
-                        {
-                            error_matches_hint = false;
-                            fmt::print(stderr, "Expected server error code '{}' but got no server error (query: {}).\n",
-                                       test_hint.serverError(), full_query);
-                        }
-                        else if (server_exception->code() != test_hint.serverError())
-                        {
-                            error_matches_hint = false;
-                            fmt::print(stderr, "Expected server error code: {} but got: {} (query: {}).\n",
-                                       test_hint.serverError(), server_exception->code(), full_query);
-                        }
-                    }
-                    if (test_hint.clientError())
-                    {
-                        if (!client_exception)
-                        {
-                            error_matches_hint = false;
-                            fmt::print(stderr, "Expected client error code '{}' but got no client error (query: {}).\n",
-                                       test_hint.clientError(), full_query);
-                        }
-                        else if (client_exception->code() != test_hint.clientError())
-                        {
-                            error_matches_hint = false;
-                            fmt::print(stderr, "Expected client error code '{}' but got '{}' (query: {}).\n",
-                                       test_hint.clientError(), client_exception->code(), full_query);
-                        }
-                    }
-                    if (!test_hint.clientError() && !test_hint.serverError())
-                    {
-                        // No error was expected but it still occurred. This is the
-                        // default case w/o test hint, doesn't need additional
-                        // diagnostics.
-                        error_matches_hint = false;
-                    }
-                }
-                else
-                {
-                    if (test_hint.clientError())
-                    {
-                        fmt::print(stderr, "The query succeeded but the client error '{}' was expected (query: {}).\n",
-                                   test_hint.clientError(), full_query);
-                        error_matches_hint = false;
-                    }
-                    if (test_hint.serverError())
-                    {
-                        fmt::print(stderr, "The query succeeded but the server error '{}' was expected (query: {}).\n",
-                                   test_hint.serverError(), full_query);
-                        error_matches_hint = false;
-                    }
-                }
-                // If the error is expected, force reconnect and ignore it.
-                if (have_error && error_matches_hint)
-                {
-                    client_exception.reset();
-                    server_exception.reset();
-                    have_error = false;
-
-                    if (!connection->checkConnected())
-                        connect();
-                }
-
-                // For INSERTs with inline data: use the end of inline data as
-                // reported by the format parser (it is saved in sendData()).
-                // This allows us to handle queries like:
-                //   insert into t values (1); select 1
-                // , where the inline data is delimited by semicolon and not by a
-                // newline.
-                auto * insert_ast = parsed_query->as<ASTInsertQuery>();
-                if (insert_ast && insert_ast->data)
-                {
-                    this_query_end = insert_ast->end;
-                    adjustQueryEnd(this_query_end, all_queries_end, global_context->getSettingsRef().max_parser_depth);
-                }
-
-                // Report error.
-                if (have_error)
-                    processError(full_query);
-
-                // Stop processing queries if needed.
-                if (have_error && !ignore_error)
-                    return is_interactive;
-
-                this_query_begin = this_query_end;
-                break;
-            }
+            output_stream << "Warnings:" << std::endl;
+            for (const auto & message : messages)
+                output_stream << " * " << message << std::endl;
+            output_stream << std::endl;
         }
     }
+    catch (const std::exception &) // NOLINT(bugprone-empty-catch)
+    {
+    }
 }
-
 
 /// Make query to get all server warnings
 std::vector<String> Client::loadWarningMessages()
 {
+    /// Older server versions cannot execute the query loading warnings.
+    constexpr UInt64 min_server_revision_to_load_warnings = DBMS_MIN_PROTOCOL_VERSION_WITH_VIEW_IF_PERMITTED;
+
+    if (server_revision < min_server_revision_to_load_warnings)
+        return {};
+
     std::vector<String> messages;
-    connection->sendQuery(connection_parameters.timeouts, "SELECT message FROM system.warnings", "" /* query_id */,
+
+    /// Unlike `\h`, autocomplete and the AI metadata query, this probe is not settings-agnostic: it
+    /// reads `system.warnings`, and part of that table is derived from the settings the server sees for
+    /// this query - a changed obsolete setting produces a warning of its own. So send what an ordinary
+    /// query sends (which also keeps a compatibility-derived value from being serialized as an explicit
+    /// change, and thus from tripping a profile that pins it read-only), rather than only the
+    /// compression knobs of `networkCompressionSettings`.
+    ///
+    /// The one setting that has to be overridden is `dialect`: the probe below is ClickHouse SQL, so a
+    /// session that switched to another dialect could not parse it. `showWarnings` swallows any
+    /// exception from here, so that failure would not be an error the user sees, but server warnings
+    /// silently never being displayed.
+    ///
+    /// The override is unconditional: only changed settings are serialized, so leaving `dialect` alone
+    /// when the local value is already `clickhouse` would let the server take the parser from the
+    /// effective `dialect` of the authenticated user, which a profile may default to Kusto or PRQL.
+    /// Sending the value a user already has is a no-op for setting constraints, so this does not trip a
+    /// profile that pins `dialect` as read-only to `clickhouse`.
+    Settings probe_settings = settingsWithoutCompatibilityDerived().value_or(client_context->getSettingsRef());
+    probe_settings.set("dialect", String("clickhouse"));
+
+    connection->sendQuery(connection_parameters.timeouts,
+                          "SELECT * FROM viewIfPermitted(SELECT message FROM system.warnings ELSE null('message String'))",
+                          {} /* query_parameters */,
+                          "" /* query_id */,
                           QueryProcessingStage::Complete,
-                          &global_context->getSettingsRef(),
-                          &global_context->getClientInfo(), false);
+                          &probe_settings,
+                          &client_context->getClientInfo(), false, {}, {});
     while (true)
     {
         Packet packet = connection->receivePacket();
         switch (packet.type)
         {
             case Protocol::Server::Data:
-                if (packet.block)
+                if (!packet.block.empty())
                 {
                     const ColumnString & column = typeid_cast<const ColumnString &>(*packet.block.getByPosition(0).column);
 
                     size_t rows = packet.block.rows();
                     for (size_t i = 0; i < rows; ++i)
-                        messages.emplace_back(column.getDataAt(i).toString());
+                        messages.emplace_back(column[i].safeGet<String>());
                 }
                 continue;
 
             case Protocol::Server::Progress:
-                continue;
             case Protocol::Server::ProfileInfo:
-                continue;
             case Protocol::Server::Totals:
-                continue;
             case Protocol::Server::Extremes:
-                continue;
             case Protocol::Server::Log:
                 continue;
 
@@ -368,65 +234,196 @@ std::vector<String> Client::loadWarningMessages()
                 continue;
 
             default:
-                throw Exception(ErrorCodes::UNKNOWN_PACKET_FROM_SERVER, "Unknown packet {} from server {}",
-                    packet.type, connection->getDescription());
+                throw Exception(
+                    ErrorCodes::UNKNOWN_PACKET_FROM_SERVER, "Unknown packet {} from server {}", packet.type, connection->getDescription());
         }
     }
 }
 
 
+Poco::Util::LayeredConfiguration & Client::getClientConfiguration()
+{
+    return config();
+}
+
 void Client::initialize(Poco::Util::Application & self)
 {
     Poco::Util::Application::initialize(self);
 
-    const char * home_path_cstr = getenv("HOME");
+    const char * home_path_cstr = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
     if (home_path_cstr)
         home_path = home_path_cstr;
 
-    configReadClient(config(), home_path);
+    const char * env_host = getenv("CLICKHOUSE_HOST"); // NOLINT(concurrency-mt-unsafe)
 
-    // global_context->setApplicationType(Context::ApplicationType::CLIENT);
-    global_context->setQueryParameters(query_parameters);
+    std::optional<std::string> config_path;
+    if (config().has("config-file"))
+        config_path.emplace(config().getString("config-file"));
+    else
+        config_path = getClientConfigPath(home_path);
+    if (config_path.has_value())
+    {
+        ConfigProcessor config_processor(*config_path);
+        auto loaded_config = config_processor.loadConfig();
+        auto & configuration = *loaded_config.configuration;
+
+        std::string default_host;
+        if (!hosts_and_ports.empty())
+            default_host = hosts_and_ports.front().host;
+        else if (config().has("host"))
+            default_host = config().getString("host");
+        else if (configuration.has("host"))
+            default_host = configuration.getString("host");
+        else if (env_host)
+            default_host = env_host;
+        else
+            default_host = "localhost";
+
+        std::optional<std::string> connection_name;
+        if (config().has("connection"))
+            connection_name.emplace(config().getString("connection"));
+
+        /// Connection credentials overrides should be set via loaded_config.configuration to have proper order.
+        auto overrides = parseConnectionsCredentials(configuration, default_host, connection_name);
+        if (overrides.hostname.has_value())
+            configuration.setString("host", overrides.hostname.value());
+        if (overrides.port.has_value())
+            configuration.setInt("port", overrides.port.value());
+        if (overrides.secure.has_value())
+        {
+            if (overrides.secure.value())
+                configuration.setBool("secure", true);
+            else
+                configuration.setBool("no-secure", true);
+        }
+        if (overrides.user.has_value())
+            configuration.setString("user", overrides.user.value());
+        if (overrides.password.has_value())
+            configuration.setString("password", overrides.password.value());
+        if (overrides.database.has_value())
+            configuration.setString("database", overrides.database.value());
+        if (overrides.history_file.has_value())
+        {
+            auto history_file = overrides.history_file.value();
+            if (history_file.starts_with("~/") && !home_path.empty())
+                history_file = home_path / history_file.substr(2);
+            configuration.setString("history_file", history_file);
+        }
+        if (overrides.history_max_entries.has_value())
+            configuration.setUInt("history_max_entries", overrides.history_max_entries.value());
+        if (overrides.accept_invalid_certificate.has_value())
+            configuration.setBool("accept-invalid-certificate", overrides.accept_invalid_certificate.value());
+        if (overrides.prompt.has_value())
+            configuration.setString("prompt", overrides.prompt.value());
+
+        config().add(loaded_config.configuration);
+
+#if USE_JWT_CPP && USE_SSL
+        /// If config file has user/password credentials, don't use auto-detected OAuth login for cloud endpoints
+        if (login_was_auto_added &&
+            (loaded_config.configuration->has("user") || loaded_config.configuration->has("password")))
+        {
+            /// Config file has auth credentials, so disable the auto-added login flag
+            config().setBool("login", false);
+        }
+#endif
+    }
+    else if (config().has("connection"))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "--connection was specified, but config does not exist");
+
+    if (config().has("accept-invalid-certificate"))
+    {
+        config().setString("openSSL.client.invalidCertificateHandler.name", "AcceptCertificateHandler");
+        config().setString("openSSL.client.verificationMode", "none");
+    }
+
+    /** getenv is thread-safe in Linux glibc and in all sane libc implementations.
+      * But the standard does not guarantee that subsequent calls will not rewrite the value by returned pointer.
+      *
+      * man getenv:
+      *
+      * As typically implemented, getenv() returns a pointer to a string within the environment list.
+      * The caller must take care not to modify this string, since that would change the environment of
+      * the process.
+      *
+      * The implementation of getenv() is not required to be reentrant. The string pointed to by the return value of getenv()
+      * may be statically allocated, and can be modified by a subsequent call to getenv(), putenv(3), setenv(3), or unsetenv(3).
+      */
+
+    const char * env_user = getenv("CLICKHOUSE_USER"); // NOLINT(concurrency-mt-unsafe)
+    if (env_user && !config().has("user"))
+        config().setString("user", env_user);
+
+    const char * env_password = getenv("CLICKHOUSE_PASSWORD"); // NOLINT(concurrency-mt-unsafe)
+    if (env_password && !config().has("password"))
+        config().setString("password", env_password);
+
+    if (env_host && !config().has("host"))
+        config().setString("host", env_host);
 
     /// settings and limits could be specified in config file, but passed settings has higher priority
-    for (const auto & setting : global_context->getSettingsRef().allUnchanged())
+    for (const auto & setting : client_context->getSettingsRef().getUnchangedNames())
     {
-        const auto & name = setting.getName();
+        String name{setting};
+        /// The `format` config key is owned by the client-side `--format` option, which in
+        /// `clickhouse-client` is output-only: it is mirrored into the `output_format` setting by
+        /// `setDefaultFormatsAndCompressionFromConfiguration` (see `mappedFormatOptionSetting`).
+        /// Feeding it into the bidirectional `format` setting here would make `--format` override
+        /// the `FORMAT` clause of `INSERT` queries on the input side.
+        if (name == "format")
+            continue;
         if (config().has(name))
-            global_context->setSetting(name, config().getString(name));
+            client_context->setSetting(name, config().getString(name));
     }
 
     /// Set path for format schema files
     if (config().has("format_schema_path"))
-        global_context->setFormatSchemaPath(fs::weakly_canonical(config().getString("format_schema_path")));
+        client_context->setFormatSchemaPath(fs::weakly_canonical(config().getString("format_schema_path")));
+
+    /// Set the path for google proto files
+    if (config().has("google_protos_path"))
+        client_context->setGoogleProtosPath(fs::weakly_canonical(config().getString("google_protos_path")));
+
+    /// Use <server_client_version_message/> unless --server-client-version-message is specified
+    if (!config().has("no-server-client-version-message") && !config().getBool("server_client_version_message", true))
+        config().setBool("no-server-client-version-message", true);
+
+    /// Use <warnings/> unless --no-warnings is specified
+    if (!config().has("no-warnings") && !config().getBool("warnings", true))
+        config().setBool("no-warnings", true);
+
+    /// Use <echo_formatted/>, <echo_query_id/>, <enable_progress_table_toggle/> unless the
+    /// corresponding dashed CLI option is specified. Shared with `clickhouse-local`.
+    remapClientConfigurationAliases();
+
+    /// The config file is loaded after the command line is processed, so the option parser
+    /// never sees values that come only from the file. Validate them now, before any query
+    /// can start: a config typo must not fail open (e.g. run a mutating query and only then
+    /// throw from a lazy read at the use site).
+    validateClientConfiguration();
 }
 
 
 int Client::main(const std::vector<std::string> & /*args*/)
 try
 {
-    UseSSL use_ssl;
-    MainThreadStatus::getInstance();
     setupSignalHandler();
 
-    std::cout << std::fixed << std::setprecision(3);
-    std::cerr << std::fixed << std::setprecision(3);
-
-    /// Limit on total memory usage
-    size_t max_client_memory_usage = config().getInt64("max_memory_usage_in_client", 0 /*default value*/);
-
-    if (max_client_memory_usage != 0)
-    {
-        total_memory_tracker.setHardLimit(max_client_memory_usage);
-        total_memory_tracker.setDescription("(total)");
-        total_memory_tracker.setMetric(CurrentMetrics::MemoryTracking);
-    }
+    output_stream << std::fixed << std::setprecision(3);
+    error_stream << std::fixed << std::setprecision(3);
 
     registerFormats();
     registerFunctions();
     registerAggregateFunctions();
+    /// The engines are not registered, so the secrets of their arguments are shown.
+    setSecretArgumentsFinder(&NoSecretArgumentsFinder::instance());
 
     processConfig();
+    adjustSettings(client_context);
+
+    initTTYBuffer(
+        toProgressOption(config().getString("progress", "default")), toProgressOption(config().getString("progress-table", "default")));
+    initKeystrokeInterceptor();
 
     /// Includes delayed_interactive.
     if (is_interactive)
@@ -435,29 +432,77 @@ try
         showClientVersion();
     }
 
-    connect();
+#if USE_JWT_CPP && USE_SSL
+    if (config().getBool("login", false))
+    {
+        login();
+    }
+#endif
 
-    /// Load Warnings at the beginning of connection
-    if (is_interactive && !config().has("no-warnings"))
+    bool asked_password = false;
+    bool asked_2fa = false;
+    for (;;)
     {
         try
         {
-            std::vector<String> messages = loadWarningMessages();
-            if (!messages.empty())
-            {
-                std::cout << "Warnings:" << std::endl;
-                for (const auto & message : messages)
-                    std::cout << " * " << message << std::endl;
-                std::cout << std::endl;
-            }
+            connect();
+            break;
         }
-        catch (...)
+        catch (const Exception & e)
         {
-            /// Ignore exception
+            auto code = e.code();
+
+            bool should_ask_password = !asked_password && is_interactive &&
+                (code == ErrorCodes::AUTHENTICATION_FAILED || code == ErrorCodes::REQUIRED_PASSWORD) &&
+                !config().has("password") && !config().getBool("ask-password", false) &&
+                !config().has("ssh-key-file");
+
+            if (should_ask_password)
+            {
+                asked_password = true;
+                config().setBool("ask-password", true);
+                preserve_announced_endpoint_for_retry = true;
+                continue;
+            }
+
+            bool should_ask_2fa = !asked_2fa && (code == ErrorCodes::REQUIRED_SECOND_FACTOR) &&
+                (config().getBool("ask-password", false) || is_interactive) && !config().has("one-time-password");
+
+            if (should_ask_2fa)
+            {
+                /// The server asks for the second factor before it checks the password, so the first attempt
+                /// without any password ends here too. Ask for the password alone first: it may already contain
+                /// the code (`password+code`); otherwise the server asks again and the code is prompted.
+                if (!asked_password && !config().has("password") && !config().getBool("ask-password", false))
+                {
+                    asked_password = true;
+                    config().setBool("ask-password", true);
+                    preserve_announced_endpoint_for_retry = true;
+                    continue;
+                }
+
+                asked_2fa = true;
+                if (!connection_parameters.password.empty())
+                    config().setString("password", connection_parameters.password);
+                config().setBool("ask-password", false);
+                config().setBool("ask-password-2fa", true);
+                preserve_announced_endpoint_for_retry = true;
+                continue;
+            }
+
+            throw;
         }
     }
 
-    if (is_interactive && !delayed_interactive)
+    /// Show warnings at the beginning of connection.
+    if (is_interactive && !config().has("no-warnings"))
+        showWarnings();
+
+    /// Set user password complexity rules
+    auto & access_control = client_context->getAccessControl();
+    access_control.setPasswordComplexityRules(connection->getPasswordComplexityRules());
+
+    if (is_interactive && !delayed_interactive && !buzz_house)
     {
         runInteractive();
     }
@@ -467,20 +512,34 @@ try
 
         runNonInteractive();
 
-        // If exception code isn't zero, we should return non-zero return
-        // code anyway.
-        const auto * exception = server_exception ? server_exception.get() : client_exception.get();
-
-        if (exception)
+        /// `--ignore-error` has already reported every failed statement and elected to carry on,
+        /// so the run is not a failure. Reporting one here would mean reporting whichever error
+        /// the final statement happened to hit, which says nothing about the rest of the batch;
+        /// `clickhouse-local --ignore-error` returns success in the same situation.
+        ///
+        /// Only a user asking for `--ignore-error` gets that, though, and `ignore_error` alone
+        /// does not say who asked: the fuzzing modes turn it on themselves, in `processOptions`,
+        /// to tolerate unparseable input. They keep the error code. BuzzHouse stops the run on an
+        /// error, and the AST fuzzer reports an early stop - losing the server, say - only
+        /// through this exit code, so granting it success would end a truncated fuzzer run with
+        /// `Fuzzer exited with success`.
+        if ((buzz_house || query_fuzzer_runs || create_query_fuzzer_runs || !ignore_error) && !stdout_is_broken)
         {
-            return exception->code() != 0 ? exception->code() : -1;
-        }
+            // If exception code isn't zero, we should return non-zero return
+            // code anyway.
+            const auto * exception = server_exception ? server_exception.get() : client_exception.get();
 
-        if (have_error)
-        {
-            // Shouldn't be set without an exception, but check it just in
-            // case so that at least we don't lose an error.
-            return -1;
+            if (exception)
+            {
+                return static_cast<UInt8>(exception->code()) ? exception->code() : -1;
+            }
+
+            if (have_error)
+            {
+                // Shouldn't be set without an exception, but check it just in
+                // case so that at least we don't lose an error.
+                return -1;
+            }
         }
 
         if (delayed_interactive)
@@ -489,95 +548,493 @@ try
 
     return 0;
 }
-catch (const Exception & e)
+catch (Exception & e)
 {
+    if (stdout_is_broken)
+        return 0;
+
     bool need_print_stack_trace = config().getBool("stacktrace", false) && e.code() != ErrorCodes::NETWORK_ERROR;
-    std::cerr << getExceptionMessage(e, need_print_stack_trace, true) << std::endl << std::endl;
+    std::cerr << getExceptionMessageForLogging(e, need_print_stack_trace, true) << std::endl << std::endl;
     /// If exception code isn't zero, we should return non-zero return code anyway.
-    return e.code() ? e.code() : -1;
+    return static_cast<UInt8>(e.code()) ? e.code() : -1;
 }
 catch (...)
 {
+    if (stdout_is_broken)
+        return 0;
+
     std::cerr << getCurrentExceptionMessage(false) << std::endl;
     return getCurrentExceptionCode();
 }
 
+#if USE_JWT_CPP && USE_SSL
+void Client::login()
+{
+    /// `hosts_and_ports` is filled from explicit --host arguments only; the default host is added
+    /// later, in `connect`. A host given via config, --connection or the environment is still
+    /// sitting in the configuration at this point.
+    std::string host = hosts_and_ports.empty()
+        ? getClientConfiguration().getString("host", "localhost")
+        : hosts_and_ports.front().host;
+    JWTProviderOptions options;
+    options.auth_url = getClientConfiguration().getString("oauth-url", "");
+    options.client_id = getClientConfiguration().getString("oauth-client-id", "");
+    options.client_secret = getClientConfiguration().getString("oauth-client-secret", "");
+    options.audience = getClientConfiguration().getString("oauth-audience", "");
+    options.scope = getClientConfiguration().getString("oauth-scope", "");
+    options.device_authorization_endpoint = getClientConfiguration().getString("oauth-device-uri", "");
+    options.token_endpoint = getClientConfiguration().getString("oauth-token-uri", "");
+    options.client_auth_method = getClientConfiguration().getString("oauth-client-auth", "");
+
+    jwt_provider = createJwtProvider(std::move(options), host, output_stream, error_stream);
+    if (jwt_provider)
+    {
+        std::string jwt = jwt_provider->getJWT();
+        if (!jwt.empty())
+        {
+            getClientConfiguration().setString("jwt", jwt);
+        }
+        else
+        {
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Login failed. Please check your credentials and try again.");
+        }
+    }
+}
+#endif
 
 void Client::connect()
 {
-    connection_parameters = ConnectionParameters(config());
-
-    if (is_interactive)
-        std::cout << "Connecting to "
-                    << (!connection_parameters.default_database.empty() ? "database " + connection_parameters.default_database + " at "
-                                                                        : "")
-                    << connection_parameters.host << ":" << connection_parameters.port
-                    << (!connection_parameters.user.empty() ? " as user " + connection_parameters.user : "") << "." << std::endl;
+    /// Only the immediate password or 2FA retry may reuse the previous announcement. Any later
+    /// reconnect is a separate attempt and must announce its endpoint, even if an earlier reconnect failed.
+    if (!preserve_announced_endpoint_for_retry)
+        announced_endpoint.clear();
+    preserve_announced_endpoint_for_retry = false;
 
     String server_name;
     UInt64 server_version_major = 0;
     UInt64 server_version_minor = 0;
     UInt64 server_version_patch = 0;
 
-    try
+    /// Capture the client local time zone before the branch below may switch the process default
+    /// to the server time zone. `serverTimezoneInstance()` reads the process default directly and
+    /// ignores `session_timezone`; `instance()` would fold in an explicit `--session_timezone` and
+    /// cache the wrong zone. `connect()` can run again on reconnect, so only capture once.
+    if (client_local_timezone.empty())
+        client_local_timezone = DateLUT::serverTimezoneInstance().getTimeZone();
+
+    if (hosts_and_ports.empty())
     {
-        connection = Connection::createConnection(connection_parameters, global_context);
-
-        if (max_client_network_bandwidth)
-        {
-            ThrottlerPtr throttler = std::make_shared<Throttler>(max_client_network_bandwidth, 0, "");
-            connection->setThrottler(throttler);
-        }
-
-        connection->getServerVersion(
-            connection_parameters.timeouts, server_name, server_version_major, server_version_minor, server_version_patch, server_revision);
+        String host = config().getString("host", "localhost");
+        /// Keep the port unset when the configuration does not specify it: this enables the automatic
+        /// choice between the plain and the secure port below.
+        std::optional<UInt16> port;
+        if (config().has("port"))
+            port = static_cast<UInt16>(config().getInt("port"));
+        hosts_and_ports.emplace_back(HostAndPort{host, port, {}, {}, false});
     }
-    catch (const Exception & e)
-    {
-        /// It is typical when users install ClickHouse, type some password and instantly forget it.
-        if ((connection_parameters.user.empty() || connection_parameters.user == "default")
-            && e.code() == DB::ErrorCodes::AUTHENTICATION_FAILED)
-        {
-            std::cerr << std::endl
-                << "If you have installed ClickHouse and forgot password you can reset it in the configuration file." << std::endl
-                << "The password for default user is typically located at /etc/clickhouse-server/users.d/default-password.xml" << std::endl
-                << "and deleting this file will reset the password." << std::endl
-                << "See also /etc/clickhouse-server/users.xml on the server where ClickHouse is installed." << std::endl
-                << std::endl;
-        }
 
-        throw;
+    for (size_t attempted_address_index = 0; attempted_address_index < hosts_and_ports.size(); ++attempted_address_index)
+    {
+        try
+        {
+            const auto host = ConnectionParameters::Host{hosts_and_ports[attempted_address_index].host};
+            const auto database = ConnectionParameters::Database{default_database};
+
+            connection_parameters = ConnectionParameters(
+                config(), host, database, hosts_and_ports[attempted_address_index].port);
+
+            /// Reuse the transport that already worked for this address (see below), so that a reconnect
+            /// does not have to probe the ports again.
+            if (hosts_and_ports[attempted_address_index].secure.has_value())
+                connection_parameters.security
+                    = *hosts_and_ports[attempted_address_index].secure ? Protocol::Secure::Enable : Protocol::Secure::Disable;
+
+#if USE_JWT_CPP && USE_SSL
+            connection_parameters.jwt_provider = jwt_provider;
+#endif
+
+            /// Candidate endpoints for the connection, in the order of preference. Normally there is a
+            /// single candidate, resolved by `ConnectionParameters`. But when neither the port nor the TLS
+            /// mode is specified explicitly, both the plain and the secure default ports are probed
+            /// concurrently, and the one that answers first is used, with TLS enabled automatically when
+            /// it is the secure one. The probing is concurrent because waiting for a connection attempt to
+            /// time out first would take too long (for example, play.clickhouse.com serves TLS on 9440
+            /// while the plain port is silently firewalled).
+            struct Candidate
+            {
+                UInt16 port;
+                Protocol::Secure security;
+
+                /// The address to start from on this port, if any: the host can resolve to several
+                /// addresses, and the connection has to start with the right one, or it pays a whole
+                /// connection timeout for every unresponsive address in front of the working one.
+                std::optional<Poco::Net::SocketAddress> address;
+
+                /// The connection the probe has established, if it is this candidate that the probe chose.
+                /// It is taken over by the `Connection` instead of opening a second one, so that the
+                /// automatic choice does not leave a short-lived session on the server for every client
+                /// connection. Only the chosen candidate carries it: by the time a fallback candidate is
+                /// tried, the first one has spent an unbounded amount of time failing (a TLS handshake can
+                /// wait out `handshake_timeout_ms`), and the server drops a connection that has not
+                /// finished its handshake within `handshake_timeout_milliseconds`, so a connection the
+                /// probe left idle in the meantime is not safe to reuse.
+                std::optional<Poco::Net::StreamSocket> socket;
+            };
+
+            std::vector<Candidate> candidates;
+
+            const bool port_unspecified = !hosts_and_ports[attempted_address_index].port.has_value() && !config().has("port");
+            const bool secure_unspecified = !hosts_and_ports[attempted_address_index].secure.has_value() && !config().has("secure")
+                && !config().has("no-secure") && !isCloudEndpoint(host.toUnderType());
+
+            /// Without TLS support in the build there is nothing to choose between: probing the secure port
+            /// would only replace a working plain connection with `SUPPORT_IS_DISABLED`, which
+            /// `Connection::connect` throws for every secure connection in such a build.
+#if USE_SSL
+            const bool build_supports_tls = true;
+#else
+            const bool build_supports_tls = false;
+#endif
+            const bool detect_transport = port_unspecified && secure_unspecified && build_supports_tls;
+
+            if (detect_transport)
+            {
+                const auto plain_port = connection_parameters.port;
+                const auto secure_port = static_cast<UInt16>(config().getInt("tcp_port_secure", DBMS_DEFAULT_SECURE_PORT));
+
+                /// The addresses of a port are attempted one at a time, this much apart, so that a host
+                /// that resolves to several reachable backends is not connected to on all of them at once
+                /// (see `probePlainAndSecurePorts`). This is the default of RFC 8305 (Happy Eyeballs).
+                static const Poco::Timespan address_attempt_delay(0, 250000);
+
+                PortsProbeResult probe;
+                try
+                {
+                    probe = probePlainAndSecurePorts(
+                        connection_parameters.host,
+                        connection_parameters.bind_host,
+                        plain_port,
+                        secure_port,
+                        connection_parameters.timeouts.connection_timeout,
+                        address_attempt_delay);
+                }
+                catch (...)
+                {
+                    /// The probe runs before any `Connection` is created, so it has to drop possibly stale
+                    /// DNS cache entries on its own: `Connection::connect` does it for every connect-level
+                    /// failure, and without it a later reconnect or failover would reuse the same dead
+                    /// addresses instead of resolving the host again.
+                    DNSResolver::instance().removeHostFromCache(connection_parameters.host);
+                    throw;
+                }
+
+                if (probe.endpoint)
+                {
+                    const bool secure = probe.endpoint->secure;
+                    candidates.push_back(
+                        {secure ? secure_port : plain_port,
+                         secure ? Protocol::Secure::Enable : Protocol::Secure::Disable,
+                         probe.endpoint->address,
+                         probe.endpoint->socket});
+
+                    /// The port that answered the probe is not necessarily the port that works: the
+                    /// connection to it can still fail at the native protocol level, e.g. when a proxy in
+                    /// front of the server accepts TCP on the plain port but serves only TLS there, or when
+                    /// the certificate of the automatically chosen secure port is not trusted. The other
+                    /// port is then worth a try before giving up.
+                    ///
+                    /// It matters the most for the secure port: TLS was not requested, it was chosen
+                    /// automatically, so a secure port that turns out to be unusable must not make the
+                    /// client fail. The plain port is what it would have connected to if there were no
+                    /// automatic choice at all, so falling back to it takes nothing away from the user. The
+                    /// common case is a server whose secure port has a self-signed or otherwise untrusted
+                    /// certificate, which every client that does not pass `--accept-invalid-certificate`
+                    /// rejects.
+                    ///
+                    /// The fallback starts from the other port of the address that answered, because the
+                    /// same backend is the best guess for where that port is; it keeps the fallback from
+                    /// walking the resolved addresses again and paying a whole connection timeout for every
+                    /// unresponsive one in front of it.
+                    const UInt16 other_port = secure ? plain_port : secure_port;
+                    candidates.push_back(
+                        {other_port,
+                         secure ? Protocol::Secure::Disable : Protocol::Secure::Enable,
+                         Poco::Net::SocketAddress(probe.endpoint->address.host(), other_port),
+                         {}});
+                }
+                else
+                {
+                    /// See above: no connection was made, so the resolved addresses may be stale.
+                    DNSResolver::instance().removeHostFromCache(connection_parameters.host);
+                    throw NetException(
+                        probe.timed_out ? ErrorCodes::SOCKET_TIMEOUT : ErrorCodes::NETWORK_ERROR,
+                        "Cannot connect to {} on port {} or on the secure port {}: {}",
+                        connection_parameters.host,
+                        plain_port,
+                        secure_port,
+                        probe.failure_reason);
+                }
+            }
+            else
+            {
+                candidates.push_back(
+                    {connection_parameters.port,
+                     connection_parameters.security,
+                     hosts_and_ports[attempted_address_index].address,
+                     {}});
+            }
+
+            /// Names a candidate the way the messages below refer to it.
+            auto describe = [&](const Candidate & candidate)
+            {
+                return fmt::format(
+                    "{}:{}{}",
+                    connection_parameters.host,
+                    candidate.port,
+                    candidate.security == Protocol::Secure::Enable ? " with TLS" : "");
+            };
+
+            /// The failure of the candidate that was tried first, when the connection moved on to the next.
+            std::exception_ptr first_error;
+            size_t first_error_index = 0;
+
+            for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
+            {
+                const auto & candidate = candidates[candidate_index];
+
+                connection_parameters.port = candidate.port;
+                connection_parameters.security = candidate.security;
+                connection_parameters.preferred_address = candidate.address;
+                connection_parameters.adopted_socket = candidate.socket;
+
+                const bool secure_auto_detected = secure_unspecified && candidate.security == Protocol::Secure::Enable;
+
+                if (is_interactive)
+                {
+                    const auto announcement = fmt::format(
+                        "Connecting to {}{}:{}{}{}.",
+                        connection_parameters.default_database.empty()
+                            ? ""
+                            : "database " + connection_parameters.default_database + " at ",
+                        connection_parameters.host,
+                        connection_parameters.port,
+                        secure_auto_detected ? " (secure)" : "",
+                        connection_parameters.user.empty() ? "" : " as user " + connection_parameters.user);
+
+                    /// The same endpoint can be attempted more than once before the connection is
+                    /// established: a server that requires a password rejects the first attempt, and the
+                    /// client prompts for the password and attempts the very same endpoint again. Repeating
+                    /// the announcement tells the user nothing and reads as if the client had connected
+                    /// twice, so announce an endpoint only when it differs from the one announced last.
+                    if (announcement != announced_endpoint)
+                    {
+                        announced_endpoint = announcement;
+                        output_stream << announcement << std::endl;
+                    }
+                }
+
+                try
+                {
+                    connection = Connection::createConnection(connection_parameters, client_context);
+                    /// The connection has taken the probed socket over; do not keep a handle to it here.
+                    connection_parameters.adopted_socket.reset();
+
+                    if (max_client_network_bandwidth)
+                    {
+                        ThrottlerPtr throttler = std::make_shared<Throttler>(max_client_network_bandwidth, 0, "");
+                        connection->setThrottler(throttler);
+                    }
+
+                    connection->getServerVersion(
+                        connection_parameters.timeouts,
+                        server_name,
+                        server_version_major,
+                        server_version_minor,
+                        server_version_patch,
+                        server_revision);
+
+                    break;
+                }
+                catch (Exception & e)
+                {
+                    /// The port accepted the TCP connection, but the connection itself failed: e.g. a proxy
+                    /// in front of the server accepts TCP on the plain port but only serves TLS there, or
+                    /// the certificate of the automatically chosen secure port is not trusted. Try the other
+                    /// port before giving up, but only for connection-level failures.
+                    ///
+                    /// A TLS-only listener on the plain port answers the native `Hello` with a TLS
+                    /// alert record, whose first byte the client reads as an unexpected packet type,
+                    /// so `Connection::receiveHello` throws `UNEXPECTED_PACKET_FROM_SERVER`; that is
+                    /// the normal outcome of the "plain port serves TLS" case and must be retriable.
+                    ///
+                    /// A timeout is not retriable, in contrast: a port that accepts the connection and then
+                    /// does not answer belongs to a server that is unresponsive rather than to a listener of
+                    /// the wrong protocol, and the other port of the same server is not going to answer
+                    /// either. Retrying it would double the time the client waits before it reports the
+                    /// failure, which is exactly the delay this feature is supposed to avoid.
+                    const bool is_connection_error = e.code() == ErrorCodes::NETWORK_ERROR
+                        || e.code() == ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF
+                        || e.code() == ErrorCodes::UNKNOWN_PACKET_FROM_SERVER
+                        || e.code() == ErrorCodes::UNEXPECTED_PACKET_FROM_SERVER;
+                    const bool is_transport_error = is_connection_error || e.code() == ErrorCodes::SOCKET_TIMEOUT;
+
+                    if (candidate_index + 1 < candidates.size() && is_connection_error)
+                    {
+                        first_error = std::current_exception();
+                        first_error_index = candidate_index;
+                        if (is_interactive)
+                            std::cerr << "Connection to " << describe(candidate) << " failed, trying "
+                                      << describe(candidates[candidate_index + 1]) << "." << std::endl;
+                        continue;
+                    }
+
+                    if (first_error && is_transport_error)
+                    {
+                        /// Both candidates failed at the connection level. Report the failure of the plain
+                        /// port as the primary error, whichever order the two were tried in: that is the
+                        /// port the client would have used if there were no automatic choice.
+                        const auto & other = candidates[first_error_index];
+                        auto note = [](const String & endpoint, const String & message)
+                        {
+                            return fmt::format("(also failed to connect to {}: {})", endpoint, message);
+                        };
+
+                        if (candidate.security == Protocol::Secure::Disable)
+                        {
+                            String first_message;
+                            try
+                            {
+                                std::rethrow_exception(first_error);
+                            }
+                            catch (Exception & first_e)
+                            {
+                                first_message = first_e.message();
+                            }
+                            e.addMessage(note(describe(other), first_message));
+                            throw;
+                        }
+
+                        const auto message = e.message();
+                        try
+                        {
+                            std::rethrow_exception(first_error);
+                        }
+                        catch (Exception & first_e)
+                        {
+                            first_e.addMessage(note(describe(candidate), message));
+                            throw;
+                        }
+                    }
+
+                    throw;
+                }
+            }
+
+            config().setString("host", connection_parameters.host);
+
+            /// Remember the endpoint that has worked, so that a reconnect to the same address does not
+            /// probe the ports again. It is remembered for this address only, and not in the global
+            /// configuration: otherwise a failover to another address would be forced to the same port
+            /// and the same TLS mode, e.g. a session with `--host secure-only --host plain-only` would
+            /// keep connecting to the plain-only address on the secure port after the first address
+            /// answered on it.
+            hosts_and_ports[attempted_address_index].port = connection_parameters.port;
+            hosts_and_ports[attempted_address_index].secure = connection_parameters.security == Protocol::Secure::Enable;
+            if (detect_transport)
+                hosts_and_ports[attempted_address_index].transport_auto_detected = true;
+            if (hosts_and_ports[attempted_address_index].transport_auto_detected)
+            {
+                /// Remember the address that has answered as well, and not only the port and the TLS mode:
+                /// the ports are not probed again on a reconnect, and without the address the connection
+                /// would start from the first address of the host once more and pay a whole connection
+                /// timeout for every unresponsive address in front of the one that works.
+                ///
+                /// The address is refreshed after every successful connect, and not only when the ports
+                /// were probed: a reconnect can fall through from the remembered address to another
+                /// resolved address of the same host when the old one stopped answering, and keeping
+                /// the dead address would make every following reconnect wait out a whole connection
+                /// timeout on it before falling through to the working one again.
+                hosts_and_ports[attempted_address_index].address = assert_cast<Connection &>(*connection).getResolvedAddress();
+            }
+
+            settings_from_server = assert_cast<Connection &>(*connection).settingsFromServer();
+
+            break;
+        }
+        catch (Exception & e)
+        {
+            /// Forget an automatically chosen transport after a failed connection attempt: it was only
+            /// valid for the endpoints this host resolved to when the ports were probed. `Connection::connect`
+            /// drops the `DNSResolver` cache entries for the host on a connect-level failure, so the next
+            /// attempt can resolve to another backend, e.g. a secure-only backend can be replaced by a
+            /// plain-only one; keeping the remembered port, TLS mode and address would make the client
+            /// retry the secure port forever and never rediscover the healthy plain port.
+            if (hosts_and_ports[attempted_address_index].transport_auto_detected)
+            {
+                hosts_and_ports[attempted_address_index].port.reset();
+                hosts_and_ports[attempted_address_index].secure.reset();
+                hosts_and_ports[attempted_address_index].address.reset();
+                hosts_and_ports[attempted_address_index].transport_auto_detected = false;
+            }
+
+            /// This problem can't be fixed with reconnection so it is not attempted
+            if (e.code() == ErrorCodes::AUTHENTICATION_FAILED || e.code() == ErrorCodes::REQUIRED_PASSWORD
+                || e.code() == ErrorCodes::REQUIRED_SECOND_FACTOR)
+                throw;
+
+            if (attempted_address_index == hosts_and_ports.size() - 1)
+                throw;
+
+            if (is_interactive)
+            {
+                std::cerr << "Connection attempt to database at " << connection_parameters.host << ":" << connection_parameters.port
+                          << " resulted in failure" << std::endl
+                          << getExceptionMessageForLogging(e, false) << std::endl
+                          << "Attempting connection to the next provided address" << std::endl;
+            }
+        }
     }
 
     server_version = toString(server_version_major) + "." + toString(server_version_minor) + "." + toString(server_version_patch);
-    load_suggestions = is_interactive && (server_revision >= Suggest::MIN_SERVER_REVISION && !config().getBool("disable_suggestion", false));
+    load_suggestions
+        = is_interactive && (server_revision >= Suggest::MIN_SERVER_REVISION) && !config().getBool("disable_suggestion", false);
+    wait_for_suggestions_to_load = config().getBool("wait_for_suggestions_to_load", false);
+    if (load_suggestions)
+    {
+        suggestion_limit = config().getInt("suggestion_limit", 10000);
+    }
 
-    if (server_display_name = connection->getServerDisplayName(connection_parameters.timeouts); server_display_name.empty())
+    server_display_name = connection->getServerDisplayName(connection_parameters.timeouts);
+    if (server_display_name.empty())
         server_display_name = config().getString("host", "localhost");
 
     if (is_interactive)
     {
-        std::cout << "Connected to " << server_name << " server version " << server_version << " revision " << server_revision << "."
-                    << std::endl << std::endl;
+        output_stream << "Connected to " << server_name << " server version " << server_version << "." << std::endl << std::endl;
 
-        auto client_version_tuple = std::make_tuple(VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH);
-        auto server_version_tuple = std::make_tuple(server_version_major, server_version_minor, server_version_patch);
+#if not CLICKHOUSE_CLOUD
+        if (!config().has("no-server-client-version-message"))
+        {
+            auto client_version_tuple = std::make_tuple(VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH);
+            auto server_version_tuple = std::make_tuple(server_version_major, server_version_minor, server_version_patch);
 
-        if (client_version_tuple < server_version_tuple)
-        {
-            std::cout << "ClickHouse client version is older than ClickHouse server. "
-                        << "It may lack support for new features." << std::endl
-                        << std::endl;
+            if (client_version_tuple < server_version_tuple)
+            {
+                output_stream << "ClickHouse client version is older than ClickHouse server. "
+                          << "It may lack support for new features." << std::endl
+                          << std::endl;
+            }
+            else if (client_version_tuple > server_version_tuple && server_display_name != "clickhouse-cloud")
+            {
+                output_stream << "ClickHouse server version is older than ClickHouse client. "
+                          << "It may indicate that the server is out of date and can be upgraded." << std::endl
+                          << std::endl;
+            }
         }
-        else if (client_version_tuple > server_version_tuple)
-        {
-            std::cout << "ClickHouse server version is older than ClickHouse client. "
-                        << "It may indicate that the server is out of date and can be upgraded." << std::endl
-                        << std::endl;
-        }
+#endif
     }
 
-    if (!global_context->getSettingsRef().use_client_time_zone)
+    if (!client_context->getSettingsRef()[Setting::use_client_time_zone])
     {
         const auto & time_zone = connection->getServerTimezone(connection_parameters.timeouts);
         if (!time_zone.empty())
@@ -589,461 +1046,240 @@ void Client::connect()
             catch (...)
             {
                 std::cerr << "Warning: could not switch to server time zone: " << time_zone
-                            << ", reason: " << getCurrentExceptionMessage(/* with_stacktrace = */ false) << std::endl
-                            << "Proceeding with local time zone." << std::endl
-                            << std::endl;
+                          << ", reason: " << getCurrentExceptionMessage(/* with_stacktrace = */ false) << std::endl
+                          << "Proceeding with local time zone." << std::endl
+                          << std::endl;
             }
         }
         else
         {
             std::cerr << "Warning: could not determine server time zone. "
-                        << "Proceeding with local time zone." << std::endl
-                        << std::endl;
+                      << "Proceeding with local time zone." << std::endl
+                      << std::endl;
         }
     }
 
-    prompt_by_server_display_name = config().getRawString("prompt_by_server_display_name.default", "{display_name} :) ");
-
-    Strings keys;
-    config().keys("prompt_by_server_display_name", keys);
-    for (const String & key : keys)
+    /// A custom prompt can be specified
+    /// - directly (possible as CLI parameter or in client.xml as top-level <prompt>...</prompt> or within client.xml's connection credentials)
+    /// - via prompt_by_server_display_name (only possible in client.xml as top-level <prompt>...</prompt>).
+    if (config().has("prompt"))
+        prompt = config().getString("prompt");
+    else if (config().has("prompt_by_server_display_name"))
     {
-        if (key != "default" && server_display_name.find(key) != std::string::npos)
+        if (config().has("prompt_by_server_display_name.default"))
+            prompt = config().getRawString("prompt_by_server_display_name.default");
+
+        Strings keys;
+        config().keys("prompt_by_server_display_name", keys);
+        for (const auto & key : keys)
         {
-            prompt_by_server_display_name = config().getRawString("prompt_by_server_display_name." + key);
-            break;
+            if (key != "default" && server_display_name.contains(key))
+            {
+                prompt = config().getRawString("prompt_by_server_display_name." + key);
+                break;
+            }
         }
+    }
+    else
+    {
+        prompt = "{display_name}";
     }
 
     /// Prompt may contain escape sequences including \e[ or \x1b[ sequences to set terminal color.
     {
-        String unescaped_prompt_by_server_display_name;
-        ReadBufferFromString in(prompt_by_server_display_name);
-        readEscapedString(unescaped_prompt_by_server_display_name, in);
-        prompt_by_server_display_name = std::move(unescaped_prompt_by_server_display_name);
+        String prompt_escaped;
+        ReadBufferFromString in(prompt);
+        readEscapedString(prompt_escaped, in);
+        prompt = prompt_escaped;
     }
 
-    /// Prompt may contain the following substitutions in a form of {name}.
-    std::map<String, String> prompt_substitutions{
+    /// Substitute placeholders in the form of {name}.
+    /// The {display_name} placeholder is kept: it is substituted in getPrompt on every
+    /// call, because the current dialect is rendered next to the display name.
+    const std::map<String, String> prompt_substitutions{
         {"host", connection_parameters.host},
         {"port", toString(connection_parameters.port)},
         {"user", connection_parameters.user},
-        {"display_name", server_display_name},
     };
 
-    /// Quite suboptimal.
     for (const auto & [key, value] : prompt_substitutions)
-        boost::replace_all(prompt_by_server_display_name, "{" + key + "}", value);
+        boost::replace_all(prompt, "{" + key + "}", value);
 }
-
 
 // Prints changed settings to stderr. Useful for debugging fuzzing failures.
 void Client::printChangedSettings() const
 {
-    const auto & changes = global_context->getSettingsRef().changes();
-    if (!changes.empty())
+    auto print_changes = [](const auto & changes, std::string_view settings_name)
     {
-        fmt::print(stderr, "Changed settings: ");
-        for (size_t i = 0; i < changes.size(); ++i)
+        if (!changes.empty())
         {
-            if (i)
+            fmt::print(stderr, "Changed {}: ", settings_name);
+            for (size_t i = 0; i < changes.size(); ++i)
             {
-                fmt::print(stderr, ", ");
-            }
-            fmt::print(stderr, "{} = '{}'", changes[i].name, toString(changes[i].value));
-        }
-        fmt::print(stderr, "\n");
-    }
-    else
-    {
-        fmt::print(stderr, "No changed settings.\n");
-    }
-}
-
-
-static bool queryHasWithClause(const IAST * ast)
-{
-    if (const auto * select = dynamic_cast<const ASTSelectQuery *>(ast); select && select->with())
-    {
-        return true;
-    }
-
-    // This full recursive walk is somewhat excessive, because most of the
-    // children are not queries, but on the other hand it will let us to avoid
-    // breakage when the AST structure changes and some new variant of query
-    // nesting is added. This function is used in fuzzer, so it's better to be
-    // defensive and avoid weird unexpected errors.
-    // clang-tidy is confused by this function: it thinks that if `select` is
-    // nullptr, `ast` is also nullptr, and complains about nullptr dereference.
-    // NOLINTNEXTLINE
-    for (const auto & child : ast->children)
-    {
-        if (queryHasWithClause(child.get()))
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-
-/// Returns false when server is not available.
-bool Client::processWithFuzzing(const String & full_query)
-{
-    ASTPtr orig_ast;
-
-    try
-    {
-        const char * begin = full_query.data();
-        orig_ast = parseQuery(begin, begin + full_query.size(), true);
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() != ErrorCodes::SYNTAX_ERROR &&
-            e.code() != ErrorCodes::TOO_DEEP_RECURSION)
-            throw;
-    }
-
-    // `USE db` should not be executed
-    // since this will break every query after `DROP db`
-    if (orig_ast->as<ASTUseQuery>())
-    {
-        return true;
-    }
-
-    if (!orig_ast)
-    {
-        // Can't continue after a parsing error
-        return true;
-    }
-
-    // Don't repeat:
-    // - INSERT -- Because the tables may grow too big.
-    // - CREATE -- Because first we run the unmodified query, it will succeed,
-    //             and the subsequent queries will fail.
-    //             When we run out of fuzzer errors, it may be interesting to
-    //             add fuzzing of create queries that wraps columns into
-    //             LowCardinality or Nullable.
-    //             Also there are other kinds of create queries such as CREATE
-    //             DICTIONARY, we could fuzz them as well.
-    // - DROP   -- No point in this (by the same reasons).
-    // - SET    -- The time to fuzz the settings has not yet come
-    //             (see comments in Client/QueryFuzzer.cpp)
-    size_t this_query_runs = query_fuzzer_runs;
-    if (orig_ast->as<ASTInsertQuery>() ||
-        orig_ast->as<ASTCreateQuery>() ||
-        orig_ast->as<ASTDropQuery>() ||
-        orig_ast->as<ASTSetQuery>())
-    {
-        this_query_runs = 1;
-    }
-
-    String query_to_execute;
-    ASTPtr parsed_query;
-
-    ASTPtr fuzz_base = orig_ast;
-    for (size_t fuzz_step = 0; fuzz_step < this_query_runs; ++fuzz_step)
-    {
-        fmt::print(stderr, "Fuzzing step {} out of {}\n", fuzz_step, this_query_runs);
-
-        ASTPtr ast_to_process;
-        try
-        {
-            WriteBufferFromOwnString dump_before_fuzz;
-            fuzz_base->dumpTree(dump_before_fuzz);
-            auto base_before_fuzz = fuzz_base->formatForErrorMessage();
-
-            ast_to_process = fuzz_base->clone();
-
-            WriteBufferFromOwnString dump_of_cloned_ast;
-            ast_to_process->dumpTree(dump_of_cloned_ast);
-
-            // Run the original query as well.
-            if (fuzz_step > 0)
-            {
-                fuzzer.fuzzMain(ast_to_process);
+                if (i)
+                    fmt::print(stderr, ", ");
+                fmt::print(stderr, "{} = '{}'", changes[i].name, fieldToString(changes[i].value));
             }
 
-            auto base_after_fuzz = fuzz_base->formatForErrorMessage();
-
-            // Check that the source AST didn't change after fuzzing. This
-            // helps debug AST cloning errors, where the cloned AST doesn't
-            // clone all its children, and erroneously points to some source
-            // child elements.
-            if (base_before_fuzz != base_after_fuzz)
-            {
-                printChangedSettings();
-
-                fmt::print(
-                    stderr,
-                    "Base before fuzz: {}\n"
-                    "Base after fuzz: {}\n",
-                    base_before_fuzz,
-                    base_after_fuzz);
-                fmt::print(stderr, "Dump before fuzz:\n{}\n", dump_before_fuzz.str());
-                fmt::print(stderr, "Dump of cloned AST:\n{}\n", dump_of_cloned_ast.str());
-                fmt::print(stderr, "Dump after fuzz:\n");
-
-                WriteBufferFromOStream cerr_buf(std::cerr, 4096);
-                fuzz_base->dumpTree(cerr_buf);
-                cerr_buf.next();
-
-                fmt::print(
-                    stderr,
-                    "Found error: IAST::clone() is broken for some AST node. This is a bug. The original AST ('dump before fuzz') and its cloned copy ('dump of cloned AST') refer to the same nodes, which must never happen. This means that their parent node doesn't implement clone() correctly.");
-
-                exit(1);
-            }
-
-            auto fuzzed_text = ast_to_process->formatForErrorMessage();
-            if (fuzz_step > 0 && fuzzed_text == base_before_fuzz)
-            {
-                fmt::print(stderr, "Got boring AST\n");
-                continue;
-            }
-
-            parsed_query = ast_to_process;
-            query_to_execute = parsed_query->formatForErrorMessage();
-            processParsedSingleQuery(full_query, query_to_execute, parsed_query);
-        }
-        catch (...)
-        {
-            // Some functions (e.g. protocol parsers) don't throw, but
-            // set last_exception instead, so we'll also do it here for
-            // uniformity.
-            // Surprisingly, this is a client exception, because we get the
-            // server exception w/o throwing (see onReceiveException()).
-            client_exception = std::make_unique<Exception>(getCurrentExceptionMessage(print_stack_trace), getCurrentExceptionCode());
-            have_error = true;
-        }
-
-        const auto * exception = server_exception ? server_exception.get() : client_exception.get();
-        // Sometimes you may get TOO_DEEP_RECURSION from the server,
-        // and TOO_DEEP_RECURSION should not fail the fuzzer check.
-        if (have_error && exception->code() == ErrorCodes::TOO_DEEP_RECURSION)
-        {
-            have_error = false;
-            server_exception.reset();
-            client_exception.reset();
-            return true;
-        }
-
-        if (have_error)
-        {
-            fmt::print(stderr, "Error on processing query '{}': {}\n", ast_to_process->formatForErrorMessage(), exception->message());
-
-            // Try to reconnect after errors, for two reasons:
-            // 1. We might not have realized that the server died, e.g. if
-            //    it sent us a <Fatal> trace and closed connection properly.
-            // 2. The connection might have gotten into a wrong state and
-            //    the next query will get false positive about
-            //    "Unknown packet from server".
-            try
-            {
-                connection->forceConnected(connection_parameters.timeouts);
-            }
-            catch (...)
-            {
-                // Just report it, we'll terminate below.
-                fmt::print(stderr,
-                    "Error while reconnecting to the server: {}\n",
-                    getCurrentExceptionMessage(true));
-
-                // The reconnection might fail, but we'll still be connected
-                // in the sense of `connection->isConnected() = true`,
-                // in case when the requested database doesn't exist.
-                // Disconnect manually now, so that the following code doesn't
-                // have any doubts, and the connection state is predictable.
-                connection->disconnect();
-            }
-        }
-
-        if (!connection->isConnected())
-        {
-            // Probably the server is dead because we found an assertion
-            // failure. Fail fast.
-            fmt::print(stderr, "Lost connection to the server.\n");
-
-            // Print the changed settings because they might be needed to
-            // reproduce the error.
-            printChangedSettings();
-
-            return false;
-        }
-
-        // Check that after the query is formatted, we can parse it back,
-        // format again and get the same result. Unfortunately, we can't
-        // compare the ASTs, which would be more sensitive to errors. This
-        // double formatting check doesn't catch all errors, e.g. we can
-        // format query incorrectly, but to a valid SQL that we can then
-        // parse and format into the same SQL.
-        // There are some complicated cases where we can generate the SQL
-        // which we can't parse:
-        // * first argument of lambda() replaced by fuzzer with
-        //   something else, leading to constructs such as
-        //   arrayMap((min(x) + 3) -> x + 1, ....)
-        // * internals of Enum replaced, leading to:
-        //   Enum(equals(someFunction(y), 3)).
-        // And there are even the cases when we can parse the query, but
-        // it's logically incorrect and its formatting is a mess, such as
-        // when `lambda()` function gets substituted into a wrong place.
-        // To avoid dealing with these cases, run the check only for the
-        // queries we were able to successfully execute.
-        // Another caveat is that sometimes WITH queries are not executed,
-        // if they are not referenced by the main SELECT, so they can still
-        // have the aforementioned problems. Disable this check for such
-        // queries, for lack of a better solution.
-        // There is also a problem that fuzzer substitutes positive Int64
-        // literals or Decimal literals, which are then parsed back as
-        // UInt64, and suddenly duplicate alias substitition starts or stops
-        // working (ASTWithAlias::formatImpl) or something like that.
-        // So we compare not even the first and second formatting of the
-        // query, but second and third.
-        // If you have to add any more workarounds to this check, just remove
-        // it altogether, it's not so useful.
-        if (!have_error && !queryHasWithClause(parsed_query.get()))
-        {
-            ASTPtr ast_2;
-            try
-            {
-                const auto * tmp_pos = query_to_execute.c_str();
-
-                ast_2 = parseQuery(tmp_pos, tmp_pos + query_to_execute.size(), false /* allow_multi_statements */);
-            }
-            catch (Exception & e)
-            {
-                if (e.code() != ErrorCodes::SYNTAX_ERROR &&
-                    e.code() != ErrorCodes::TOO_DEEP_RECURSION)
-                    throw;
-            }
-
-            if (ast_2)
-            {
-                const auto text_2 = ast_2->formatForErrorMessage();
-                const auto * tmp_pos = text_2.c_str();
-                const auto ast_3 = parseQuery(tmp_pos, tmp_pos + text_2.size(),
-                    false /* allow_multi_statements */);
-                const auto text_3 = ast_3->formatForErrorMessage();
-                if (text_3 != text_2)
-                {
-                    fmt::print(stderr, "Found error: The query formatting is broken.\n");
-
-                    printChangedSettings();
-
-                    fmt::print(stderr,
-                        "Got the following (different) text after formatting the fuzzed query and parsing it back:\n'{}'\n, expected:\n'{}'\n",
-                        text_3, text_2);
-                    fmt::print(stderr, "In more detail:\n");
-                    fmt::print(stderr, "AST-1 (generated by fuzzer):\n'{}'\n", parsed_query->dumpTree());
-                    fmt::print(stderr, "Text-1 (AST-1 formatted):\n'{}'\n", query_to_execute);
-                    fmt::print(stderr, "AST-2 (Text-1 parsed):\n'{}'\n", ast_2->dumpTree());
-                    fmt::print(stderr, "Text-2 (AST-2 formatted):\n'{}'\n", text_2);
-                    fmt::print(stderr, "AST-3 (Text-2 parsed):\n'{}'\n", ast_3->dumpTree());
-                    fmt::print(stderr, "Text-3 (AST-3 formatted):\n'{}'\n", text_3);
-                    fmt::print(stderr, "Text-3 must be equal to Text-2, but it is not.\n");
-
-                    exit(1);
-                }
-            }
-        }
-
-        // The server is still alive so we're going to continue fuzzing.
-        // Determine what we're going to use as the starting AST.
-        if (have_error)
-        {
-            // Query completed with error, keep the previous starting AST.
-            // Also discard the exception that we now know to be non-fatal,
-            // so that it doesn't influence the exit code.
-            server_exception.reset();
-            client_exception.reset();
-            have_error = false;
-        }
-        else if (ast_to_process->formatForErrorMessage().size() > 500)
-        {
-            // ast too long, start from original ast
-            fmt::print(stderr, "Current AST is too long, discarding it and using the original AST as a start\n");
-            fuzz_base = orig_ast;
+            fmt::print(stderr, "\n");
         }
         else
         {
-            // fuzz starting from this successful query
-            fmt::print(stderr, "Query succeeded, using this AST as a start\n");
-            fuzz_base = ast_to_process;
+            fmt::print(stderr, "No changed {}.\n", settings_name);
         }
-    }
+    };
 
-    return true;
+    print_changes(client_context->getSettingsRef().changes(), "settings");
+    print_changes(cmd_merge_tree_settings->changes(), "MergeTree settings");
+}
+
+
+String Client::getHelpHeader() const
+{
+    return fmt::format(
+        "Usage: {0} [--query <query>]\n"
+        "{0} is a client application that is used to connect to ClickHouse.\n\n"
+        "It can run queries as a command line tool if you pass queries as an argument\n"
+        "or as an interactive client.\n"
+        "Queries can run one at a time, or in a multiquery mode.\n"
+        "To change settings you may use SET statements and SETTINGS clause\n"
+        "in queries or set them for a session with corresponding arguments.\n"
+        "'{0}' command will try to connect to clickhouse-server running\n"
+        "on the same server. If you have credentials set up, pass them with\n"
+        "--user <username> --password <password> or with --ask-password argument\n"
+        "that will open command prompt.\n\n"
+        "Connect to tcp native port (9000) without encryption:\n"
+        "    {0} --host clickhouse.example.com --password mysecretpassword\n"
+        "Connect to secure endpoint:\n"
+        "    {0} --secure --host clickhouse.example.com --password mysecretpassword\n",
+        app_name);
+}
+
+
+String Client::getHelpFooter() const
+{
+    return fmt::format(
+        "Note: if clickhouse is installed, you can use 'clickhouse-client' invocation with a dash.\n\n"
+        "Example printing current longest running query on a server:\n"
+        "    {0} --query \\\n"
+        "        'SELECT * FROM system.processes ORDER BY elapsed LIMIT 1 FORMAT Vertical'\n"
+        "Example creating table and inserting data:\n"
+        "    {0} --multiquery --query \\\n"
+        "        'CREATE TABLE t (a Int) ENGINE = Memory; INSERT INTO t VALUES (1), (2), (3)'\n",
+        app_name);
 }
 
 
 void Client::printHelpMessage(const OptionsDescription & options_description)
 {
-    std::cout << options_description.main_description.value() << "\n";
-    std::cout << options_description.external_description.value() << "\n";
-    std::cout << "In addition, --param_name=value can be specified for substitution of parameters for parametrized queries.\n";
+    output_stream << getHelpHeader() << "\n";
+    if (options_description.main_description.has_value())
+        output_stream << options_description.main_description.value() << "\n";
+    if (options_description.external_description.has_value())
+        output_stream << options_description.external_description.value() << "\n";
+    if (options_description.hosts_and_ports_description.has_value())
+        output_stream << options_description.hosts_and_ports_description.value() << "\n";
+
+    output_stream << "All settings are documented at https://clickhouse.com/docs/operations/settings/settings.\n";
+    output_stream << getHelpFooter() << "\n";
+    output_stream << "In addition, --param_name=value can be specified for substitution of parameters for parameterized queries.\n";
+    output_stream << "\nSee also: https://clickhouse.com/docs/en/integrations/sql-clients/cli\n";
 }
 
 
-void Client::addOptions(OptionsDescription & options_description)
+void Client::addExtraOptions(OptionsDescription & options_description)
 {
     /// Main commandline options related to client functionality and all parameters from Settings.
     options_description.main_description->add_options()
         ("config,c", po::value<std::string>(), "config-file path (another shorthand)")
-        ("host,h", po::value<std::string>()->default_value("localhost"), "server host")
-        ("port", po::value<int>()->default_value(9000), "server port")
+        ("connection", po::value<std::string>(), "connection to use (from the client config), by default connection name is hostname")
         ("secure,s", "Use TLS connection")
+        ("tls-sni-override", po::value<std::string>(), "Override the SNI host name used for TLS connections")
+        ("no-secure", "Don't use TLS connection")
         ("user,u", po::value<std::string>()->default_value("default"), "user")
-        /** If "--password [value]" is used but the value is omitted, the bad argument exception will be thrown.
-            * implicit_value is used to avoid this exception (to allow user to type just "--password")
-            * Since currently boost provides no way to check if a value has been set implicitly for an option,
-            * the "\n" is used to distinguish this case because there is hardly a chance a user would use "\n"
-            * as the password.
-            */
-        ("password", po::value<std::string>()->implicit_value("\n", ""), "password")
+        ("password", po::value<std::string>(), "password")
         ("ask-password", "ask-password")
+        ("ssh-key-file", po::value<std::string>(), "File containing the SSH private key to authenticate with the server. "
+            "If the file name is omitted, the key is looked up using SSH configuration: "
+            "the identity files configured for this host in `~/.ssh/config`, the default identity files, such as `~/.ssh/id_ed25519`, "
+            "and the keys held by the ssh-agent.")
+        ("ssh-key-passphrase", po::value<std::string>(), "Passphrase for the SSH private key specified by --ssh-key-file.")
         ("quota_key", po::value<std::string>(), "A string to differentiate quotas when the user have keyed quotas configured on server")
-        ("testmode,T", "enable test hints in comments")
-
-        ("max_client_network_bandwidth", po::value<int>(), "the maximum speed of data exchange over the network for the client in bytes per second.")
-        ("compression", po::value<bool>(), "enable or disable compression")
-
-        ("query-fuzzer-runs", po::value<int>()->default_value(0), "After executing every SELECT query, do random mutations in it and run again specified number of times. This is used for testing to discover unexpected corner cases.")
-        ("interleave-queries-file", po::value<std::vector<std::string>>()->multitoken(),
-            "file path with queries to execute before every file from 'queries-file'; multiple files can be specified (--queries-file file1 file2...); this is needed to enable more aggressive fuzzing of newly added tests (see 'query-fuzzer-runs' option)")
-
-        ("opentelemetry-traceparent", po::value<std::string>(), "OpenTelemetry traceparent header as described by W3C Trace Context recommendation")
-        ("opentelemetry-tracestate", po::value<std::string>(), "OpenTelemetry tracestate header as described by W3C Trace Context recommendation")
-
+        ("jwt", po::value<std::string>(), "Use JWT for authentication")
+        ("one-time-password", po::value<std::string>(), "Time-based one-time password (TOTP) for two-factor authentication")
+#if USE_JWT_CPP && USE_SSL
+        ("login", po::bool_switch(), "Use OAuth 2.0 device authorization grant to login")
+        ("oauth-url", po::value<std::string>(), "OAuth / OIDC issuer base URL (used for endpoint discovery)")
+        ("oauth-client-id", po::value<std::string>(), "The client ID for the OAuth 2.0 application")
+        ("oauth-client-secret", po::value<std::string>(), "Optional client secret for confidential OAuth clients")
+        ("oauth-client-auth", po::value<std::string>(), "Confidential client auth method: basic (default) or post")
+        ("oauth-audience", po::value<std::string>(), "Optional audience parameter for the device authorization request (Auth0-style)")
+        ("oauth-scope", po::value<std::string>(), "OAuth scope for the device authorization request")
+        ("oauth-device-uri", po::value<std::string>(), "Explicit device authorization endpoint (skips discovery when set with --oauth-token-uri)")
+        ("oauth-token-uri", po::value<std::string>(), "Explicit token endpoint (skips discovery when set with --oauth-device-uri)")
+#endif
+        ("max_client_network_bandwidth",
+            po::value<int>(),
+            "the maximum speed of data exchange over the network for the client in bytes per second.")
+        ("compression",
+            po::value<bool>(),
+            "enable or disable compression (enabled by default for remote communication and disabled for localhost communication).")
+        ("query-fuzzer-runs",
+            po::value<int>()->default_value(0),
+            "After executing every SELECT query, do random mutations in it and run again specified number of times. This is used for "
+            "testing to discover unexpected corner cases.")
+        ("create-query-fuzzer-runs", po::value<int>()->default_value(0), "")
+        ("buzz-house-config", po::value<std::string>(), "Path to configuration file for BuzzHouse")
+        ("interleave-queries-file",
+            po::value<std::vector<std::string>>()->multitoken(),
+            "file path with queries to execute before every file from 'queries-file'; multiple files can be specified (--queries-file "
+            "file1 file2...); this is needed to enable more aggressive fuzzing of newly added tests (see 'query-fuzzer-runs' option)")
+        ("opentelemetry-traceparent",
+            po::value<std::string>(),
+            "OpenTelemetry traceparent header as described by W3C Trace Context recommendation")
+        ("opentelemetry-tracestate",
+            po::value<std::string>(),
+            "OpenTelemetry tracestate header as described by W3C Trace Context recommendation")
         ("no-warnings", "disable warnings when client connects to server")
-        ("max_memory_usage_in_client", po::value<int>(), "sets memory limit in client")
-    ;
+        ("no-server-client-version-message", "suppress server-client version mismatch message")
+        /// TODO: Left for compatibility as it's used in upgrade check, remove after next release and use server setting ignore_drop_queries_probability
+        ("fake-drop", "Ignore all DROP queries, should be used only for testing")
+        ("accept-invalid-certificate",
+            "Ignore certificate verification errors, equal to config parameters "
+            "openSSL.client.invalidCertificateHandler.name=AcceptCertificateHandler and openSSL.client.verificationMode=none")
+        ("inline-insert-data",
+            "Send INSERT data as is in the query text instead of converting it to blocks in the native format. "
+            "The server will parse the inline data itself, avoiding the round-trip to receive table structure.");
 
     /// Commandline options related to external tables.
 
     options_description.external_description.emplace(createOptionsDescription("External tables options", terminal_width));
     options_description.external_description->add_options()
-    (
-        "file", po::value<std::string>(), "data file or - for stdin"
-    )
-    (
-        "name", po::value<std::string>()->default_value("_data"), "name of the table"
-    )
-    (
-        "format", po::value<std::string>()->default_value("TabSeparated"), "data format"
-    )
-    (
-        "structure", po::value<std::string>(), "structure"
-    )
-    (
-        "types", po::value<std::string>(), "types"
-    );
+        ("external", "marks the beginning of a clause. You may have multiple sections like this, for the number of tables being transmitted")
+        ("file", po::value<std::string>(), "data file or - for stdin")
+        ("name", po::value<std::string>()->default_value("_data"), "name of the table")
+        ("format", po::value<std::string>()->default_value("TabSeparated"), "data format")
+        ("structure", po::value<std::string>(), "structure")
+        ("scalar", "Send as Scalar packet (not Data)")
+        ("types", po::value<std::string>(), "types");
+
+    /// Commandline options related to hosts and ports.
+    options_description.hosts_and_ports_description.emplace(createOptionsDescription("Hosts and ports options", terminal_width));
+    options_description.hosts_and_ports_description->add_options()
+        ("host,h", po::value<String>()->default_value("localhost"),
+            "Server hostname. Multiple hosts can be passed via multiple arguments. "
+            "Example of usage: '--host host1 --host host2 --port port2 --host host3 ...'. "
+            "Each '--port port' will be attached to the last seen host that doesn't have a port yet, "
+            "if there is no such host, the port will be attached to the next first host or to default host.")
+        ("port", po::value<UInt16>(), "server ports");
 }
 
 
-void Client::processOptions(const OptionsDescription & options_description,
-                            const CommandLineOptions & options,
-                            const std::vector<Arguments> & external_tables_arguments)
+void Client::processOptions(
+    const OptionsDescription & options_description,
+    const CommandLineOptions & options,
+    const std::vector<Arguments> & external_tables_arguments,
+    const std::vector<Arguments> & hosts_and_ports_arguments)
 {
     namespace po = boost::program_options;
 
@@ -1051,171 +1287,568 @@ void Client::processOptions(const OptionsDescription & options_description,
     for (size_t i = 0; i < external_tables_arguments.size(); ++i)
     {
         /// Parse commandline options related to external tables.
-        po::parsed_options parsed_tables = po::command_line_parser(external_tables_arguments[i]).options(
-            options_description.external_description.value()).run();
+        po::parsed_options parsed_tables
+            = po::command_line_parser(external_tables_arguments[i]).options(options_description.external_description.value()).run();
         po::variables_map external_options;
         po::store(parsed_tables, external_options);
 
         try
         {
-            external_tables.emplace_back(external_options);
-            if (external_tables.back().file == "-")
+            auto & external_data = external_options.contains("scalar") ? external_scalars : external_tables;
+            external_data.emplace_back(external_options);
+            if (external_data.back().file == "-")
                 ++number_of_external_tables_with_stdin_source;
             if (number_of_external_tables_with_stdin_source > 1)
-                throw Exception("Two or more external tables has stdin (-) set as --file field", ErrorCodes::BAD_ARGUMENTS);
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Two or more external tables has stdin (-) set as --file field");
         }
-        catch (const Exception & e)
+        catch (Exception & e)
         {
-            std::cerr << getExceptionMessage(e, false) << std::endl;
+            std::cerr << getExceptionMessageForLogging(e, false) << std::endl;
             std::cerr << "Table №" << i << std::endl << std::endl;
             /// Avoid the case when error exit code can possibly overflow to normal (zero).
             auto exit_code = e.code() % 256;
             if (exit_code == 0)
                 exit_code = 255;
-            exit(exit_code);
+            _exit(exit_code);
         }
     }
+
+    for (const auto & hosts_and_ports_argument : hosts_and_ports_arguments)
+    {
+        /// Parse commandline options related to external tables.
+        po::parsed_options parsed_hosts_and_ports
+            = po::command_line_parser(hosts_and_ports_argument).options(options_description.hosts_and_ports_description.value()).run();
+        po::variables_map host_and_port_options;
+        po::store(parsed_hosts_and_ports, host_and_port_options);
+        std::string host = host_and_port_options["host"].as<std::string>();
+        std::optional<UInt16> port
+            = !host_and_port_options["port"].empty() ? std::make_optional(host_and_port_options["port"].as<UInt16>()) : std::nullopt;
+        hosts_and_ports.emplace_back(HostAndPort{host, port, {}, {}, false});
+    }
+
     send_external_tables = true;
 
     shared_context = Context::createShared();
     global_context = Context::createGlobal(shared_context.get());
-
     global_context->makeGlobalContext();
     global_context->setApplicationType(Context::ApplicationType::CLIENT);
-
-    global_context->setSettings(cmd_settings);
+    global_context->setSettings(*cmd_settings);
 
     /// Copy settings-related program options to config.
     /// TODO: Is this code necessary?
-    for (const auto & setting : global_context->getSettingsRef().all())
-    {
-        const auto & name = setting.getName();
-        if (options.count(name))
-            config().setString(name, options[name].as<String>());
-    }
+    global_context->getSettingsRef().addToClientOptions(config(), options, allow_repeated_settings);
 
-    if (options.count("config-file") && options.count("config"))
-        throw Exception("Two or more configuration files referenced in arguments", ErrorCodes::BAD_ARGUMENTS);
+    if (options.contains("config-file") && options.contains("config"))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Two or more configuration files referenced in arguments");
 
-    if (options.count("config"))
+    if (options.contains("config"))
         config().setString("config-file", options["config"].as<std::string>());
-    if (options.count("host") && !options["host"].defaulted())
-        config().setString("host", options["host"].as<std::string>());
-    if (options.count("interleave-queries-file"))
+    if (options.contains("connection"))
+        config().setString("connection", options["connection"].as<std::string>());
+    if (options.contains("interleave-queries-file"))
         interleave_queries_files = options["interleave-queries-file"].as<std::vector<std::string>>();
-    if (options.count("port") && !options["port"].defaulted())
-        config().setInt("port", options["port"].as<int>());
-    if (options.count("secure"))
+    if (options.contains("secure"))
         config().setBool("secure", true);
-    if (options.count("user") && !options["user"].defaulted())
+    if (options.contains("tls-sni-override"))
+        config().setString("tls-sni-override", options["tls-sni-override"].as<std::string>());
+    if (options.contains("no-secure"))
+        config().setBool("no-secure", true);
+    if (options.contains("user") && !options["user"].defaulted())
         config().setString("user", options["user"].as<std::string>());
-    if (options.count("password"))
+    if (options.contains("password"))
         config().setString("password", options["password"].as<std::string>());
-    if (options.count("ask-password"))
+    if (options.contains("ask-password"))
         config().setBool("ask-password", true);
-    if (options.count("quota_key"))
+    if (options.contains("one-time-password"))
+        config().setString("one-time-password", options["one-time-password"].as<std::string>());
+    if (options.contains("ssh-key-file"))
+        config().setString("ssh-key-file", options["ssh-key-file"].as<std::string>());
+    if (options.contains("ssh-key-passphrase"))
+        config().setString("ssh-key-passphrase", options["ssh-key-passphrase"].as<std::string>());
+    if (options.contains("quota_key"))
         config().setString("quota_key", options["quota_key"].as<std::string>());
-    if (options.count("testmode"))
-        config().setBool("testmode", true);
-    if (options.count("max_client_network_bandwidth"))
+    if (options.contains("max_client_network_bandwidth"))
         max_client_network_bandwidth = options["max_client_network_bandwidth"].as<int>();
-    if (options.count("compression"))
+    if (options.contains("compression"))
         config().setBool("compression", options["compression"].as<bool>());
-    if (options.count("no-warnings"))
+    if (options.contains("no-warnings"))
         config().setBool("no-warnings", true);
-
-    if ((query_fuzzer_runs = options["query-fuzzer-runs"].as<int>()))
+    if (options.contains("no-server-client-version-message"))
+        config().setBool("no-server-client-version-message", true);
+    if (options.contains("fake-drop"))
+        config().setString("ignore_drop_queries_probability", "1");
+    if (options.contains("inline-insert-data"))
+        config().setBool("inline-insert-data", true);
+    if (options.contains("jwt"))
     {
-        // Fuzzer implies multiquery.
-        config().setBool("multiquery", true);
+        if (!options["user"].defaulted())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "User and JWT flags can't be specified together");
+        config().setString("jwt", options["jwt"].as<std::string>());
+        config().setString("user", "");
+    }
+#if USE_JWT_CPP && USE_SSL
+    if (options["login"].as<bool>())
+    {
+        if (!options["user"].defaulted())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "User and login flags can't be specified together");
+        if (config().has("jwt"))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "JWT and login flags can't be specified together");
+        config().setBool("login", true);
+        config().setString("user", "");
+    }
+    if (options.contains("oauth-url"))
+        config().setString("oauth-url", options["oauth-url"].as<std::string>());
+    if (options.contains("oauth-client-id"))
+        config().setString("oauth-client-id", options["oauth-client-id"].as<std::string>());
+    if (options.contains("oauth-client-secret"))
+        config().setString("oauth-client-secret", options["oauth-client-secret"].as<std::string>());
+    if (options.contains("oauth-client-auth"))
+        config().setString("oauth-client-auth", options["oauth-client-auth"].as<std::string>());
+    if (options.contains("oauth-audience"))
+        config().setString("oauth-audience", options["oauth-audience"].as<std::string>());
+    if (options.contains("oauth-scope"))
+        config().setString("oauth-scope", options["oauth-scope"].as<std::string>());
+    if (options.contains("oauth-device-uri"))
+        config().setString("oauth-device-uri", options["oauth-device-uri"].as<std::string>());
+    if (options.contains("oauth-token-uri"))
+        config().setString("oauth-token-uri", options["oauth-token-uri"].as<std::string>());
+#endif
+    if (options.contains("accept-invalid-certificate"))
+    {
+        config().setString("openSSL.client.invalidCertificateHandler.name", "AcceptCertificateHandler");
+        config().setString("openSSL.client.verificationMode", "none");
+    }
+    else
+        config().setString("openSSL.client.invalidCertificateHandler.name", "RejectCertificateHandler");
+
+    query_fuzzer_runs = options["query-fuzzer-runs"].as<int>();
+    buzz_house_options_path = options.contains("buzz-house-config") ? options["buzz-house-config"].as<std::string>() : "";
+    buzz_house = !query_fuzzer_runs && !buzz_house_options_path.empty();
+    if (query_fuzzer_runs || !buzz_house_options_path.empty())
+    {
         // Ignore errors in parsing queries.
         config().setBool("ignore-error", true);
         ignore_error = true;
+#if USE_BUZZHOUSE
+        if (!buzz_house_options_path.empty())
+        {
+            fuzz_config = std::make_unique<BuzzHouse::FuzzConfig>(this, buzz_house_options_path);
+            external_integrations = std::make_unique<BuzzHouse::ExternalIntegrations>(*fuzz_config);
+
+            if (query_fuzzer_runs && fuzz_config->seed)
+            {
+                fuzzer.setSeed(fuzz_config->seed);
+            }
+        }
+#endif
+        if (query_fuzzer_runs)
+        {
+            fmt::print(stdout, "Using seed {} for AST fuzzer\n", fuzzer.getSeed());
+        }
     }
 
-    if (options.count("opentelemetry-traceparent"))
+    create_query_fuzzer_runs = options["create-query-fuzzer-runs"].as<int>();
+    if (create_query_fuzzer_runs)
+    {
+        // Ignore errors in parsing queries.
+        config().setBool("ignore-error", true);
+
+        global_context->setSetting("allow_suspicious_low_cardinality_types", true);
+        ignore_error = true;
+    }
+
+    if (options.contains("opentelemetry-traceparent"))
     {
         String traceparent = options["opentelemetry-traceparent"].as<std::string>();
         String error;
-        if (!global_context->getClientInfo().client_trace_context.parseTraceparentHeader(traceparent, error))
+        if (!global_context->getClientTraceContext().parseTraceparentHeader(traceparent, error))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot parse OpenTelemetry traceparent '{}': {}", traceparent, error);
     }
 
-    if (options.count("opentelemetry-tracestate"))
-        global_context->getClientInfo().client_trace_context.tracestate = options["opentelemetry-tracestate"].as<std::string>();
+    if (options.contains("opentelemetry-tracestate"))
+        global_context->getClientTraceContext().tracestate = options["opentelemetry-tracestate"].as<std::string>();
+
+    initClientContext(Context::createCopy(global_context));
+    /// Initialize query context for the current thread to avoid sharing global context (i.e. for obtaining session_timezone)
+    query_scope = QueryScope::create(client_context);
+
+
+    /// Allow to pass-through unknown settings to the server.
+    client_context->getAccessControl().allowAllSettings();
 }
 
 
 void Client::processConfig()
 {
+    if (!queries.empty() && !queries_files.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Options '--query' and '--queries-file' cannot be specified at the same time");
+
     /// Batch mode is enabled if one of the following is true:
-    /// - -e (--query) command line option is present.
+    /// - -q (--query) command line option is present.
     ///   The value of the option is used as the text of query (or of multiple queries).
     ///   If stdin is not a terminal, INSERT data for the first query is read from it.
     /// - stdin is not a terminal. In this case queries are read from it.
-    /// - -qf (--queries-file) command line option is present.
+    /// - --queries-file command line option is present.
     ///   The value of the option is used as file with query (or of multiple queries) to execute.
 
-    delayed_interactive = config().has("interactive") && (config().has("query") || config().has("queries-file"));
-    if (stdin_is_a_tty
-        && (delayed_interactive || (!config().has("query") && queries_files.empty())))
+    delayed_interactive = config().has("interactive") && (!queries.empty() || !queries_files.empty());
+    if (stdin_is_a_tty && (delayed_interactive || (queries.empty() && queries_files.empty())))
     {
         is_interactive = true;
     }
     else
     {
-        need_render_progress = config().getBool("progress", false);
-        echo_queries = config().getBool("echo", false);
+        query_id = config().getString("query_id", "");
+        if (!query_id.empty())
+            client_context->setCurrentQueryId(query_id);
+    }
+
+    /// A delayed-interactive run executes the given queries through `runNonInteractive` before it
+    /// enters the prompt, so that prelude is a batch and follows the batch contract of
+    /// `--ignore-error`, the same as in `clickhouse-local` and in the embedded client. Taken from
+    /// the branch above, the option would be dropped for a delayed-interactive run on a terminal:
+    /// the prelude would stop at its first failing statement and the exit code of that statement
+    /// would end the run before the prompt.
+    if (!is_interactive || delayed_interactive)
         ignore_error = config().getBool("ignore-error", false);
 
-        auto query_id = config().getString("query_id", "");
-        if (!query_id.empty())
-            global_context->setCurrentQueryId(query_id);
+    setupEchoAndHighlightSettings();
+
+    if (is_interactive || delayed_interactive)
+    {
+        if (home_path.empty())
+        {
+            const char * home_path_cstr = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
+            if (home_path_cstr)
+                home_path = home_path_cstr;
+        }
+
+        /// Load command history if present.
+        if (config().has("history_file"))
+            history_file = config().getString("history_file");
+        else
+            history_file = ClientBase::getHistoryFilePath();
     }
+
+    pager = config().getString("pager", "");
+    enable_highlight = ConfigHelper::getBool(config(), "highlight", true);
+    multiline = config().has("multiline");
+    rainbow_parentheses = config().getBool("rainbow_parentheses", true);
     print_stack_trace = config().getBool("stacktrace", false);
+    default_database = config().getString("database", "");
+    /// `default_database` may have come from a config file (or a named connection in that file)
+    /// rather than the `--database` CLI option. The `database` setting needs to know either
+    /// way, so it ships with every query the client runs.
+    if (!default_database.empty() && !cmd_settings->isChanged("database"))
+    {
+        cmd_settings->set("database", default_database);
+        /// `processConfig` runs after `processOptions` already copied `cmd_settings` into `global_context`
+        /// and `client_context`, and the later TCP sends read `client_context->getSettingsRef()[database]`,
+        /// not `cmd_settings`. Apply the mirrored value to the live contexts too (mirroring what
+        /// `setDefaultFormatsAndCompressionFromConfiguration` now does for the format settings), so a
+        /// config / named-connection `database` is not overridden by a stale profile value in `executeQuery`.
+        if (global_context)
+            global_context->setSetting("database", default_database);
+        if (client_context)
+            client_context->setSetting("database", default_database);
+    }
+    inline_insert_data = config().getBool("inline-insert-data", false);
 
-    if (config().has("multiquery"))
-        is_multiquery = true;
+    if (inline_insert_data)
+        client_context->setSetting("send_table_structure_on_insert_with_inline_data", false);
 
-    is_default_format = !config().has("vertical") && !config().has("format");
-    if (config().has("vertical"))
-        format = config().getString("format", "Vertical");
-    else
-        format = config().getString("format", is_interactive ? "PrettyCompact" : "TabSeparated");
+    setDefaultFormatsAndCompressionFromConfiguration();
+}
 
-    format_max_block_size = config().getInt("format_max_block_size", global_context->getSettingsRef().max_block_size);
 
-    insert_format = "Values";
+void Client::readArguments(
+    int argc,
+    char ** argv,
+    Arguments & common_arguments,
+    std::vector<Arguments> & external_tables_arguments,
+    std::vector<Arguments> & hosts_and_ports_arguments)
+{
+    // Default to oauth authentication for ClickHouse Cloud for a hostname argument.
+    bool is_hostname_argument = false;
+#if USE_JWT_CPP && USE_SSL
+    if (argc >= 2)
+    {
+        std::string_view first_arg(argv[1]);
 
-    /// Setting value from cmd arg overrides one from config
-    if (global_context->getSettingsRef().max_insert_block_size.changed)
-        insert_format_max_block_size = global_context->getSettingsRef().max_insert_block_size;
-    else
-        insert_format_max_block_size = config().getInt("insert_format_max_block_size", global_context->getSettingsRef().max_insert_block_size);
+        /// Only process as positional hostname if it doesn't start with '-' (i.e., it's not a flag)
+        if (!first_arg.starts_with('-'))
+        {
+            std::string hostname(argv[1]);
+            std::string port;
+            bool has_auth_in_connection_string = false;
 
-    ClientInfo & client_info = global_context->getClientInfo();
-    client_info.setInitialQuery();
-    client_info.quota_key = config().getString("quota_key", "");
+            try
+            {
+                Poco::URI uri{hostname};
+                if (const auto & host = uri.getHost(); !host.empty())
+                {
+                    hostname = host;
+                    port = std::to_string(uri.getPort());
+                }
+                /// Check if connection string contains user credentials (e.g., clickhouse://user:password@host)
+                has_auth_in_connection_string = !uri.getUserInfo().empty();
+            }
+            catch (const Poco::URISyntaxException &) // NOLINT(bugprone-empty-catch)
+            {
+                // intentionally ignored. argv[1] is not a uri, but could be a query.
+            }
+
+            if (isCloudEndpoint(hostname) && !has_auth_in_connection_string)
+            {
+                is_hostname_argument = true;
+
+                /// Check if user provided authentication credentials via command line
+                bool has_auth_in_cmdline = false;
+                for (int i = 1; i < argc; ++i)
+                {
+                    std::string_view arg(argv[i]);
+                    if (arg.starts_with("--user") || arg.starts_with("--password") ||
+                        arg.starts_with("--jwt") || arg.starts_with("--ssh-key-file") ||
+                        arg == "-u")
+                    {
+                        has_auth_in_cmdline = true;
+                        break;
+                    }
+                }
+
+                /// Only auto-add --login if no authentication credentials provided via command line or connection string
+                if (!has_auth_in_cmdline && !has_auth_in_connection_string)
+                {
+                    common_arguments.emplace_back("--login");
+                    login_was_auto_added = true;
+                }
+                common_arguments.emplace_back("--secure");
+
+                std::vector<std::string> host_and_port;
+                host_and_port.push_back("--host=" + hostname);
+                if (!port.empty())
+                    host_and_port.push_back("--port=" + port);
+                hosts_and_ports_arguments.push_back(std::move(host_and_port));
+            }
+        }
+    }
+#endif
+
+    bool has_connection_string = !is_hostname_argument && argc >= 2 && tryParseConnectionString(std::string_view(argv[1]), common_arguments, hosts_and_ports_arguments);
+    int start_argument_index = (has_connection_string || is_hostname_argument) ? 2 : 1;
+
+    /** We allow different groups of arguments:
+        * - common arguments;
+        * - arguments for any number of external tables each in form "--external args...",
+        *   where possible args are file, name, format, structure, types;
+        * - param arguments for prepared statements.
+        * Split these groups before processing.
+        */
+    bool in_external_group = false;
+
+    std::string prev_host_arg;
+    std::string prev_port_arg;
+
+    for (int arg_num = start_argument_index; arg_num < argc; ++arg_num)
+    {
+        std::string_view arg = argv[arg_num];
+
+        /// Support arguments with a space on both sides of equals sign.
+        /// Ex: --param = value
+        std::string fused_arg;
+        if (arg.starts_with('-') && arg_num + 2 < argc)
+        {
+            std::string_view next_arg = argv[arg_num + 1];
+            if (next_arg == "=" && !arg.contains('='))
+            {
+                fused_arg = std::string(arg);
+                fused_arg += "=";
+                fused_arg += argv[arg_num + 2];
+
+                arg = fused_arg;
+                arg_num += 2;
+            }
+        }
+
+        if (has_connection_string || is_hostname_argument)
+            checkIfCmdLineOptionCanBeUsedWithConnectionString(arg);
+
+        if (arg == "--external")
+        {
+            in_external_group = true;
+            external_tables_arguments.emplace_back(Arguments{""});
+        }
+        /// Options with value after equal sign.
+        else if (
+            in_external_group
+            && (arg.starts_with("--file=") || arg.starts_with("--name=") || arg.starts_with("--format=") || arg.starts_with("--structure=")
+                || arg.starts_with("--types=")))
+        {
+            external_tables_arguments.back().emplace_back(arg);
+        }
+        /// Options with value after whitespace.
+        else if (in_external_group && (arg == "--file" || arg == "--name" || arg == "--format" || arg == "--structure" || arg == "--types"))
+        {
+            if (arg_num + 1 < argc)
+            {
+                external_tables_arguments.back().emplace_back(arg);
+                ++arg_num;
+                arg = argv[arg_num];
+                external_tables_arguments.back().emplace_back(arg);
+            }
+            else
+                break;
+        }
+        /// Options with no value
+        else if (in_external_group && (arg == "--scalar"))
+        {
+            external_tables_arguments.back().emplace_back(arg);
+        }
+        else
+        {
+            in_external_group = false;
+            if (arg == "--file"sv || arg == "--name"sv || arg == "--structure"sv || arg == "--types"sv)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Parameter must be in external group, try add --external before {}", arg);
+
+            /// Parameter arg after underline or dash.
+            if (arg.starts_with("--param_") || arg.starts_with("--param-"))
+            {
+                auto param_continuation = arg.substr(strlen("--param_"));
+                auto equal_pos = param_continuation.find_first_of('=');
+
+                if (equal_pos == std::string::npos)
+                {
+                    /// param_name value
+                    ++arg_num;
+                    if (arg_num >= argc)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Parameter requires value");
+                    arg = argv[arg_num];
+                    query_parameters.emplace(String(param_continuation), String(arg));
+                }
+                else
+                {
+                    if (equal_pos == 0)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Parameter name cannot be empty");
+
+                    /// param_name=value
+                    query_parameters.emplace(param_continuation.substr(0, equal_pos), param_continuation.substr(equal_pos + 1));
+                }
+            }
+            else if (arg.starts_with("--host") || arg.starts_with("-h"))
+            {
+                std::string host_arg;
+                /// --host host
+                if (arg == "--host" || arg == "-h")
+                {
+                    ++arg_num;
+                    if (arg_num >= argc)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Host argument requires value");
+                    arg = argv[arg_num];
+                    host_arg = "--host=";
+                    host_arg.append(arg);
+                }
+                else
+                    host_arg = arg;
+
+                /// --port port1 --host host1
+                if (!prev_port_arg.empty())
+                {
+                    hosts_and_ports_arguments.push_back({host_arg, prev_port_arg});
+                    prev_port_arg.clear();
+                }
+                else
+                {
+                    /// --host host1 --host host2
+                    if (!prev_host_arg.empty())
+                        hosts_and_ports_arguments.push_back({prev_host_arg});
+
+                    prev_host_arg = host_arg;
+                }
+            }
+            else if (arg.starts_with("--port"))
+            {
+                auto port_arg = String{arg};
+                /// --port port
+                if (arg == "--port")
+                {
+                    port_arg.push_back('=');
+                    ++arg_num;
+                    if (arg_num >= argc)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Port argument requires value");
+                    arg = argv[arg_num];
+                    port_arg.append(arg);
+                }
+
+                /// --host host1 --port port1
+                if (!prev_host_arg.empty())
+                {
+                    hosts_and_ports_arguments.push_back({port_arg, prev_host_arg});
+                    prev_host_arg.clear();
+                }
+                else
+                {
+                    /// --port port1 --port port2
+                    if (!prev_port_arg.empty())
+                        hosts_and_ports_arguments.push_back({prev_port_arg});
+
+                    prev_port_arg = port_arg;
+                }
+            }
+            else if (arg == "--allow_repeated_settings")
+                allow_repeated_settings = true;
+            else if (arg == "--allow_merge_tree_settings")
+                allow_merge_tree_settings = true;
+            else if (arg == "--password" && ((arg_num + 1) >= argc || std::string_view(argv[arg_num + 1]).starts_with('-')))
+            {
+                common_arguments.emplace_back(arg);
+                /// if the value of --password is omitted, the password will be asked before
+                /// connection start
+                common_arguments.emplace_back(ConnectionParameters::ASK_PASSWORD);
+            }
+            else if (arg == "--ssh-key-file" && ((arg_num + 1) >= argc || std::string_view(argv[arg_num + 1]).starts_with('-')))
+            {
+                common_arguments.emplace_back(arg);
+                /// If the file name is omitted, the key is looked up in `~/.ssh` and in the ssh-agent.
+                common_arguments.emplace_back();
+            }
+            else
+                common_arguments.emplace_back(arg); /// anything else, eg --hilite
+        }
+    }
+    if (!prev_host_arg.empty())
+        hosts_and_ports_arguments.push_back({prev_host_arg});
+    if (!prev_port_arg.empty())
+        hosts_and_ports_arguments.push_back({prev_port_arg});
 }
 
 }
 
 
-#pragma GCC diagnostic ignored "-Wunused-function"
-#pragma GCC diagnostic ignored "-Wmissing-declarations"
+int mainEntryClickHouseClient(int argc, char ** argv);
 
 int mainEntryClickHouseClient(int argc, char ** argv)
 {
+    DB::MainThreadStatus::getInstance();
+
+    /// Join global-pool threads before the statics they may have accessed are destroyed.
+    /// That way, accesses happen-before destruction.
+    SCOPE_EXIT_SAFE({
+        DB::StaticThreadPool::shutdownAll();
+        GlobalThreadPool::shutdown();
+    });
+
     try
     {
         DB::Client client;
+        // Initialize command line options
         client.init(argc, argv);
         return client.run();
     }
-    catch (const DB::Exception & e)
+    catch (DB::Exception & e)
     {
-        std::cerr << DB::getExceptionMessage(e, false) << std::endl;
-        return 1;
+        std::cerr << DB::getExceptionMessageForLogging(e, false) << std::endl;
+        auto code = DB::getCurrentExceptionCode();
+        return static_cast<UInt8>(code) ? code : 1;
     }
     catch (const boost::program_options::error & e)
     {
@@ -1224,7 +1857,8 @@ int mainEntryClickHouseClient(int argc, char ** argv)
     }
     catch (...)
     {
-        std::cerr << DB::getCurrentExceptionMessage(true) << std::endl;
-        return 1;
+        std::cerr << DB::getCurrentExceptionMessage(true) << '\n';
+        auto code = DB::getCurrentExceptionCode();
+        return static_cast<UInt8>(code) ? code : 1;
     }
 }
